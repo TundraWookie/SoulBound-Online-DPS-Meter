@@ -47,7 +47,7 @@ Do not download or run files posted by third parties. Official project releases 
 1. Install Python 3.10 or newer with Tkinter.
 2. Download the latest `DpsMeter-*.py` file.
 3. Put it in its own folder.
-4. Open PowerShell or Command Prompt in that folder and run:
+4. Open PowerShell or Command Prompt in that folder and run / should be able to double click to run also.
 
 ```powershell
 python DpsMeter-0.8.2-py.3.py
