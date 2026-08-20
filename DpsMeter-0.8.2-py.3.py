@@ -1,0 +1,1751 @@
+#!/usr/bin/env python3
+"""Soulbound DPS Meter — readable, dependency-free Python edition.
+
+Requires Python 3.10+ with Tkinter (included with the normal Windows installer).
+Combat logs are read only from the selected folder. No network access is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import ctypes
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import tkinter as tk
+from collections import deque
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from tkinter import filedialog, messagebox
+from typing import Any, Callable
+
+
+VERSION = "0.8.2-py.3"
+SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
+SCRIPT_DIR = Path(__file__).resolve().parent
+RECORDS_PATH = SCRIPT_DIR / "records.txt"
+LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", SCRIPT_DIR))
+SETTINGS_PATH = LOCAL_APP_DATA / "SoulboundMeter" / "settings.json"
+
+
+def utc_now() -> float:
+    return time.time()
+
+
+def parse_timestamp(value: Any) -> float:
+    if not value:
+        return utc_now()
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return utc_now()
+
+
+def timestamp_text(value: float) -> str:
+    return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def first_value(obj: Any, *names: str, default: Any = None) -> Any:
+    if not isinstance(obj, dict):
+        return default
+    for name in names:
+        if name in obj and obj[name] is not None:
+            return obj[name]
+    return default
+
+
+def first_number(obj: Any, *names: str, default: float = 0.0) -> float:
+    value = first_value(obj, *names, default=default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def first_bool(obj: Any, *names: str) -> bool:
+    value = first_value(obj, *names, default=False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"true", "yes", "1"}
+
+
+def normalize_ability(name: str) -> str:
+    return "".join(ch.lower() for ch in name if ch.isalnum())
+
+
+def is_unknown_ability(name: str | None) -> bool:
+    return not name or name.strip().lower() in {"unknown", "unknown ability"}
+
+
+def is_own_event(event: "CombatEvent") -> bool:
+    if not event.source_type:
+        return True
+    return (
+        event.source_type.lower() == "self"
+        or (event.source_id or "").lower() == "self"
+        or (event.source_name or "").lower() == "self"
+    )
+
+
+def format_number(value: float) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}m"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return f"{value:.0f}"
+
+
+def format_rate(value: float) -> str:
+    text = f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
+def format_date(value: str | None) -> str:
+    if not value:
+        return "No record yet"
+    try:
+        dt = datetime.fromtimestamp(parse_timestamp(value)).astimezone()
+        return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+    except (ValueError, OSError):
+        return "No record yet"
+
+
+@dataclass(slots=True)
+class CombatEvent:
+    type: str
+    event_id: str | None
+    timestamp: float
+    encounter_id: str | None
+    source_id: str | None
+    source_name: str | None
+    source_type: str | None
+    target_id: str | None
+    target_name: str | None
+    ability_id: str | None
+    ability_name: str
+    amount: float
+    raw_amount: float
+    overheal: float
+    absorbed: float
+    critical: bool
+    heavy_hit: bool
+    periodic: bool
+    sequence: float | None
+
+
+def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | None:
+    try:
+        root = json.loads(line_or_object) if isinstance(line_or_object, str) else line_or_object
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(root, dict):
+        return None
+
+    raw_type = str(first_value(root, "type", "event_type", "event", default="")).strip().lower()
+    if not raw_type:
+        return None
+    type_map = {
+        "damage_dealt": "damage", "damaged": "damage", "hit": "damage",
+        "healing_done": "heal", "healing_dealt": "heal", "heal_dealt": "heal",
+        "heal_applied": "heal", "healing": "heal", "healed": "heal",
+        "shield_gained": "shield", "run_start": "combat_start", "run_end": "combat_end",
+    }
+    event_type = type_map.get(raw_type, raw_type)
+    payload = root.get("data") if isinstance(root.get("data"), dict) else root
+    source = first_value(payload, "source", "actor", "caster", default={})
+    target = first_value(payload, "target", "recipient", "victim", default={})
+    if not isinstance(source, dict):
+        source = {}
+    if not isinstance(target, dict):
+        target = {}
+
+    if event_type == "damage":
+        amount = first_number(payload, "post_target_mitigation_amount", "applied_amount", "effective_amount", "amount", "value")
+    else:
+        amount = first_number(payload, "effective_amount", "applied_amount", "amount", "value")
+    cast = payload.get("cast") if isinstance(payload.get("cast"), dict) else {}
+    ability = payload.get("ability") if isinstance(payload.get("ability"), dict) else {}
+    ability_name = first_value(payload, "ability_display_name", "ability_name", "skill_name", "action_name", "weapon_display_name")
+    ability_name = ability_name or first_value(cast, "display_name") or first_value(ability, "name")
+    ability_name = ability_name or first_value(payload, "ability_id", "skill_id", default="Unknown")
+    sequence_value = first_value(root, "sequence")
+    try:
+        sequence = float(sequence_value) if sequence_value is not None else None
+    except (TypeError, ValueError):
+        sequence = None
+
+    return CombatEvent(
+        event_type,
+        str(first_value(payload, "event_id", "id", "sequence_id") or first_value(root, "event_id", "id", "sequence_id"))
+        if (first_value(payload, "event_id", "id", "sequence_id") or first_value(root, "event_id", "id", "sequence_id")) is not None else None,
+        parse_timestamp(first_value(root, "timestamp_utc", "timestamp", "time", "ts")),
+        first_value(payload, "encounter_id", "combat_id", "session_id") or first_value(root, "encounter_id", "combat_id", "session_id"),
+        first_value(source, "id", "entity_id", "user_id", "alias") or first_value(payload, "source_id", "actor_id"),
+        first_value(source, "display_name", "name", "alias") or first_value(payload, "source_name", "actor_name"),
+        first_value(source, "type"),
+        first_value(target, "id", "entity_id", "user_id", "alias") or first_value(payload, "target_id", "victim_id"),
+        first_value(target, "display_name", "name", "alias") or first_value(payload, "target_name", "victim_name"),
+        first_value(payload, "ability_id", "skill_id", "action_id") or first_value(ability, "id"),
+        str(ability_name),
+        max(0.0, amount),
+        max(0.0, first_number(payload, "pre_target_mitigation_amount", "raw_amount", "unmitigated_amount", "raw_value", default=amount)),
+        max(0.0, first_number(payload, "overheal", "overhealing")),
+        max(0.0, first_number(payload, "absorbed", "blocked", "mitigated")),
+        first_bool(payload, "is_crit", "critical", "crit", "is_critical"),
+        first_bool(payload, "is_heavy_hit", "heavy_hit"),
+        first_bool(payload, "periodic", "is_periodic", "dot", "hot"),
+        sequence,
+    )
+
+
+class CombatAbilityResolver:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.healing_abilities: set[str] = set()
+        self.shield_abilities: set[str] = set()
+        self.last_healing_cast: tuple[str, float] | None = None
+        self.last_shield_cast: tuple[str, float] | None = None
+
+    def observe(self, root: dict[str, Any]) -> None:
+        if str(root.get("event", "")).lower() != "loadout_snapshot":
+            return
+        abilities = root.get("data", {}).get("abilities", []) if isinstance(root.get("data"), dict) else []
+        if not isinstance(abilities, list):
+            return
+        self.healing_abilities.clear()
+        self.shield_abilities.clear()
+        for ability in abilities:
+            if not isinstance(ability, dict):
+                continue
+            name = str(ability.get("ability_display_name", "")).strip()
+            lowered = name.lower()
+            if name and "heal" in lowered:
+                self.healing_abilities.add(name)
+            if name and (lowered == "fortify" or "shield" in lowered or "barrier" in lowered):
+                self.shield_abilities.add(name)
+
+    def resolve(self, event: CombatEvent) -> CombatEvent:
+        lowered = event.ability_name.lower()
+        is_healing = event.ability_name in self.healing_abilities or "heal" in lowered
+        is_shield = event.ability_name in self.shield_abilities or lowered == "fortify" or "shield" in lowered or "barrier" in lowered
+        if event.type == "cast_result" and is_healing:
+            self.last_healing_cast = (event.ability_name, event.timestamp)
+            return event
+        if event.type in {"cast_attempt", "cast_result"} and is_shield:
+            self.last_shield_cast = (event.ability_name, event.timestamp)
+            return event
+        if event.type == "shield" and is_unknown_ability(event.ability_name):
+            name = None
+            if self.last_shield_cast and abs(event.timestamp - self.last_shield_cast[1]) <= 3:
+                name = self.last_shield_cast[0]
+            elif len(self.shield_abilities) == 1:
+                name = next(iter(self.shield_abilities))
+            return replace(event, ability_name=name) if name else event
+        if event.type != "heal" or not is_unknown_ability(event.ability_name):
+            return event
+        name = None
+        if self.last_healing_cast and abs(event.timestamp - self.last_healing_cast[1]) <= 3:
+            name = self.last_healing_cast[0]
+        elif len(self.healing_abilities) == 1:
+            name = next(iter(self.healing_abilities))
+        return replace(event, ability_name=name) if name else event
+
+
+class CombatSession:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.total_damage = 0.0
+        self.total_healing = 0.0
+        self.total_shielding = 0.0
+        self.highest_critical_hit = 0.0
+        self.highest_heavy_hit = 0.0
+        self.highest_devastating_hit = 0.0
+        self.damage_hit_count = 0
+        self.critical_hit_count = 0
+        self.heavy_hit_count = 0
+        self.devastating_hit_count = 0
+        self.started_at: float | None = None
+        self.last_event_at: float | None = None
+        self.encounter_started_at: float | None = None
+        self.completed_combat_time = 0.0
+        self.is_active = False
+        self.run_controlled = False
+        self.has_encounter_timing = False
+        self.abilities: dict[str, list[Any]] = {}
+        self.seen_event_ids: set[str] = set()
+        self.recent_damage: deque[tuple[float, float]] = deque()
+        self.recent_healing: deque[tuple[float, float]] = deque()
+
+    def _close_encounter(self, at: float) -> None:
+        if self.encounter_started_at is not None:
+            self.completed_combat_time += max(0.0, at - self.encounter_started_at)
+            self.encounter_started_at = None
+
+    @staticmethod
+    def _add_recent(queue: deque[tuple[float, float]], at: float, amount: float) -> None:
+        queue.append((at, amount))
+        while queue and at - queue[0][0] > 30:
+            queue.popleft()
+
+    def apply(self, event: CombatEvent) -> None:
+        if event.event_id and event.event_id in self.seen_event_ids:
+            return
+        if event.event_id:
+            self.seen_event_ids.add(event.event_id)
+        if event.type == "combat_start":
+            self.reset()
+            self.started_at = self.last_event_at = event.timestamp
+            self.is_active = True
+            self.run_controlled = True
+            return
+        if event.type == "encounter_start":
+            self.has_encounter_timing = True
+            if self.encounter_started_at is not None:
+                self._close_encounter(event.timestamp)
+            self.encounter_started_at = self.last_event_at = event.timestamp
+            self.is_active = True
+            return
+        if event.type == "encounter_end":
+            self.has_encounter_timing = True
+            self._close_encounter(event.timestamp)
+            self.last_event_at = event.timestamp
+            self.is_active = False
+            return
+        if event.type == "combat_end":
+            self._close_encounter(event.timestamp)
+            self.last_event_at = event.timestamp
+            self.is_active = False
+            self.run_controlled = False
+            return
+        if event.type not in {"damage", "heal", "shield"} or event.amount <= 0 or not is_own_event(event):
+            return
+        if not self.is_active:
+            if self.started_at is None:
+                self.reset()
+            self.started_at = self.started_at or event.timestamp
+            self.is_active = True
+        self.last_event_at = event.timestamp
+        if event.type == "damage":
+            self.total_damage += event.amount
+            self._add_recent(self.recent_damage, event.timestamp, event.amount)
+            self.damage_hit_count += 1
+            self.critical_hit_count += int(event.critical)
+            self.heavy_hit_count += int(event.heavy_hit)
+            self.devastating_hit_count += int(event.critical and event.heavy_hit)
+            if event.critical and event.heavy_hit:
+                self.highest_devastating_hit = max(self.highest_devastating_hit, event.amount)
+            elif event.critical:
+                self.highest_critical_hit = max(self.highest_critical_hit, event.amount)
+            elif event.heavy_hit:
+                self.highest_heavy_hit = max(self.highest_heavy_hit, event.amount)
+        elif event.type == "heal":
+            self.total_healing += event.amount
+            self._add_recent(self.recent_healing, event.timestamp, event.amount)
+        else:
+            self.total_shielding += event.amount
+        key = (event.ability_id or event.ability_name).lower()
+        if key not in self.abilities:
+            self.abilities[key] = [event.ability_name, 0.0]
+        self.abilities[key][1] += event.amount
+
+    @staticmethod
+    def _rolling(queue: deque[tuple[float, float]], now: float) -> float:
+        while queue and now - queue[0][0] > 30:
+            queue.popleft()
+        return sum(amount for _, amount in queue) / 30.0
+
+    def snapshot(self) -> dict[str, Any]:
+        now = utc_now()
+        if self.is_active and not self.run_controlled and self.last_event_at is not None and now - self.last_event_at > 12:
+            self.is_active = False
+        if self.has_encounter_timing:
+            duration = self.completed_combat_time + (max(0.0, now - self.encounter_started_at) if self.encounter_started_at is not None else 0.0)
+        elif self.started_at is None:
+            duration = 0.0
+        else:
+            end = now if self.is_active else (self.last_event_at or self.started_at)
+            duration = max(0.0, end - self.started_at)
+        visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
+        largest = visible[0][1] if visible else 1.0
+        top = [{"name": name, "amount": amount, "percent": amount / largest * 100.0} for name, amount in visible[:6]]
+        hits = self.damage_hit_count or 1
+        return {
+            "damage": self.total_damage, "healing": self.total_healing, "shielding": self.total_shielding,
+            "dps": self._rolling(self.recent_damage, now), "hps": self._rolling(self.recent_healing, now),
+            "duration": duration, "active": self.is_active, "abilities": top,
+            "highest_crit": self.highest_critical_hit, "highest_heavy": self.highest_heavy_hit,
+            "highest_dev": self.highest_devastating_hit,
+            "crit_rate": self.critical_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
+            "heavy_rate": self.heavy_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
+            "dev_rate": self.devastating_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
+        }
+
+
+ICON_DATA: dict[str, str] = {
+    "blackholebomb": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAxhJREFUaIHtWk1IVFEUfjM9HRmkxsK0cAJLAxM0WoxTiVpIiLoMdJEatDehoKJc1S4X/SxaRBCTCwfctGgQEXKmghkjUhcWKQYqWkk5SAnp0LTJ734v7sMnGXrAb/W9w3nv3sP5OPecO+NqKe9KG39w4Gixa5X78nevUmO0LwH+ZOSysRFoKe8Cz0qVgrvTu8Azf/m1795/r+zuDdnNJkJ8AK7rbU/xUHW+HnLq7rgLe3VzENJaSMLFIi2Gv6BwTf761Tj45FwMH/X9bLLdq84oPgPiAzC52rBsQsOXwPsHU0hxlHxqm04hrQPh5/CZnvkInxPB09qFf2TOqopHsllKT8DudRWl6RXm8BGfAfEBmFxJuNqwbM7UmPBZOXsBPON4NnxC145pF+gfTGntbx9GSBIRsH2eWmV2G1o5LbunyUU4xAdgORxuX3kBPtqXQMqaWDaV2eAsrfaSmXUtHDVbwct3NIDPLnwAP+LtBE96wuBZqdLtKrRlYPIDVyQ+pLja2MlmbOkm+ELuV+1iOfN7wKu9IfCooeSUaxSDew6/wR4OLlfBPjkXAxefAfEBWKoQT0kG9R7cFzmRzd68Iu1iXz5PgLOcuNo0PsgHX3n5XbvXxs4cGMVnQHwA5tou9pjfqaaq/XkB8NmpIQfvflMP+nbJAm7RGeIzID6Af5KQ6VHTnBPZOAEflK0dj8D5QoAhPgPiA3AkIbupig8jS1VxgNxF1fMY3rX9t6vQVoWthAL1NdwnoS+6964AxvYS1cOMLaq+iA84BsuG+x/+Jsv1r3sn7TfFZ0B8ABYJldVVgA9FBiGbQu8h2PsNNdTbycm2t6FqYycbbqEHetV1ZVldhZL0iPqO+AyID8DFU1h1cxDcH6zQDvLPbiXB+Y6Iwf52sJNNww2f1mc6noCEoj1x2MVnQHwAJleeaE9cDfJXT8LOqQz3qhY3sKQOO65a3Q4WthxSVG0yKi/Cx9pax7UVSXwGxAfwX35mXS9Yxjk+dV6xpM/dUdKKPY5sS2jLwLVZf/awAx+sLK3kJzXxTQ2PY8/iMyA+gN8HEw/q5vxLzwAAAABJRU5ErkJggg==",
+    "bomb": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAA1JJREFUaIHtWk1IVFEUfm98g+k04kxZRjml/dBAjUgKThIT9EPmRsyhHCVEUWjXUvrbJLlt1SIpJGQoFFuZLsJw4Q9ZBCYZCVpmRmZj4egUk/PafedM3Ne8oc1cmG/13TfnnvcO5+Occ98bVTFAk6cc3BbTwNcsv3WRvS2mqcwG1+9PjhvdAtAvxi8Zh0/1gXivJaH3FIf0Aah8YUY2RVG70NGsdRXc9X0DfudzM3Cdy0l/4qXNUx8TPuhGtVd4XfoMSB+A2rZnHxb7M7LBR2zZQtmEI3Pgp9/bhE67PVng28MkpwIvyel4VQ64O3cV94rlO2FveT5DTl1bYBOtJKlLnwHpA9C4bGY21pGmzhAVqOGFCPiouxDct2tJ7HWS7Ls9WfD55TWZXKqnqsUlYR0Yh/3bRWqOB0fHaHNaQikEtclTzmQT+ZetoiiK4is9Af75xUPwHaUXhPbzE2PC6wHrV/COO3ngzW00CjUd+wEJeUtYz41EQaXPgPQBaEY/DC8Qv1FNsrl98xqzIn6+8pDQT13rFfCRV7PgQSatYAvZB6zL4BVVedDTRP8yNFS2OoPr0mdA+gDUIaVYeMIykk3NmSpwh5OaYHhlGjyq7wbvG+wH7+kLCh+CS4tXrZM0/igNfhr9fR7aK30GpA8grpG9KzqKH5KVDcdmhxt8JbQObkZOg72PhXs/dJJNepxOJcQ1Mj7b8CZlJBsulSPqGvhwiGwcTrIxA/veYvCVEFWkv0ZucOkzIH0A2nK+Cw2i9lwDKpLRbMPBZcNH8QNJPgRvZEbIKBgCf8bmNOkzIH0AWkzJxIKn8tHAFHhzwA/Oq9BLnd4LtTiZ15AitOfNq7fzFrjRaY7DcpcqoXKWGpz0GZA+gLhZ6Ok3OjjXtdaD+2sC4EZyMkJti/hExsEbKG+O3L9fIwkdLrTT68eET5DikD4Aw0M9B68e94I9Ce0vX28HN1NtzMhmKWcr+PhiugqlDgxfLRbqlD5XGX2fqigpSuoGvPKYqTb8hcCcSlK5qtHcxeUkfQakD0Dz/VTRFDrs2yCnrmn6eNGoiN8wJ4tkZWMG0mdA+gDUdvcpLDaFw+BvHDrk1MC+eTXuZGPtf6DrE0mFf5Y180+AzOiv9CyUMvgD0cIoulp19QEAAAAASUVORK5CYII=",
+    "chainlightning": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAydJREFUaIHtWUFLVFEUfvfNa2YUR0EmA7URkmBAkYqioLEgWlarFkVto3LTpo3+gCRw40aCoJ37QNxEK3OhNLuMhLJyLK1pNqMwOuPMve3Od95wL8+JFh7wrL535p577uH75tx371PGGC/KlFKRY1xWXRjCQzoDXCoY5lfMb53HlKtYT1eCYv1/XtkhMfEFqCYJ8QeitfZu+H/lA/W5e+TUi7OhNdHgYgXOnnaK1Ssl8otnQHwBQdMz0ddYnyGnqwO4zJSrNI/qSuAH1m304mx0F0rECHLZeJ1xGi+eAfEFBHyT4puOSzacSjXQiY6xvo0OM5wmrLI5JKiUMT+TK5eNKy+XpbddIyieAfEFqJZl09OuGLZ2JL5JhZJ5rNt47chbWCKsC/OReZO3vyGXNZMgE19AaCNzyqa3A7LpTlrHcNMr04STj38RrptJq+SCgeeEa4V55D2ZQpfb2LHmEs+A+AJCXchjr7tmpwbZpOLwFyugda+OSL65DN4kHBu6Btx31yqhupnEQwndRq++JHfiykdrAeIZEF9A4IVPYWRcNk0bCuG2+xuE9/UzawLl9RPW5hPk4b3G+5KXhSzTqzTeJRtu4hkQX4CqLgxFHrTNfhIUbxURzTpP8OgJn9d6OeAy38sBq1H7Qh13U+IZEF+Aqn2/Y/8hM4IuxOTEO1JwdRy8HkesqeD1WGVGCB/zJ6y5XHdT9fdTNH89P2WNFc+A+AJCf22+GZnSOgalB4jWQI1bJ+LXj7HMGLpW5Qv5G2tzCKg2+HjCwYWnmPPNA8J6bc7a2cQzIL4A5yYTercp43pQf3hFVMZHVyITuG62m05ztI62sd/k3J05wcccSehQ2oE+ftWKDxHg6EhcKlwescs37Dk6ujGnTsM/iO5UfzHNI44kdCit+QMHWWhT2/xhHcNlo4IzoPXsFmKrfwj75y9Z5ccP9Tq/1NI3XfEMiC8gJCF+R6SX3xL2L17HKy7rDP45yMak9sivurLAvf3WWO+WD6nssm9h+eUWT3PCTXwBIYpc14zhm+o+yGbzJ7pK+FBPxmWjTp1G7NfPB1lfpJzEMyC+gL+GUTIOjGEWdAAAAABJRU5ErkJggg==",
+    "chakram": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAA49JREFUaIHtWU1IVFEUfs95M/PmF81Sc/KHfmRSI5IMggqsNjKL3Fm0KAINAyGQlBZhLlxELQTDKA1sIeJORJEgClKIZgILKlTE8qcySzJnUsenTbvvnJH7UGvjDc/qu2fO3HfPnG++d+696qnMcoVZjGFV+XuLiZyprgLM6UrIgl9fyQduHMzY0IMSNry0TWbSJ6Ap5rSB36MnC+kUXpxBjE1zIEZLsAEnulLZ/BFgPUq0Uf6BrtJXQPoENLMPOCU8jmSUPrwwA3+Sayeww+ZBzOcfw5jHa89CjF3dAf+8FqJF/E4DrvRPAK9HkaSvgPQJaLrVjRIvGqQSXEk4JdKTcoSqFTXmVVFMYvQM8Ky9Q7gI53Ih8LI6jXk4nbhxaklfAekTUEtyrmPA1YbTZpvuR1lVLQK/3epE/Bd1DjHZvgOIiU6OMTqVChfBqWUWo5i87KSvgPQJaB5HMgYrS6RIuc4bXD2AIzHqi1z7dKJNyi7M0xl8jPi2hntrLiI0cha4cG8qcHfFFA8Tqp/0FZA+gbh/9qV8UgPDMiFUD64YvdZB4LbbYqqcv1YB/LDgDnBLrB84u+8gcPVTouL7oWXgVXSCSV8B6ROIa6cNi7j34MZpwy008hW44f5NYDPavBjoJOwmrJysBeR0unv8DXDx6GFg6SsgfQIaPxeKGvPAdqsTuN1dJ/zy1ctEFU4bboGiVuCPfV7a7Bt+qNyg+gv+dncd/NVK85oJSF8B6RPQPDr1QjORSZQvPSkH/m8hKmV9yydgTpt0bxrt4OamhEeLx9JI9MKZKr1Ex12I/7Ch5f8HFZA+AU2z2DDgtDHbGXHaFBt+4LezrFdhP0vPs4vAgaJWUOXVz1xQaGj8HWIGuoiuvBfi/ZLiEz5KTpM+Ac1rycXAUNbuhY4eKqFBkPqiDBsdD+Y56RCgJdZPisTo1M38Tb1V8D/qIZVr7qAWvcZXCezbowNLXwHpE1DL8nox0FfyxXdbVfTOuRAgCbhS2wOcGBS32dxmj5BqNdUFgLnalNeTytXExLR58jwMLH0FpE9A41eciskdGVcDRaFNOqeBohDm1OLW9YBieE8VpzbroE3Kdm3rXGjTWNy50KoLBVBov88K5y21EbislOj0MvgamG/YzexchDbvp094hDFmtJn+TqolfQWkT8CUQh66ZVXCCzEhndZjXEnMjFNld5ZNeJExOrYEvHVHtpnsDwjTF87lraiZAAAAAElFTkSuQmCC",
+    "drone": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAA4dJREFUaIHdml1IVEEUx8+Na2JaWvZBKWZld9GClEq7ECzhPtRDn5ZFRQ/CPkhRIfTgg2kW9BILBlEgbBAUSEmaYEFruRCsEQtblOa62Sa7lEpSiooabA/VuefWnO72IO34f/rPeObuDPNjznyogHssBgKV62noO/WlohDY5DggrM9bsxF9c2M9+iFXmIYpSaEuAACYydsm7MNvUkSV8+JomNCSfgAKuMewUK6n4VRSbFblF6JflrVW+CGKDae/4cQ04dBSCoL9AACgatNvSf0Wy07MlpI/BgEAYGql9k/t5EeovCcmxKbMeR6979kD9BQhDpucnDxh/cBACL3n3m30fTUdpj5tyJ4PAABvItNYaff5hTipwl9KEK2HCcsY+RFanpGJU0Ox4URxOny0ShhDUeHajn8yVr+i9uds/754vAAAMPXKVI99TmiEqJKy09HPRL6ilx4h0wxwqweVj/imOy7LeH37HsuYYIVDWK+5PbEMh/1XEXGCiJH4pEGIKlVfjV56hJTKcw3CBBF6/xr9cLQfPV15nnhbhB+lCY5+J+x/if7KjZuWnautO41ec3tM/e5+9CP5ST8D0g9ApVNMRbGZDdlsK4T1vb2D6C/UXUVfS1aqgLMlBuklADAHZkD6AZjyAIdNPMkonpWnoqrW8jsULYoTJ+lnQPoBmLbT9PBORZMXt1XmsGl72i6Mv99mbKH37y4RxjRcM05tOx3GKkQTnPQzIP0A1PxDzVjouVuGPp7TGT2YU3HYUFFs4sGJk/QzIP0AVCDXekOuMK5Inoullo05VLgExO1/OJziaau+m+ghxc3CoESW/AhFSo/TMuLUV9OBOBU27sMAusXlUNkbzUFPH0rq4bNlh2iiPHPyGHoOLdNmLiUcQD+ZK87KiSb5EbL7/Fjo1oyb50mmQXfQeJgo0HLRs9ikWGPD7Xk4bALf8tFLPwPSD0AFctNbEOxXxlIXAADAcOZiXJE0twdjmsjhmm6zW+nL0IBhj5CtL30cOeU8K+wQRZSq+tZD9FlLFinRkVEcgFBbQy+Mgr6DC/svio6MQtE6GwDMEYSoYgvHfz7rjBtjG3R50QecxnVi4Ho1+ssndqGnt9YcNhQVepqjN+QcNvbCg/I9cERHRqHYVvxHvfQIKXZnJ/c3y3/A8Opk90pwomq9VImeYkNvth9/SBa25bChSmiE6GrDSXqEvgPayzIHNTLMcgAAAABJRU5ErkJggg==",
+    "fortify": "iVBORw0KGgoAAAANSUhEUgAAACoAAAAwCAYAAABnjuimAAAAAXNSR0IArs4c6QAAAsZJREFUWIXtWUFrE0EUni2zSWyaxqayhoKC2Ip4qQURA3pRCrYHD1ooPYjgRf+BFEQQxOJJ6EF66iVXc1VB9BoPBe2lSFsQLJS4YLSNIU23aE/95luZwe0h4IN8p29mZ2Yf73v73syspwjXJx+AZwoB+G7U/nPAT12bQH9zdd3wre+esiCbH8Tc7Jlh9H959xo85acxd6ceov/Nq2fgPbbF/0eIMVRPTj9Fw9c++E49hGTFcxfQP1w6D77M0m/XMZ6RzQ9a53LY1FaWMDc9cAxhwLaJ8agYQ7VSCm6P9iI8YLn5a3VhZGYMvPZx0zxo2sfzmkXqDzfWrCEkxqNiDNW/G1touOS+feskTamDLR/yZaUhM7dEa5YrZkxA42srS+BiPCrGUO16wMmZ5V6Yew+ev9wHPnPlInj1dAH8w8tF69z7s1et7+IiwhDjUTGGejem59DYbfxEsu3J5dEfnBgBd8nNqG4WrP1vn5h38Zrhxho4Z6FUbw51X4xHxRjqTdx8bBq+D+lzZ4+jvzg2BO6S24UkYcBg6ZVSXek7Bp3q60cjarfAG5+/WSdwMmdwHWe516ufrOM5tFzvSuWOgovxqBhDddRu4UvnJOza5j2fN7X70tRd8CRy81n+0Yt74OXKV3A+9PFuX4xHxRjq3OaxBLwDZ7k5aY8/nLWuw3LzmHLFhEfTsbVjiPGoGEM136Tx1Qof9FgaFonrcpLazdnAJTcf6DKFoFvrOwbNF6eZ/gFrGMR2+46FktTuv5I5OIcH28C2ifGoGENj9+58h6/oUlftRdYw4ASeZJvHyT+2k9e+sYNuFLt3+J2E9ZeLUvEw8DK9htMBkLeFo3emwF2JnZN5ErkZYjwqxlCn9Az+jZI+Yq502q1f//yjF6vdnMy3f6DfJTdDjEfFGJpIegaHQTYwP16aYQ1h4Kzdh5SbIcajYgzdB2byDhdJZKoUAAAAAElFTkSuQmCC",
+    "gleamtwins": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAu1JREFUaIHtmU9oE0EUxmfK4kGqDQjZRCOIJB56EXMTitEitBaP4klFsQqCVBD1Uqi04MEiKip48KBUPAhFBC9Vof4riIdGTwvNVglIMAlEgqbSWnQ95b1vYcZs7KUP/E6/mbyZ3cf7Mm830er6TWVSZ7lO3EjEgiZnbkwY423yb53gPfOfNO2Z3cpBAyfb2hPV8c8rV4nEJ6Bjx87QoL49HZiCshOviX+eum3caPO7PHFQekn8ce45MdpJJdZr5i6er/9g/txgri4w134Riq+A+AScul4k26BVUDbbpB5dJTZ6729KdJmXxNYyF2vMYJtOv0j2E18B8Qk42Q9faXCl+z7xUK5hig/Z5sKGEeKSt0T8wL3c8sKZnpGWMTb5Q0fIfuIrID4BPX2ITyGbbbBJnV/cRYy28bxl4vd72GbYyNbFthC32xCrFZ/4e71ILL4C4hNwznmHaZCqZYixZCrLzzDjtTHiHd5Z46ahtaCVNES0DVpRfAXEJ6D3DT4zVs12AsRdttlUX9K4afnbaeK9yZoxBm1zb+clY8zRt8PEeJqhxFdAfAIODir5O8QunDwKLIR26n/KIWgDm22wSd212MYrLBnn070cj/cpvgLiE3DwtEHZ5lFop4HHB4lTbuuGiCeM7bG8qnitu2m38R7EV0B8AqFTCJ83sGHZhPF4SqDiwHh64P694y+Ma7P7meen2XL/n4VWkxzbBxq/9Za3IZuiNERU//E3xLY3L7QNSnwFxCfg4GOq7STBUuYKk8Svth0gbrch2t7abBa1zYuvgPgEHH+GX9JVz7AxCG0TRStpiP61h21dS3wFxCfgqECNNgf+zNhFU5Bf8UZN8xmljPGoKA0xZGM1xwj3pnTHE+L5xGwTxVdAfAJOqDTBb3MUxoByhUmyEDa1KA0xZBubVVQwywg/X6XLhOIrID4BrUpTMLT9Nsx/qifX8N+gX5YXaMFgvJvm0U6oSLYJwDaar6s29hn3FF8B8Qn8Ab+WKDfzp2QoAAAAAElFTkSuQmCC",
+    "healingpulse": "iVBORw0KGgoAAAANSUhEUgAAACcAAAAqCAYAAAAwPULrAAAAAXNSR0IArs4c6QAAAvJJREFUWIXtWF1Ik2EU/pbf3MSftbnswlk523QiWmogVktJuuwi70IzAosoKcqLiK4iKiKLLiwQCsorIQn6I8GNIFnfhX+LkbKBhn5hmW21rKkN19We90xeWWXQe7Fz9XzP97znHM7Zefe+n8Z07bQUt5/z/lgca7PsGsJD8+3icymZ3Qocp48xguGzQ2lM6mddUsV/NKGTk2krjbYzeBEK3OC24y8Maz2qA6TdpAL7g5YY4aEXunJCJ6f5nWnNnzFA01R8ANhszOA6nQtFgAeGpoG9Tj2VIdbZml6QdIqFrpzQycl0g5XIZFG+qfgK8MDQNNpx7mgt1+nVLg/wrqoC+PRKn8DTqexQGlPT+k9Ns+J/EHbKdgf4bg9rcYnVjBbUVhu5az2DIeDxiTm0ab7yJtOQDZnaa7UUWOjKCZ2cLJHN0P10Gi3IbtgGkXv4EXCJtfWPAtC1Y+MLwC0HxxDXozoQd6q5ARqhKyd0cpq2PnZM+jDFpuxFz0iMtyAvzMr+oPM81+mhE5eBZ3P6uRpjy3XgHfITtNVZvQRe6MoJnZy81RpB+/r6i/Aiz6xFqUuz90Ozt6YMmtU24bZjJ4FdSh3w6MJj+Azdb4fPyd3boXFW68ELXTmhk5PpQ5WTHZm8D01EFQTvUnzcKabmUnzctdrwD9DazeXgA6/YztC7oT51ZFqzaTZ196OkjjQvu2Pe66Y6aOoKL4EstORx77OT6iz0LycvJMSLg8w9zSDTt1RAv/TOm2rrmk3Wv1HwELHpgMsqc4F9w5+BB9/fRtlHZ5ieWnR5kbabO9369Rbg5VV4oSsndHIJm7ApLQhc32rnnpDdz9Skm/AKw1p9xT6ugP60ohtTbV27yRIp+9vxTLSs3vkFou86dpe07rRAn6ULgzdnMJxtSAeOZBQAf81hfvzBXMSKLkbgU/7IPioKXTmhk0uY1iIrK29nVz6dSuCFcjZxR8hHP0kySHxjF5YOxUJfIBad0In2w8BCV07o5H4BT7/k67qiWgoAAAAASUVORK5CYII=",
+    "icecube": "iVBORw0KGgoAAAANSUhEUgAAAC0AAAAtCAYAAAA6GuKaAAAAAXNSR0IArs4c6QAAAtBJREFUWIXtWd9Lk2EU/j6bI+fnUnOfW5kQS0crL7qIwKQtIvsFRkQQFCJsdtNtd4EXkv9Al9mgLoIuIsgbyauCkmGURWZroKHV1KkU0ialaFc95yzel2+DGBzwuXq+85733eGch/P+mGmUEz3XivHa1NjNv6TivwRTZogM2iyqZPfuEB8adPZ//EpprszlwdeqPY4y0EFkpkUG/a88qGS766hM3iryqGG8qR7+kVwI/r6Zdbg8Sj1UysA3kQKvC53D3O1VPtgXNr5yjnVEZlpk0C7dQK1lgf/Y76cSs84QWT+Ish7yNcHubbDg39dxS7l+0v2WfyoltJSfIom6yS4y0yKD1srj4o1ulCzROwD7sfAJlCziOUxlzdHc9iB1gHBIvX578CT46NQieHKMZJNxL2J93m1EZlpk0C5/azM+5tOz4InhEeWEaP1xlIzL4FSUfL7MqX9s8hNxLolikG/YuXU0LTtc8+lZlDs2eBMDXB58g4ifJUnsCagX5fanz4hzSXBpcSTHiPvHJ8B/+m1wkZkWGbR2c9FBJwneMXRdQicJjpHQR/DG31F0DGucdCYy0yKD1sqjL3senHcMjlIlodtQCmTz/gPowg4v2d+NgorMtMigzdjaDB1B2YYSO9MJftfVbKjANw4drk8vK+1XNjfA++0nNMDfTPjl+sg+UJGZFhl0YfdgpbGDcfB4Kx1ZL71QS4V3hgemcy4KOsZ9JomjLSSJxlp+4d06mpYdrkR20tHJTjtLgoN3Bi4Vbj/95jb4rsudKH2mrZokMb1MUvm+Cioy0yKDLvlo+pwuEEa2Y1Xpw+UUZZ2nn72fGAMXQDP8Wew1vZQaAXb26LoKKjLTIoM2jW/DdLG1wxjgT2Elo+2A2t7iUdsDXvX/LHMrxLt6QUVmWmTQ5t6ll/j4/GtFKRUdtBvTUIrKXVFJdmsb8RpN42Iy0EFkpkUG/QfUGse1mx6jwQAAAABJRU5ErkJggg==",
+    "kusarigama": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAA95JREFUaIHtmV1IU2EYx8+Zp53pdmY7rVN+NNNabW6pZYpYVqjUTfRhUdBF1EXfSBdFV9FNXRcRREFdVFeBghVFRVghhEhEn+ZHmGbqNDPn3Gqlrqv+zyu8Q4Uu9oLP1e999u55z7Pnf96vydWeboln3ow5XD9rGUssU/b5OTrO5f7BMXD0Tww8356ExreRcfkfF6y0cuObpnyCBDfhE1AkSYoxbTlOP/TRHAr69GkkibRQUkziWLItCTzU/wdsT6bf7uMQ+QdDE2CTEQZ3dCngnCwVYwlfAeETUCRGNk6N8glHqZRWlfx2XUH57CEKdK0oMvVoRXH8TW+47sUN+RirzxUkeXelgoWvgPAJyJcrAmh8Db0HZ2p+lO9jD80SnWVU7vJLef/nKdoXAesb+8jf9Aq4uCEfPOwKzEooYUxpHniHRq6xArKpbT8Df8qmLeBHN3YyTIE8mcvBThMtOtOxwQnaF+1vvgeul1aBOyWS04+XjWDhKyB8AnK1pxuyaY6cxQcNgZvcL/iytmIGMGI6/AtSMsFjE6PgmrYL3D1SPMlNktOd1+Bb+0i679/dBwtfAeETkCtcB1FiVjZex3pIJUtbCf8SrRzs1vO48piOsYsjax/GtoFZObV8bQXbU9NmF7KEsUkrTtH8KpTGr9Nbn2+UcqXCyqBLaeV1kYod2YjZM/wQ/usdJxDziM8L/2CQtvGsbLRkDXFGgrRfEr4Cwicgm80WlLIy8yjKtDn7FHc77dRM6PNjfAT+wC/iiImOanNNj8G9o3VgX6oV8Z/Gkc3qrAqMle2gmXBXwUmw8BUQPoFJh3rFZMYHLdEWeuv1Hvi/O4bAv2293KCx7jZwMER9piObpTklGFfX3fDv8p/k3l8JXwHhE5BXFe5Aw+OjLW5vzxewRc1A+Qb6P8G/bTed1F48a5Z4fcomOsDxZFNeeZz7cGwct14A2aSrLviFr4DwCchl6w6gEQ4PQSqsPM6dPjSjoKfPXQXXXDkPZmUzHWOlxcpJVW2zs1DCmLyh/BgaFosNEqp/chH+hekulExV6X8xh54G3rx9D75bd/su/OwBPEVNRpxI9Cf3gaxWuihgJR1PTsJXQPgEFPZ0Y7G4uZ2WeeifiVw/Xfc5DeeUsjEMN2STOo/k4fUXgkOhfvDTh7Xc0x8raXaWE74CwieghMPf0ah/8gDMvvWlG3K5ZY0nG/behpWNqpDkItFh+Nes3QhOMqvgtldvwXsPV4PZhVX4CgifgGw208JkGDQLDQy0z+jakJUNO7OVlFWBbQ66QCgpXg9/Y9NzcOBzEMzKkjWvv3B2L5Qw9hfQmEenCdPf3wAAAABJRU5ErkJggg==",
+    "machinegun": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAzJJREFUaIHtmU1IVFEUx+97Ppv8TJqaslFBcjMSDKW0iIrQKAzKkKhs0we4jQiCFi5d1LKtwbRoJYRoUG1UMEnEUhMrJWSmSBlnRoeasRm/3rx2/3uU+3hORnjAs/rf++69j8P5ce6592pWv6BmiWzsmbrb7PU7Th0sWlH2v0qt0qbmtI7u+KdtbuwdMIQdNhQPS9Rms6juD45gaiIf/YtrBnT5Si70cMIFXZojqQmblh3SGMQ+Auwd0Kx20nonav7Xj9s/eoFZ8FfeX6/DPgLsHTDEIMlCd8gXm02Kmt2GtclNys4cN6/H36ah2UeAvQOa1S8R8jS6s5pcXOhS9l8x8pX9L9ZSWY3fYEq02EeAvQOG3Ydyn8ww12/cc1yor78bOtDTBU0xa2h+oJwbeNoG3XlwP+qu3qUVbHZpodO6aKcW2jamWbfIRnZbfqAZqebsZejobEi50KYwez0EPdN0H/rM1+fQHTY4PfqZAE5RM4Mx7CPA3gHNuklKaE18UA3ydEmcgq3V0HOfE9AdQx7lDzpLTOhkJAl99eUw9JuWeugTJy/KNQlOdsY+Auwd0DKXCtDIjFUhI+XUj6OfIrQVu9bSCj0d+gRtl9n8v2Xt1FCiLsXZR4C9A5p5+gAaemUEGcns8yMjlSZnMCbbLPQkPApN6ytqPybHlf3H9lZCHypUl23sI8DeAUOvi6Bhzeah3sipG0cdEqY4tX2xWWrGpl+axyuRqKo8At1BEKL1T9NciGyscu5oXGYt9hFg78C6Qz29C7IMF0492uoyspOn242wbqUuojhRGyGnufU4xfDfkl0FOyeybWO2JzKK02gkHyHLuOQdTu2eeSVa/8qijQtAKDDhRoZ8GJRj2EeAvQNa9G4RGlM9ZcDp1PFJ5YSBYR90uigOtBZyZenbfDgJtAbe+7JCS8tYwGZCX5Qba64knT6IsI8AeweMqZ4yNCq8MSARi0u0Uul1t9CI5TlfBJqiNbaUxjqmawk6JfcxceFoSImZpWvQ31O7HR1gHwH2Dji+RwkhxNtqiUeFNwa9AS3YfLxY+cJu90Z2ft+yRJe87IfJFWLYVD/as48Aewf+ALU0C2C6KmUhAAAAAElFTkSuQmCC",
+    "minigun": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAtpJREFUaIHtmk1IVFEUx+/r3QpqbDFjYxj4lSNMimbZh9Amah0ErYo2EkREHwgtXJRai3aRRZsWbqRWLaqFEGQgRCkYlFSCM6UJDY6JLcbIKbN25/yDe5j3aPMOzFn933333evh/+Pec+/omeF7xhm+Zd2e/OPskyt4pH/84vZvK+7+HdXuuaSYyLGeLrKefEdyXbgRoxfqE7BmapGf0pVs/e9Vbn8ww3pfnLHZBPkjNoBKav8158SZ8asl+0j9MdQ7oD4Bz3SdYetbW/hNwmdUNrA0P2GBSdiS2GzeVuGc+Pt8wdkepH/m7mnS6h1Qn4A1VUnmI78Ar5IsY5Bn9XrGBjaX1DnG5sjxk6SfPbwf6g9CVCScEFf1DqhPwJob1/np1h13r+U1NzYDQ6RFuyHCrkhSO4Z6B9Qn4InYGEPYNGRytFL5wyPUjkhs3d5Aevb1W9Jd3b2kB2/2OyfCcSRsyrVQVMPGx9jupQNthEd6fIqwWR2boHZE4vnoI9KIDW5k/xOIFtZXiJN6B9Qn4LUc49K0+GbSeRgPi01NTSPpublsyXaslyT8sE+5nI5SWMQmSBkcFpvsDN/hYOD4dXvaSL968YS0dArDUO+A+gSshI1U+obFprGeLwokbL5++URaxAavJT8u0Sar3gH1CVjEQCprdzbVOT8Oiw2OL2Jz8RRPgNgUinz5sCNOUr0D6hOw+CDdyfT2XSDd33e75KBBVrPOg0ed/U3TRtYv84DNFm6v4NOiegfUJ/APQmg3WowRBCcsvzGkEhpXntholrBZ3l3PH4/Mc6l/gtvVO6A+Ae/x0/dkzYfpWXqBJy+MIJsUhnjPg9hkPjM2qVrulPBBw48pvi3XQpEJb1fnYbIGVxXESVo9wm5SgbDBH1mq4D8EcIMzpoxQZMI7e3mAbMIDtYSTFOImdaiddKy4xtjsbeWPL51n3XOFdX6BEWqu5booXUlSvQPqE/gLeogp8ai51SkAAAAASUVORK5CYII=",
+    "pyrosphere": "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAA3lJREFUaIHtWU1IVFEUvu9nRqdxZpSU0sY0wkqmMMFMBCEiIpBo6UJa5CIwwpa1KFq0a5UQuas2LWIoEBEmaCFEEOoqMy0htDIzZ7KZQWecnzet+s4ZuI+ZafUu+K2+e+bc896Z83Huee9p94KXxT9UuZfBv7t+Ff7xhq1uUQqhqgWpvXd/Vcm9S+uN4GFjTuoTLAQ03JsWh10vGd3hUD4B068nsEhkWiGbM1oK9mzwJ8rXFA3AZyrtgQ+Xyt6TX8FzoQy4frxeehM9ff20aJPfaNiYw3W5nJSvgPIJmAnLj9LwTqJ7AlLZdD8mH7veZAk/XeA5SVTMM/5wmPzfPAPvWRqU2sXQCVAuJ+UroHwC2svDXShHqroWsvkSb4T91qUpbOBdxRy+UdHFuCSsD1FpHO6j98nlND3UTj4V3YEDoXwCWrjzLBaLGweksrEGqKvw0nPYHVJcBnYoRzZFca6Pkb1kdIdD+QTMSmVTTufJjY2ylY0MykA5/spXQPkETLsfbGXDOoAtQvI4XE4clUqraO9/73QIlE/AVkJ2spmI7CsZtH+AnubKkQfvWpXOV8pXQPkEiiRU9ADO5pBJG9nM+urAO+qSGMUnr3hwOF68IO9a5Tzs281C716dJrt0p0JQPgHbLmQHLpvW3BZkE40ZsK/6fLQhQrT/CetOLKbtCM1eCFjsEAwbOWkcJaF8AmXNQkI0g3UlN8GjHjf4wT3b6DyJlAZpvfCbsM+ONMH/ztX37Fp8/CbcHz8PvvF6GrytvXr31aJjYC42LNFi3i11ajySQsnWPtMhtWx6wbPbJJukTj4tYEKMeLfBb47Wlry5o8EFxBSb9BFkbdm1+2rRMdAenOvAYiZGpX/auwr73bfHwFvSdHg1ZDPw/+SpgX3DpMqvaykmJzrgjEICTvEcHUxeQQei5qK34rz7/XDvdiHnwJyJ0Xeu4VNRlCYXInl0Rah8i9XknzC88PflSQZJk6TYnHfBZ8VIkpwEfViJuZPYW8NkxmXz26Q4TZk07MpXQPkENL5IPaInr4kIPSWNf/NJOwmHZaURq3uLOg8fv+t3qINlhQV7XneBZzWyWxr9v678DvjtjzQXKV8B5RMoGqc919bBBzsPgQcKbpT+j6BSxjXqVMIQNJ8w2fBOIoQoCCmog3HJrWjUnYSpF8kd15IHVAfKJ/AXPXYsyqmnxLkAAAAASUVORK5CYII=",
+}
+
+
+def default_record_data() -> dict[str, Any]:
+    return {
+        "HighestDamage": None, "HighestHealing": None,
+        "HighestNormalHit": None, "HighestCriticalHit": None,
+        "HighestHeavyHit": None, "HighestDevastatingHit": None,
+        "BestDamage60": 0.0, "BestDamage60At": None,
+        "BestHealing60": 0.0, "BestHealing60At": None,
+        "BestRunDamage": 0.0, "BestRunDamageAt": None,
+        "BestRunHealing": 0.0, "BestRunHealingAt": None,
+        "LifetimeDamage": 0.0, "LifetimeHealing": 0.0, "RunsTracked": 0,
+        "LastUpdatedUtc": None, "CountedLogs": [], "LogSequenceCheckpoints": {},
+        "LogDamageTotals": {}, "LogHealingTotals": {}, "LogHitDamageTotals": {},
+        "LifetimeHitDamage": {"Normal": 0.0, "Critical": 0.0, "Heavy": 0.0, "Devastating": 0.0},
+        "RecentEventIds": [],
+    }
+
+
+def merge_defaults(loaded: Any, defaults: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(loaded, dict):
+        return defaults
+    result = dict(defaults)
+    result.update(loaded)
+    for key in ("LogSequenceCheckpoints", "LogDamageTotals", "LogHealingTotals", "LogHitDamageTotals"):
+        if not isinstance(result.get(key), dict):
+            result[key] = {}
+    for key in ("CountedLogs", "RecentEventIds"):
+        if not isinstance(result.get(key), list):
+            result[key] = list(result.get(key) or [])
+    if "LifetimeHitDamage" in defaults:
+        hit_defaults = defaults["LifetimeHitDamage"]
+        result["LifetimeHitDamage"] = merge_defaults(result.get("LifetimeHitDamage"), hit_defaults)
+    return result
+
+
+def dict_key_casefold(mapping: dict[str, Any], key: str) -> str | None:
+    folded = key.casefold()
+    return next((existing for existing in mapping if existing.casefold() == folded), None)
+
+
+class FlexRecordStore:
+    def __init__(self, records_path: Path | None = None) -> None:
+        self.path = records_path or RECORDS_PATH
+        self.active_log: str | None = None
+        self.damage_window: deque[tuple[float, float]] = deque()
+        self.healing_window: deque[tuple[float, float]] = deque()
+        self.sequences_this_read: set[float] = set()
+        self.ids_this_read: set[str] = set()
+        self.dirty = False
+        self.last_save = 0.0
+        if records_path is None:
+            self._migrate_legacy()
+        self.data = self._load()
+        self.save(force=True)
+
+    def _migrate_legacy(self) -> None:
+        if self.path.exists():
+            return
+        legacy = LOCAL_APP_DATA / "SoulboundMeter" / "records.txt"
+        if legacy.resolve() == self.path.resolve() or not legacy.exists():
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(legacy, self.path)
+        except OSError:
+            pass
+
+    def _load(self) -> dict[str, Any]:
+        defaults = default_record_data()
+        if not self.path.exists():
+            return defaults
+        try:
+            return merge_defaults(json.loads(self.path.read_text(encoding="utf-8")), defaults)
+        except (OSError, json.JSONDecodeError):
+            try:
+                recovery = self.path.with_name(f"{self.path.name}.recovery-{datetime.now():%Y%m%d%H%M%S}.txt")
+                shutil.copyfile(self.path, recovery)
+            except OSError:
+                pass
+            return defaults
+
+    def begin_log(self, path: str) -> None:
+        try:
+            self.active_log = str(Path(path).resolve())
+        except OSError:
+            self.active_log = path
+        self.damage_window.clear()
+        self.healing_window.clear()
+        self.sequences_this_read.clear()
+        self.ids_this_read.clear()
+
+    def _log_key(self) -> str:
+        return self.active_log or "legacy-or-manual-source"
+
+    def _persisted(self, event: CombatEvent) -> bool:
+        log_key = self._log_key()
+        checkpoints = self.data["LogSequenceCheckpoints"]
+        actual_key = dict_key_casefold(checkpoints, log_key)
+        if event.sequence is not None and actual_key is not None and event.sequence <= float(checkpoints[actual_key]):
+            return True
+        return bool(event.event_id and event.event_id in set(self.data["RecentEventIds"]))
+
+    def _checkpoint(self, event: CombatEvent) -> None:
+        if event.sequence is None:
+            return
+        log_key = self._log_key()
+        checkpoints = self.data["LogSequenceCheckpoints"]
+        actual_key = dict_key_casefold(checkpoints, log_key) or log_key
+        if actual_key not in checkpoints or event.sequence > float(checkpoints[actual_key]):
+            checkpoints[actual_key] = event.sequence
+            self.dirty = True
+
+    @staticmethod
+    def _record(event: CombatEvent) -> dict[str, Any]:
+        return {
+            "Value": event.amount, "AbilityName": event.ability_name, "TargetName": event.target_name,
+            "Timestamp": timestamp_text(event.timestamp), "Critical": event.critical, "HeavyHit": event.heavy_hit,
+        }
+
+    def _update_record(self, key: str, event: CombatEvent) -> None:
+        current = self.data.get(key)
+        if not isinstance(current, dict) or float(current.get("Value", 0)) < event.amount:
+            self.data[key] = self._record(event)
+
+    @staticmethod
+    def _hit_key(event: CombatEvent) -> str:
+        if event.critical and event.heavy_hit:
+            return "Devastating"
+        if event.critical:
+            return "Critical"
+        if event.heavy_hit:
+            return "Heavy"
+        return "Normal"
+
+    def _add_total(self, collection_key: str, amount: float) -> float:
+        mapping = self.data[collection_key]
+        log_key = self._log_key()
+        actual_key = dict_key_casefold(mapping, log_key) or log_key
+        mapping[actual_key] = float(mapping.get(actual_key, 0)) + amount
+        return mapping[actual_key]
+
+    def _run_hit_damage(self) -> dict[str, float]:
+        mapping = self.data["LogHitDamageTotals"]
+        log_key = self._log_key()
+        actual_key = dict_key_casefold(mapping, log_key) or log_key
+        if actual_key not in mapping or not isinstance(mapping[actual_key], dict):
+            mapping[actual_key] = {"Normal": 0.0, "Critical": 0.0, "Heavy": 0.0, "Devastating": 0.0}
+        return mapping[actual_key]
+
+    def apply(self, event: CombatEvent) -> None:
+        if not is_own_event(event) or event.type not in {"damage", "heal"} or event.amount <= 0:
+            return
+        if event.sequence is not None:
+            if event.sequence in self.sequences_this_read:
+                return
+            self.sequences_this_read.add(event.sequence)
+        if event.event_id:
+            if event.event_id in self.ids_this_read:
+                return
+            self.ids_this_read.add(event.event_id)
+
+        window = self.damage_window if event.type == "damage" else self.healing_window
+        window.append((event.timestamp, event.amount))
+        while window and event.timestamp - window[0][0] > 60:
+            window.popleft()
+        rolling = sum(amount for _, amount in window)
+        best_key = "BestDamage60" if event.type == "damage" else "BestHealing60"
+        best_at_key = best_key + "At"
+        if rolling > float(self.data.get(best_key, 0)):
+            self.data[best_key] = rolling
+            self.data[best_at_key] = timestamp_text(event.timestamp)
+            self.dirty = True
+
+        already_counted = self._persisted(event)
+        self._checkpoint(event)
+        if already_counted:
+            self.save_if_due()
+            return
+
+        log_key = self._log_key()
+        counted = self.data["CountedLogs"]
+        if not any(str(item).casefold() == log_key.casefold() for item in counted):
+            counted.append(log_key)
+            self.data["RunsTracked"] = int(self.data.get("RunsTracked", 0)) + 1
+
+        if event.type == "damage":
+            self.data["LifetimeDamage"] = float(self.data.get("LifetimeDamage", 0)) + event.amount
+            self._update_record("HighestDamage", event)
+            hit_key = self._hit_key(event)
+            record_key = {"Normal": "HighestNormalHit", "Critical": "HighestCriticalHit", "Heavy": "HighestHeavyHit", "Devastating": "HighestDevastatingHit"}[hit_key]
+            self._update_record(record_key, event)
+            run_total = self._add_total("LogDamageTotals", event.amount)
+            run_hits = self._run_hit_damage()
+            run_hits[hit_key] = float(run_hits.get(hit_key, 0)) + event.amount
+            lifetime_hits = self.data["LifetimeHitDamage"]
+            lifetime_hits[hit_key] = float(lifetime_hits.get(hit_key, 0)) + event.amount
+            if run_total > float(self.data.get("BestRunDamage", 0)):
+                self.data["BestRunDamage"] = run_total
+                self.data["BestRunDamageAt"] = timestamp_text(event.timestamp)
+        else:
+            self.data["LifetimeHealing"] = float(self.data.get("LifetimeHealing", 0)) + event.amount
+            self._update_record("HighestHealing", event)
+            run_total = self._add_total("LogHealingTotals", event.amount)
+            if run_total > float(self.data.get("BestRunHealing", 0)):
+                self.data["BestRunHealing"] = run_total
+                self.data["BestRunHealingAt"] = timestamp_text(event.timestamp)
+
+        if event.event_id:
+            ids = self.data["RecentEventIds"]
+            ids.append(event.event_id)
+            if len(ids) > 5000:
+                del ids[:-5000]
+        self.data["LastUpdatedUtc"] = timestamp_text(utc_now())
+        self.dirty = True
+        self.save_if_due()
+
+    def snapshot(self) -> dict[str, Any]:
+        self.save_if_due()
+        result = dict(self.data)
+        result["CurrentRunHitDamage"] = dict(self._run_hit_damage())
+        return result
+
+    def save_if_due(self) -> None:
+        if self.dirty and utc_now() - self.last_save >= 0.5:
+            self.save()
+
+    def save(self, force: bool = False) -> None:
+        if not force and not self.dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, self.path)
+            self.dirty = False
+            self.last_save = utc_now()
+        except OSError:
+            pass
+
+
+class AppSettings:
+    DEFAULTS = {
+        "CombatLogPath": None, "CombatLogFolder": None, "CleanupOldCombatLogs": False,
+        "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
+    }
+
+    def __init__(self) -> None:
+        self.data = dict(self.DEFAULTS)
+        try:
+            loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.data.update({key: loaded[key] for key in self.DEFAULTS if key in loaded})
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def get(self, key: str) -> Any:
+        return self.data.get(key, self.DEFAULTS.get(key))
+
+    def set(self, key: str, value: Any, save: bool = True) -> None:
+        self.data[key] = value
+        if save:
+            self.save()
+
+    def save(self) -> None:
+        try:
+            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_PATH.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+
+class CombatLogWatcher:
+    def __init__(self, configured_folder: str | None, cleanup_enabled: bool,
+                 event_callback: Callable[[CombatEvent], None], log_callback: Callable[[str], None],
+                 status_callback: Callable[[bool, str], None]) -> None:
+        self.folder = self._normalize_folder(configured_folder)
+        self.cleanup_enabled = cleanup_enabled
+        self.event_callback = event_callback
+        self.log_callback = log_callback
+        self.status_callback = status_callback
+        self.resolver = CombatAbilityResolver()
+        self.active_path: Path | None = None
+        self.position = 0
+        self.partial = b""
+        self.last_status: tuple[bool, str] | None = None
+
+    @staticmethod
+    def _normalize_folder(path: str | None) -> Path | None:
+        if not path:
+            return None
+        candidate = Path(path).expanduser()
+        if candidate.is_file():
+            candidate = candidate.parent
+        try:
+            return candidate.resolve()
+        except OSError:
+            return None
+
+    @staticmethod
+    def default_folder() -> Path | None:
+        root = LOCAL_APP_DATA / "worldwidewebb"
+        candidates = [root / "combat_logs", root / "combat-logs", root / "logs" / "combat", root / "logs", root]
+        return next((folder for folder in candidates if folder.is_dir() and CombatLogWatcher.find_newest(folder)), None) or next((folder for folder in candidates if folder.is_dir()), None)
+
+    @staticmethod
+    def verified(path: Path) -> bool:
+        try:
+            with path.open("r", encoding="utf-8-sig", errors="strict") as handle:
+                for _ in range(32):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    try:
+                        root = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(root, dict):
+                        continue
+                    if str(root.get("event", "")).lower() == "log_header":
+                        return True
+                    data = root.get("data")
+                    if isinstance(data, dict) and str(data.get("format", "")).lower() == "soulbound_combat_log":
+                        return True
+        except (OSError, UnicodeError):
+            pass
+        return False
+
+    @staticmethod
+    def files(folder: Path) -> list[Path]:
+        try:
+            return [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS]
+        except OSError:
+            return []
+
+    @classmethod
+    def find_newest(cls, folder: Path) -> Path | None:
+        verified = [path for path in cls.files(folder) if cls.verified(path)]
+        try:
+            return max(verified, key=lambda path: (path.stat().st_mtime_ns, path.stat().st_ctime_ns, path.name.lower()), default=None)
+        except OSError:
+            return None
+
+    @classmethod
+    def cleanup_old_logs(cls, folder: Path, keep: int = 10) -> int:
+        verified = [path for path in cls.files(folder) if cls.verified(path)]
+        try:
+            verified.sort(key=lambda path: (path.stat().st_mtime_ns, path.stat().st_ctime_ns, path.name.lower()), reverse=True)
+        except OSError:
+            return 0
+        removed = 0
+        for path in verified[keep:]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    def _status(self, connected: bool, message: str) -> None:
+        status = (connected, message)
+        if status != self.last_status:
+            self.last_status = status
+            self.status_callback(connected, message)
+
+    def change_folder(self, folder: str) -> None:
+        self.folder = self._normalize_folder(folder)
+        self.active_path = None
+        self.position = 0
+        self.partial = b""
+
+    def poll(self) -> None:
+        if self.folder is None:
+            self.folder = self.default_folder()
+        if self.folder is None or not self.folder.is_dir():
+            self._status(False, "Waiting for combat-log folder")
+            return
+        newest = self.find_newest(self.folder)
+        if newest is None:
+            self._status(False, "Waiting for a combat log")
+            return
+        if self.active_path is None or str(self.active_path).casefold() != str(newest).casefold():
+            self.active_path = newest
+            self.position = 0
+            self.partial = b""
+            self.resolver.reset()
+            self.log_callback(str(newest))
+            removed = self.cleanup_old_logs(self.folder, 10) if self.cleanup_enabled else 0
+            suffix = f" · cleared {removed} old" if removed else ""
+            self._status(True, f"Reading {newest.name}{suffix}")
+        try:
+            size = newest.stat().st_size
+            if size < self.position:
+                self.position = 0
+                self.partial = b""
+            with newest.open("rb") as handle:
+                handle.seek(self.position)
+                chunk = handle.read()
+                self.position = handle.tell()
+            if chunk:
+                parts = (self.partial + chunk).split(b"\n")
+                self.partial = parts.pop()
+                for raw in parts:
+                    self._consume(raw.rstrip(b"\r"))
+                if self.partial:
+                    try:
+                        json.loads(self.partial.decode("utf-8-sig"))
+                    except (json.JSONDecodeError, UnicodeError):
+                        pass
+                    else:
+                        self._consume(self.partial)
+                        self.partial = b""
+            self._status(True, f"Reading {newest.name}")
+        except PermissionError:
+            self._status(False, "Cannot read combat-log folder")
+        except OSError:
+            self._status(False, "Combat log temporarily unavailable")
+        except UnicodeError:
+            self._status(False, "Combat log must be UTF-8")
+
+    def _consume(self, raw: bytes) -> None:
+        if not raw.strip():
+            return
+        try:
+            root = json.loads(raw.decode("utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeError):
+            return
+        if not isinstance(root, dict):
+            return
+        self.resolver.observe(root)
+        event = parse_combat_event(root)
+        if event is not None:
+            self.event_callback(self.resolver.resolve(event))
+
+
+class WindowsApi:
+    HOTKEY_ID = 0x5342
+    WM_HOTKEY = 0x0312
+    PM_REMOVE = 0x0001
+    MOD_ALT = 0x0001
+    MOD_SHIFT = 0x0004
+    MOD_NOREPEAT = 0x4000
+    VK_D = 0x44
+    GWL_EXSTYLE = -20
+    WS_EX_TRANSPARENT = 0x20
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint), ("wParam", ctypes.c_size_t),
+            ("lParam", ctypes.c_ssize_t), ("time", ctypes.c_uint),
+            ("pt_x", ctypes.c_long), ("pt_y", ctypes.c_long), ("lPrivate", ctypes.c_uint),
+        ]
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.available = os.name == "nt"
+        self.root = root
+        self.hwnd = 0
+        self.hotkey_registered = False
+        if not self.available:
+            return
+        self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+        hwnd_type = ctypes.c_void_p
+        self.user32.RegisterHotKey.argtypes = [hwnd_type, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+        self.user32.RegisterHotKey.restype = ctypes.c_bool
+        self.user32.UnregisterHotKey.argtypes = [hwnd_type, ctypes.c_int]
+        self.user32.UnregisterHotKey.restype = ctypes.c_bool
+        self.user32.PeekMessageW.argtypes = [ctypes.POINTER(self.MSG), hwnd_type, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+        self.user32.PeekMessageW.restype = ctypes.c_bool
+        self.user32.GetWindowLongW.argtypes = [hwnd_type, ctypes.c_int]
+        self.user32.GetWindowLongW.restype = ctypes.c_long
+        self.user32.SetWindowLongW.argtypes = [hwnd_type, ctypes.c_int, ctypes.c_long]
+        self.user32.SetWindowLongW.restype = ctypes.c_long
+        self.user32.ShowWindow.argtypes = [hwnd_type, ctypes.c_int]
+        self.user32.ShowWindow.restype = ctypes.c_bool
+        self.user32.IsWindow.argtypes = [hwnd_type]
+        self.user32.IsWindow.restype = ctypes.c_bool
+        self.user32.IsWindowVisible.argtypes = [hwnd_type]
+        self.user32.IsWindowVisible.restype = ctypes.c_bool
+        self.user32.IsIconic.argtypes = [hwnd_type]
+        self.user32.IsIconic.restype = ctypes.c_bool
+        self.user32.GetWindowThreadProcessId.argtypes = [hwnd_type, ctypes.POINTER(ctypes.c_ulong)]
+        self.user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        self.user32.GetWindowRect.argtypes = [hwnd_type, ctypes.POINTER(self.RECT)]
+        self.user32.GetWindowRect.restype = ctypes.c_bool
+        self.user32.GetDpiForWindow.argtypes = [hwnd_type]
+        self.user32.GetDpiForWindow.restype = ctypes.c_uint
+        self.kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+        self.kernel32.OpenProcess.restype = ctypes.c_void_p
+        self.kernel32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+        self.kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+        self.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self.kernel32.CloseHandle.restype = ctypes.c_bool
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                self.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+        root.update_idletasks()
+        self.hwnd = int(root.winfo_id())
+        self.hotkey_registered = bool(self.user32.RegisterHotKey(
+            self.hwnd, self.HOTKEY_ID, self.MOD_ALT | self.MOD_SHIFT | self.MOD_NOREPEAT, self.VK_D))
+
+    def poll_hotkey(self) -> bool:
+        if not self.available or not self.hwnd:
+            return False
+        message = self.MSG()
+        return bool(self.user32.PeekMessageW(ctypes.byref(message), self.hwnd, self.WM_HOTKEY, self.WM_HOTKEY, self.PM_REMOVE))
+
+    def set_click_through(self, enabled: bool) -> None:
+        if not self.available or not self.hwnd:
+            return
+        style = self.user32.GetWindowLongW(self.hwnd, self.GWL_EXSTYLE)
+        new_style = style | self.WS_EX_TRANSPARENT if enabled else style & ~self.WS_EX_TRANSPARENT
+        self.user32.SetWindowLongW(self.hwnd, self.GWL_EXSTYLE, new_style)
+
+    def minimize(self) -> None:
+        if self.available and self.hwnd:
+            self.user32.ShowWindow(self.hwnd, 6)
+        else:
+            self.root.iconify()
+
+    def find_soulbound(self) -> tuple[int, int] | None:
+        if not self.available:
+            return None
+        found: list[tuple[int, int]] = []
+        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        @enum_proc
+        def callback(hwnd: int, _lparam: int) -> bool:
+            if not self.user32.IsWindowVisible(hwnd):
+                return True
+            pid = ctypes.c_ulong()
+            self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            process = self.kernel32.OpenProcess(0x1000, False, pid.value)
+            if not process:
+                return True
+            try:
+                size = ctypes.c_ulong(2048)
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if self.kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+                    if Path(buffer.value).stem.casefold() == "soulbound":
+                        found.append((int(hwnd), int(pid.value)))
+                        return False
+            finally:
+                self.kernel32.CloseHandle(process)
+            return True
+
+        self.user32.EnumWindows(callback, 0)
+        return found[0] if found else None
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        if not self.available or not self.user32.IsWindow(hwnd) or self.user32.IsIconic(hwnd):
+            return None
+        rect = self.RECT()
+        if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        dpi = self.user32.GetDpiForWindow(hwnd) or 96
+        scale = dpi / 96.0
+        return (round(rect.left / scale), round(rect.top / scale), round(rect.right / scale), round(rect.bottom / scale))
+
+    def close(self) -> None:
+        if self.available and self.hotkey_registered:
+            self.user32.UnregisterHotKey(self.hwnd, self.HOTKEY_ID)
+
+
+def color_tuple(hex_color: str) -> tuple[int, int, int]:
+    text = hex_color.strip().lstrip("#")
+    if len(text) != 6:
+        raise ValueError("Expected RRGGBB")
+    return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+
+
+def color_hex(color: tuple[int, int, int]) -> str:
+    return "#%02X%02X%02X" % color
+
+
+def mix_color(source: tuple[int, int, int], target: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
+    return tuple(round(a + (b - a) * amount) for a, b in zip(source, target))  # type: ignore[return-value]
+
+
+class MeterApp:
+    FONT = "Segoe UI"
+
+    def __init__(self, log_override: str | None = None, smoke_seconds: float | None = None) -> None:
+        self.settings = AppSettings()
+        self.session = CombatSession()
+        self.records = FlexRecordStore()
+        configured = log_override or self.settings.get("CombatLogFolder") or self.settings.get("CombatLogPath")
+        self.process_status = "Looking for Soulbound…"
+        self.process_connected = False
+        self.log_status = "Waiting for combat log"
+        self.log_connected = False
+        self.game_window: int | None = None
+        self.game_pid: int | None = None
+        self.last_process_poll = 0.0
+        self.locked = False
+        self.current_view = "meter"
+        self.closed = False
+        self.theme_roles: list[tuple[tk.Widget, str | None, str | None]] = []
+        self.ability_rows: list[dict[str, Any]] = []
+        self._updating_theme = False
+        self._drag_start: tuple[int, int, int, int] | None = None
+        self._resize_start: tuple[int, int, int, int] | None = None
+
+        self.root = tk.Tk()
+        self.root.title("DPS Meter")
+        self.root.geometry(self._initial_geometry())
+        self.root.minsize(320, 560)
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Configure>", lambda _event: self._position_settings_entry())
+
+        self.outer = tk.Frame(self.root, highlightthickness=1)
+        self.outer.pack(fill="both", expand=True, padx=7, pady=7)
+        self.content = self.role(tk.Frame(self.outer), "bg", None)
+        self.content.pack(fill="both", expand=True, padx=14, pady=11)
+        self._build_header()
+        self.view_host = self.role(tk.Frame(self.content), "bg", None)
+        self.view_host.pack(fill="both", expand=True)
+        self._build_meter_view()
+        self._build_flex_view()
+        self._build_settings_view()
+        self._build_credit_and_grip()
+        self._load_icons()
+        self.apply_theme(str(self.settings.get("ThemeColorHex") or "#10151D"), save=False)
+
+        self.watcher = CombatLogWatcher(
+            configured, bool(self.settings.get("CleanupOldCombatLogs")), self._on_combat_event,
+            self._on_active_log, self._on_log_status,
+        )
+        if self.watcher.folder:
+            self.settings.set("CombatLogFolder", str(self.watcher.folder))
+        self.win = WindowsApi(self.root)
+        self.find_and_follow(force=True)
+        self.root.after(20, self.tick)
+        if smoke_seconds:
+            self.root.after(max(100, round(smoke_seconds * 1000)), self.close)
+
+    def _initial_geometry(self) -> str:
+        width, height = 360, 650
+        left = self.settings.get("WindowLeft")
+        top = self.settings.get("WindowTop")
+        if not self.settings.get("FollowGameWindow") and isinstance(left, (int, float)) and isinstance(top, (int, float)):
+            return f"{width}x{height}+{round(left)}+{round(top)}"
+        return f"{width}x{height}+40+40"
+
+    def role(self, widget: tk.Widget, background: str | None = None, foreground: str | None = None) -> tk.Widget:
+        self.theme_roles.append((widget, background, foreground))
+        return widget
+
+    def label(self, parent: tk.Misc, text: str = "", size: int = 10, weight: str = "normal",
+              foreground: str = "text", **kwargs: Any) -> tk.Label:
+        widget = tk.Label(parent, text=text, font=(self.FONT, size, weight), borderwidth=0, **kwargs)
+        return self.role(widget, "bg", foreground)  # type: ignore[return-value]
+
+    def button(self, parent: tk.Misc, text: str, command: Callable[[], None], width: int | None = None, **kwargs: Any) -> tk.Button:
+        widget = tk.Button(parent, text=text, command=command, font=(self.FONT, 9), relief="flat", borderwidth=1,
+                           highlightthickness=0, cursor="hand2", padx=6, pady=4, width=width, **kwargs)
+        return self.role(widget, "button", "text")  # type: ignore[return-value]
+
+    def panel(self, parent: tk.Misc, **kwargs: Any) -> tk.Frame:
+        widget = tk.Frame(parent, highlightthickness=1, **kwargs)
+        return self.role(widget, "panel", None)  # type: ignore[return-value]
+
+    def _build_header(self) -> None:
+        self.header = self.role(tk.Frame(self.content), "bg", None)
+        self.header.pack(fill="x")
+        controls = self.role(tk.Frame(self.header), "bg", None)
+        controls.pack(side="right", anchor="n")
+        self.view_button = self.button(controls, "Flex", self.toggle_view, width=4)
+        self.view_button.pack(side="left", padx=(0, 4))
+        self.button(controls, "⚙", self.show_settings, width=2).pack(side="left", padx=(0, 4))
+        self.button(controls, "—", self.minimize, width=2).pack(side="left", padx=(0, 4))
+        self.button(controls, "×", self.close, width=2).pack(side="left")
+        left = self.role(tk.Frame(self.header), "bg", None)
+        left.pack(side="left", fill="x", expand=True)
+        title = self.label(left, "DPS METER", 11, "bold", anchor="w")
+        title.pack(anchor="w")
+        status1 = self.role(tk.Frame(left), "bg", None)
+        status1.pack(anchor="w", pady=(3, 0))
+        self.process_dot = self.label(status1, "●", 8, foreground="neutral")
+        self.process_dot.pack(side="left")
+        self.process_label = self.label(status1, self.process_status, 8, foreground="muted", width=25, anchor="w")
+        self.process_label.pack(side="left", padx=(3, 0))
+        status2 = self.role(tk.Frame(left), "bg", None)
+        status2.pack(anchor="w")
+        self.log_dot = self.label(status2, "●", 8, foreground="neutral")
+        self.log_dot.pack(side="left")
+        self.log_label = self.label(status2, self.log_status, 8, foreground="muted", width=25, anchor="w")
+        self.log_label.pack(side="left", padx=(3, 0))
+        for widget in (self.header, left, title, status1, self.process_dot, self.process_label, status2, self.log_dot, self.log_label):
+            widget.bind("<ButtonPress-1>", self.start_drag)
+            widget.bind("<B1-Motion>", self.drag_window)
+
+    def _build_meter_view(self) -> None:
+        self.meter_view = self.role(tk.Frame(self.view_host), "bg", None)
+        self.meter_view.pack(fill="both", expand=True, pady=(10, 21))
+
+        encounter = self.role(tk.Frame(self.meter_view), "bg", None)
+        encounter.pack(fill="x", pady=(0, 9))
+        timer = self.role(tk.Frame(encounter), "bg", None)
+        timer.pack(side="left")
+        self.label(timer, "COMBAT TIME", 7, "bold", "muted").pack(anchor="w")
+        self.duration_label = self.label(timer, "00:00", 19, "normal", "text")
+        self.duration_label.pack(anchor="w")
+        self.state_label = self.label(encounter, "IDLE", 8, "bold", "accent", padx=8, pady=5)
+        self.state_label.pack(side="right")
+        chances = self.role(tk.Frame(encounter), "bg", None)
+        chances.pack(side="right", padx=(0, 7))
+        self.chance_labels: dict[str, tk.Label] = {}
+        for column, (key, title, role) in enumerate((("crit", "CRIT CHANCE", "red"), ("heavy", "HEAVY CHANCE", "orange"), ("dev", "DEV CHANCE", "purple"))):
+            box = self.role(tk.Frame(chances), "bg", None)
+            box.grid(row=0, column=column, padx=4)
+            self.label(box, title, 6, foreground="muted").pack()
+            value = self.label(box, "0%", 11, "bold", role)
+            value.pack()
+            self.chance_labels[key] = value
+
+        metrics = self.role(tk.Frame(self.meter_view), "bg", None)
+        metrics.pack(fill="x")
+        metrics.grid_columnconfigure((0, 1), weight=1, uniform="metrics")
+        self.dps_value, self.dps_sub = self._metric_card(metrics, 0, 0, "DAMAGE · LAST 30S", "red", True)
+        self.damage_value, _ = self._metric_card(metrics, 0, 1, "DAMAGE", "text", False)
+        self.hps_value, self.hps_sub = self._metric_card(metrics, 1, 0, "HEALING · LAST 30S", "green", True)
+        combined = self.panel(metrics)
+        combined.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
+        healing_box = self.role(tk.Frame(combined), "panel", None)
+        healing_box.pack(side="left", fill="both", expand=True, padx=8, pady=7)
+        self.label(healing_box, "HEALING", 7, foreground="muted").pack(anchor="w")
+        self.healing_value = self.label(healing_box, "0", 15, "bold", "text")
+        self.healing_value.pack(anchor="w")
+        shield_box = self.role(tk.Frame(combined), "panel", None)
+        shield_box.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=7)
+        self.label(shield_box, "SHIELDING", 7, foreground="blue").pack(anchor="w")
+        self.shielding_value = self.label(shield_box, "0", 15, "bold", "blue")
+        self.shielding_value.pack(anchor="w")
+
+        run_high = self.panel(self.meter_view)
+        run_high.pack(fill="x", pady=(10, 0))
+        self.label(run_high, "RUN HIGH", 6, foreground="muted").pack(side="left", padx=7)
+        self.run_high_labels: dict[str, tk.Label] = {}
+        for key, title, role in (("crit", "CRIT", "red"), ("heavy", "HEAVY", "orange"), ("dev", "DEVASTATING", "purple")):
+            box = self.role(tk.Frame(run_high), "panel", None)
+            box.pack(side="left", fill="x", expand=True, pady=5)
+            self.label(box, title, 6, foreground=role).pack(anchor="w")
+            value = self.label(box, "0", 8, "bold", "purple" if key == "dev" else "text")
+            value.pack(anchor="w")
+            self.run_high_labels[key] = value
+
+        abilities_header = self.role(tk.Frame(self.meter_view), "bg", None)
+        abilities_header.pack(fill="x", pady=(8, 2))
+        self.label(abilities_header, "TOP ABILITIES", 7, "bold", "muted").pack(side="left")
+        self.label(abilities_header, "AMOUNT", 7, "bold", "muted").pack(side="right")
+        self.abilities_frame = self.role(tk.Frame(self.meter_view), "bg", None)
+        self.abilities_frame.pack(fill="both", expand=True)
+        for _ in range(6):
+            row = self.role(tk.Frame(self.abilities_frame), "bg", None)
+            row.pack(fill="x", pady=2)
+            icon_holder = self.role(tk.Frame(row, width=25, height=25), "bg", None)
+            icon_holder.pack(side="left", padx=(0, 7))
+            icon_holder.pack_propagate(False)
+            icon = self.role(tk.Label(icon_holder, borderwidth=0), "bg", None)
+            icon.place(relx=0.5, rely=0.5, anchor="center")
+            middle = self.role(tk.Frame(row), "bg", None)
+            name = self.label(middle, "", 8, foreground="text", anchor="w")
+            name.pack(fill="x")
+            bar = tk.Canvas(middle, height=3, borderwidth=0, highlightthickness=0)
+            self.role(bar, "bar_bg", None)
+            bar.pack(fill="x", pady=(3, 0), padx=(0, 10))
+            amount = self.label(row, "", 8, "bold", "text", anchor="ne")
+            amount.pack(side="right", anchor="n")
+            middle.pack(side="left", fill="x", expand=True)
+            self.ability_rows.append({"frame": row, "icon": icon, "name": name, "bar": bar, "amount": amount, "percent": 0.0})
+
+        footer = self.role(tk.Frame(self.meter_view), "bg", None)
+        footer.pack(fill="x", side="bottom", pady=(5, 0))
+        self.log_path_label = self.label(footer, "Log folder: auto-detect", 6, foreground="dim", anchor="w")
+        self.log_path_label.pack(fill="x", pady=(0, 5))
+        buttons = self.role(tk.Frame(footer), "bg", None)
+        buttons.pack(fill="x")
+        for index, (text, command) in enumerate((("Attach", lambda: self.find_and_follow(force=True)), ("Log folder", self.pick_log_folder), ("Reset", self.reset_session))):
+            button = self.button(buttons, text, command)
+            button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 3, 0 if index == 2 else 3))
+            buttons.grid_columnconfigure(index, weight=1, uniform="footer")
+        self.follow_var = tk.BooleanVar(value=bool(self.settings.get("FollowGameWindow")))
+        self.follow_check = tk.Checkbutton(footer, text="Follow game window", variable=self.follow_var, command=self.follow_changed,
+                                           font=(self.FONT, 7), borderwidth=0, highlightthickness=0, anchor="w")
+        self.role(self.follow_check, "bg", "muted")
+        self.follow_check.pack(anchor="w", pady=(4, 0))
+        self.label(footer, "Alt+Shift+D toggles click-through lock", 6, foreground="dim").pack(anchor="w")
+        # Repack the expandable list after the bottom-anchored footer so the
+        # footer always reserves its space and ability rows fill the gap.
+        self.abilities_frame.pack_forget()
+        self.abilities_frame.pack(fill="both", expand=True)
+
+    def _metric_card(self, parent: tk.Misc, row: int, column: int, title: str, value_role: str,
+                     has_sub: bool) -> tuple[tk.Label, tk.Label | None]:
+        card = self.panel(parent)
+        card.grid(row=row, column=column, sticky="nsew", padx=(0, 4) if column == 0 else (4, 0), pady=(0, 4) if row == 0 else (4, 0))
+        self.label(card, title, 7, foreground="muted").pack(anchor="w", padx=8, pady=(6, 0))
+        value = self.label(card, "0", 15, "bold", value_role)
+        value.pack(anchor="w", padx=8)
+        sub = None
+        if has_sub:
+            sub = self.label(card, "0 DPS" if "DAMAGE" in title else "0 HPS", 6, foreground="muted")
+            sub.pack(anchor="w", padx=8, pady=(0, 5))
+        else:
+            self.label(card, "", 6).pack(pady=(0, 5))
+        return value, sub
+
+    def _build_flex_view(self) -> None:
+        self.flex_view = self.role(tk.Frame(self.view_host), "bg", None)
+        top = self.role(tk.Frame(self.flex_view), "bg", None)
+        top.pack(fill="x", pady=(12, 8))
+        left = self.role(tk.Frame(top), "bg", None)
+        left.pack(side="left")
+        self.label(left, "FLEX RECORDS", 10, "bold", "text").pack(anchor="w")
+        self.label(left, "Your permanent personal bests", 7, foreground="muted").pack(anchor="w")
+        self.label(top, "SAVED LIVE", 7, "bold", "accent").pack(side="right")
+
+        cards = self.role(tk.Frame(self.flex_view), "bg", None)
+        cards.pack(fill="both", expand=True)
+        cards.grid_columnconfigure((0, 1), weight=1, uniform="flex")
+        cards.grid_rowconfigure((0, 1, 2), weight=1, uniform="flexrow")
+        self.flex_card_values: dict[str, tuple[tk.Label, tk.Label]] = {}
+        card_specs = (
+            ("big_hit", "BIGGEST HIT", "red"), ("big_heal", "BIGGEST HEAL", "green"),
+            ("damage60", "BEST DAMAGE · 60 SEC", "red"), ("healing60", "BEST HEALING · 60 SEC", "green"),
+            ("run_damage", "BEST RUN DAMAGE", "red"), ("run_healing", "BEST RUN HEALING", "green"),
+        )
+        for index, (key, title, value_role) in enumerate(card_specs):
+            row, column = divmod(index, 2)
+            card = self.panel(cards)
+            card.grid(row=row, column=column, sticky="nsew", padx=(0, 4) if column == 0 else (4, 0), pady=(0, 4) if row == 0 else ((4, 4) if row == 1 else (4, 0)))
+            self.label(card, title, 7, foreground="muted").pack(anchor="w", padx=8, pady=(7, 0))
+            value = self.label(card, "0", 14, "bold", value_role)
+            value.pack(anchor="w", padx=8)
+            detail = self.label(card, "No record yet", 6, foreground="muted", anchor="w")
+            detail.pack(fill="x", padx=8, pady=(0, 6))
+            self.flex_card_values[key] = (value, detail)
+
+        hit_panel = self.panel(self.flex_view)
+        hit_panel.pack(fill="x", pady=(8, 7))
+        self.label(hit_panel, "PERSONAL BEST BY HIT TYPE", 6, foreground="muted").pack(anchor="w", padx=8, pady=(6, 3))
+        hit_row = self.role(tk.Frame(hit_panel), "panel", None)
+        hit_row.pack(fill="x", padx=8, pady=(0, 6))
+        self.flex_hit_labels: dict[str, tk.Label] = {}
+        for key, title, role in (("normal", "NORMAL", "muted"), ("crit", "CRIT", "red"), ("heavy", "HEAVY", "orange"), ("dev", "DEVASTATING", "purple")):
+            box = self.role(tk.Frame(hit_row), "panel", None)
+            box.pack(side="left", fill="x", expand=True)
+            self.label(box, title, 6, foreground=role).pack(anchor="w")
+            value = self.label(box, "0", 8, "bold", "purple" if key == "dev" else "text")
+            value.pack(anchor="w")
+            self.flex_hit_labels[key] = value
+
+        lifetime = self.panel(self.flex_view)
+        lifetime.pack(fill="x")
+        self.flex_lifetime_labels: dict[str, tk.Label] = {}
+        for key, title in (("damage", "LIFETIME DAMAGE"), ("healing", "LIFETIME HEALING"), ("runs", "RUNS RECORDED")):
+            box = self.role(tk.Frame(lifetime), "panel", None)
+            box.pack(side="left", fill="x", expand=True, padx=8, pady=7)
+            self.label(box, title, 6, foreground="muted").pack(anchor="w")
+            value = self.label(box, "0", 9, "bold", "text")
+            value.pack(anchor="w")
+            self.flex_lifetime_labels[key] = value
+        self.records_path_label = self.label(self.flex_view, f"Records: {self.records.path}", 6, foreground="dim", anchor="w")
+        self.records_path_label.pack(fill="x", pady=(7, 18))
+
+    def _build_settings_view(self) -> None:
+        self.settings_view = self.role(tk.Frame(self.outer, highlightthickness=1), "bg", None)
+        header = self.role(tk.Frame(self.settings_view), "bg", None)
+        header.pack(fill="x", padx=15, pady=(14, 0))
+        self.label(header, "APPEARANCE", 10, "bold", "text").pack(side="left")
+        self.button(header, "×", self.hide_settings, width=2).pack(side="right")
+        self.label(self.settings_view, "Menu color", 8, foreground="muted").pack(anchor="w", padx=15, pady=(15, 4))
+        sliders = self.role(tk.Frame(self.settings_view), "bg", None)
+        sliders.pack(fill="x", padx=15)
+        self.rgb_vars: dict[str, tk.DoubleVar] = {}
+        self.rgb_value_labels: dict[str, tk.Label] = {}
+        for row, (key, title) in enumerate((("r", "Red"), ("g", "Green"), ("b", "Blue"))):
+            self.label(sliders, title, 8, foreground="text", width=5, anchor="w").grid(row=row, column=0, sticky="w")
+            variable = tk.DoubleVar(value=0)
+            scale = tk.Scale(sliders, from_=0, to=255, orient="horizontal", showvalue=False, variable=variable,
+                             command=lambda _value, channel=key: self.slider_changed(channel), borderwidth=0,
+                             highlightthickness=0, sliderlength=14)
+            self.role(scale, "bg", "text")
+            scale.grid(row=row, column=1, sticky="ew", padx=4, pady=2)
+            value = self.label(sliders, "0", 8, foreground="muted", width=3, anchor="e")
+            value.grid(row=row, column=2, sticky="e")
+            sliders.grid_columnconfigure(1, weight=1)
+            self.rgb_vars[key] = variable
+            self.rgb_value_labels[key] = value
+
+        hex_row = self.role(tk.Frame(self.settings_view), "bg", None)
+        hex_row.pack(fill="x", padx=15, pady=(12, 0))
+        self.color_preview = self.role(tk.Frame(hex_row, width=30, height=30, highlightthickness=1), "bg", None)
+        self.color_preview.pack(side="left")
+        self.color_preview.pack_propagate(False)
+        self.hex_var = tk.StringVar(value="#10151D")
+        self.hex_entry = tk.Entry(hex_row, textvariable=self.hex_var, font=(self.FONT, 9), relief="flat", borderwidth=1)
+        self.role(self.hex_entry, "panel", "text")
+        self.hex_entry.pack(side="left", fill="x", expand=True, padx=7, ipady=5)
+        self.hex_entry.bind("<Return>", lambda _event: self.apply_hex())
+        self.button(hex_row, "Apply", self.apply_hex).pack(side="right")
+
+        self.label(self.settings_view, "Presets", 8, foreground="muted").pack(anchor="w", padx=15, pady=(15, 5))
+        presets = self.role(tk.Frame(self.settings_view), "bg", None)
+        presets.pack(fill="x", padx=15)
+        for color in ("#10151D", "#14293A", "#17352F", "#382040", "#40221F", "#3D321A"):
+            button = tk.Button(presets, text="", width=3, height=1, background=color, activebackground=color,
+                               relief="flat", borderwidth=1, command=lambda value=color: self.apply_theme(value))
+            button.pack(side="left", padx=(0, 5))
+        self.label(self.settings_view, "Enter any #RRGGBB color or use the RGB sliders. Changes preview instantly and are saved automatically.",
+                   7, foreground="muted", justify="left", wraplength=300).pack(anchor="w", padx=15, pady=(8, 0))
+
+        self.label(self.settings_view, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(20, 5))
+        self.cleanup_var = tk.BooleanVar(value=bool(self.settings.get("CleanupOldCombatLogs")))
+        cleanup = tk.Checkbutton(self.settings_view, text="Delete verified old combat logs; keep newest 10",
+                                 variable=self.cleanup_var, command=self.cleanup_changed, font=(self.FONT, 8),
+                                 borderwidth=0, highlightthickness=0, anchor="w", justify="left")
+        self.role(cleanup, "bg", "text")
+        cleanup.pack(anchor="w", padx=15)
+        self.label(self.settings_view, "Only files containing a Soulbound combat-log header are eligible.", 7,
+                   foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        bottom = self.role(tk.Frame(self.settings_view), "bg", None)
+        bottom.pack(fill="x", side="bottom", padx=15, pady=15)
+        self.button(bottom, "Default color", lambda: self.apply_theme("#10151D")).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.button(bottom, "Done", self.hide_settings).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+    def _build_credit_and_grip(self) -> None:
+        self.credit = self.label(self.outer, "Made by TundraWooK", 6, "bold", "neon")
+        self.credit.place(relx=1.0, rely=1.0, x=-18, y=-8, anchor="se")
+        self.grip = self.label(self.outer, "◢", 8, foreground="muted", cursor="size_nw_se")
+        self.grip.place(relx=1.0, rely=1.0, x=-1, y=-1, anchor="se")
+        self.grip.bind("<ButtonPress-1>", self.start_resize)
+        self.grip.bind("<B1-Motion>", self.resize_window)
+
+    def _load_icons(self) -> None:
+        self.icons: dict[str, tk.PhotoImage] = {}
+        for name, encoded in ICON_DATA.items():
+            try:
+                image = tk.PhotoImage(data=encoded)
+                self.icons[name] = image.subsample(2, 2)
+            except tk.TclError:
+                continue
+
+    def apply_theme(self, value: str, save: bool = True) -> None:
+        try:
+            base = color_tuple(value)
+        except (ValueError, TypeError):
+            return
+        luminance = (0.2126 * base[0] + 0.7152 * base[1] + 0.0722 * base[2]) / 255.0
+        primary = (16, 20, 25) if luminance > 0.58 else (244, 247, 251)
+        target = (0, 0, 0) if luminance > 0.58 else (255, 255, 255)
+        self.colors = {
+            "bg": color_hex(base), "panel": color_hex(mix_color(base, target, 0.08 if luminance > 0.58 else 0.07)),
+            "border": color_hex(mix_color(base, target, 0.34 if luminance > 0.58 else 0.25)),
+            "button": color_hex(mix_color(base, target, 0.13 if luminance > 0.58 else 0.12)),
+            "accent": color_hex(mix_color(base, (0, 0, 0) if luminance > 0.58 else (255, 255, 255), 0.52)),
+            "text": color_hex(primary), "muted": color_hex(mix_color(primary, base, 0.42)),
+            "dim": "#687484", "neutral": "#66717F", "green": "#6CE5C1", "red": "#FF7C75",
+            "orange": "#FFB75E", "purple": "#B46CFF", "blue": "#72A7FF", "neon": "#39FF88",
+            "bar_bg": "#242C37", "bar": "#6C93E5",
+        }
+        self.root.configure(background=self.colors["bg"])
+        self.outer.configure(background=self.colors["bg"], highlightbackground=self.colors["border"])
+        for widget, background, foreground in self.theme_roles:
+            try:
+                options: dict[str, Any] = {}
+                if background:
+                    options["background"] = self.colors[background]
+                    if isinstance(widget, (tk.Button, tk.Checkbutton, tk.Scale)):
+                        options["activebackground"] = self.colors[background]
+                    if isinstance(widget, tk.Checkbutton):
+                        options["selectcolor"] = self.colors["panel"]
+                    if isinstance(widget, tk.Frame) and int(widget.cget("highlightthickness") or 0) > 0:
+                        options["highlightbackground"] = self.colors["border"]
+                if foreground and not isinstance(widget, tk.Frame):
+                    options["foreground"] = self.colors[foreground]
+                    if isinstance(widget, (tk.Button, tk.Checkbutton, tk.Scale)):
+                        options["activeforeground"] = self.colors[foreground]
+                widget.configure(**options)
+            except (tk.TclError, TypeError):
+                pass
+        self.color_preview.configure(background=color_hex(base), highlightbackground=self.colors["border"])
+        self._updating_theme = True
+        for key, component in zip(("r", "g", "b"), base):
+            self.rgb_vars[key].set(component)
+            self.rgb_value_labels[key].configure(text=str(component))
+        self.hex_var.set(color_hex(base))
+        self._updating_theme = False
+        self.settings.data["ThemeColorHex"] = color_hex(base)
+        if save:
+            self.settings.save()
+        self._redraw_bars()
+
+    def slider_changed(self, _channel: str) -> None:
+        if self._updating_theme:
+            return
+        components = tuple(round(self.rgb_vars[key].get()) for key in ("r", "g", "b"))
+        for key, component in zip(("r", "g", "b"), components):
+            self.rgb_value_labels[key].configure(text=str(component))
+        self.apply_theme(color_hex(components))  # type: ignore[arg-type]
+
+    def apply_hex(self) -> None:
+        try:
+            color_tuple(self.hex_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid color", "Enter a color in #RRGGBB format.", parent=self.root)
+            return
+        self.apply_theme(self.hex_var.get())
+
+    def show_settings(self) -> None:
+        if self.locked:
+            self.toggle_lock()
+        self.settings_view.place(x=0, y=0, relwidth=1, relheight=1)
+        self.settings_view.lift()
+        self.credit.lift()
+        self.grip.lift()
+
+    def hide_settings(self) -> None:
+        self.settings_view.place_forget()
+
+    def _position_settings_entry(self) -> None:
+        pass
+
+    def _on_combat_event(self, event: CombatEvent) -> None:
+        self.session.apply(event)
+        self.records.apply(event)
+
+    def _on_active_log(self, path: str) -> None:
+        self.session.reset()
+        self.records.begin_log(path)
+
+    def _on_log_status(self, connected: bool, message: str) -> None:
+        self.log_connected = connected
+        self.log_status = message
+
+    def reset_session(self) -> None:
+        self.session.reset()
+        self.refresh()
+
+    def pick_log_folder(self) -> None:
+        initial = str(self.watcher.folder) if self.watcher.folder and self.watcher.folder.is_dir() else str(LOCAL_APP_DATA)
+        selected = filedialog.askdirectory(title="Select the Soulbound combat-log folder", initialdir=initial, parent=self.root)
+        if not selected:
+            return
+        self.watcher.change_folder(selected)
+        self.settings.data["CombatLogFolder"] = str(Path(selected).resolve())
+        self.settings.data["CombatLogPath"] = None
+        self.settings.save()
+        self.log_path_label.configure(text=f"Log folder: {selected}")
+
+    def cleanup_changed(self) -> None:
+        enabled = bool(self.cleanup_var.get())
+        self.settings.set("CleanupOldCombatLogs", enabled)
+        self.watcher.cleanup_enabled = enabled
+        if enabled and self.watcher.folder:
+            removed = self.watcher.cleanup_old_logs(self.watcher.folder, 10)
+            if removed:
+                self.log_status = f"Cleared {removed} old combat logs"
+
+    def follow_changed(self) -> None:
+        enabled = bool(self.follow_var.get())
+        self.settings.set("FollowGameWindow", enabled)
+        if enabled:
+            self.find_and_follow(force=True)
+
+    def toggle_view(self) -> None:
+        if self.current_view == "meter":
+            self.meter_view.pack_forget()
+            self.flex_view.pack(fill="both", expand=True)
+            self.current_view = "flex"
+            self.view_button.configure(text="Meter")
+        else:
+            self.flex_view.pack_forget()
+            self.meter_view.pack(fill="both", expand=True, pady=(10, 21))
+            self.current_view = "meter"
+            self.view_button.configure(text="Flex")
+        self.refresh()
+
+    @staticmethod
+    def _record_detail(record: Any) -> str:
+        if not isinstance(record, dict):
+            return "No record yet"
+        flags = " · DEV" if record.get("Critical") and record.get("HeavyHit") else " · CRIT" if record.get("Critical") else " · HEAVY" if record.get("HeavyHit") else ""
+        return f"{record.get('AbilityName') or 'Unknown'}{flags}"
+
+    def refresh(self) -> None:
+        snapshot = self.session.snapshot()
+        total_seconds = max(0, round(snapshot["duration"]))
+        self.duration_label.configure(text=f"{(total_seconds // 60) % 60:02d}:{total_seconds % 60:02d}")
+        self.state_label.configure(text="ACTIVE" if snapshot["active"] else "IDLE")
+        self.damage_value.configure(text=format_number(snapshot["damage"]))
+        self.healing_value.configure(text=format_number(snapshot["healing"]))
+        self.shielding_value.configure(text=format_number(snapshot["shielding"]))
+        self.dps_value.configure(text=format_number(snapshot["dps"] * 30))
+        self.dps_sub.configure(text=f"{format_number(snapshot['dps'])} DPS")
+        self.hps_value.configure(text=format_number(snapshot["hps"] * 30))
+        self.hps_sub.configure(text=f"{format_number(snapshot['hps'])} HPS")
+        self.chance_labels["crit"].configure(text=format_rate(snapshot["crit_rate"]))
+        self.chance_labels["heavy"].configure(text=format_rate(snapshot["heavy_rate"]))
+        self.chance_labels["dev"].configure(text=format_rate(snapshot["dev_rate"]))
+        self.run_high_labels["crit"].configure(text=format_number(snapshot["highest_crit"]))
+        self.run_high_labels["heavy"].configure(text=format_number(snapshot["highest_heavy"]))
+        self.run_high_labels["dev"].configure(text=format_number(snapshot["highest_dev"]))
+
+        abilities = snapshot["abilities"]
+        for index, row in enumerate(self.ability_rows):
+            if index >= len(abilities):
+                row["frame"].pack_forget()
+                continue
+            if not row["frame"].winfo_manager():
+                row["frame"].pack(fill="x", pady=2)
+            ability = abilities[index]
+            row["name"].configure(text=ability["name"])
+            row["amount"].configure(text=format_number(ability["amount"]))
+            row["percent"] = ability["percent"]
+            icon = self.icons.get(normalize_ability(ability["name"]))
+            row["icon"].configure(image=icon or "")
+        self._redraw_bars()
+
+        flex = self.records.snapshot()
+        cards = {
+            "big_hit": (flex.get("HighestDamage"), flex.get("HighestDamage")),
+            "big_heal": (flex.get("HighestHealing"), flex.get("HighestHealing")),
+            "damage60": (flex.get("BestDamage60", 0), flex.get("BestDamage60At")),
+            "healing60": (flex.get("BestHealing60", 0), flex.get("BestHealing60At")),
+            "run_damage": (flex.get("BestRunDamage", 0), flex.get("BestRunDamageAt")),
+            "run_healing": (flex.get("BestRunHealing", 0), flex.get("BestRunHealingAt")),
+        }
+        for key, (value_source, detail_source) in cards.items():
+            value_label, detail_label = self.flex_card_values[key]
+            if isinstance(value_source, dict):
+                value_label.configure(text=format_number(float(value_source.get("Value", 0))))
+                detail_label.configure(text=self._record_detail(detail_source))
+            else:
+                value_label.configure(text=format_number(float(value_source or 0)))
+                detail_label.configure(text=format_date(detail_source if isinstance(detail_source, str) else None))
+        record_keys = {"normal": "HighestNormalHit", "crit": "HighestCriticalHit", "heavy": "HighestHeavyHit", "dev": "HighestDevastatingHit"}
+        for key, record_key in record_keys.items():
+            record = flex.get(record_key)
+            self.flex_hit_labels[key].configure(text=format_number(float(record.get("Value", 0))) if isinstance(record, dict) else "0")
+        self.flex_lifetime_labels["damage"].configure(text=format_number(float(flex.get("LifetimeDamage", 0))))
+        self.flex_lifetime_labels["healing"].configure(text=format_number(float(flex.get("LifetimeHealing", 0))))
+        self.flex_lifetime_labels["runs"].configure(text=str(int(flex.get("RunsTracked", 0))))
+
+        self.process_label.configure(text=self.process_status)
+        self.process_dot.configure(foreground=self.colors["green"] if self.process_connected else self.colors["neutral"])
+        self.log_label.configure(text=self.log_status)
+        self.log_dot.configure(foreground=self.colors["green"] if self.log_connected else self.colors["orange"])
+        folder = self.watcher.folder
+        self.log_path_label.configure(text=f"Log folder: {folder}" if folder else "Log folder: auto-detect")
+
+    def _redraw_bars(self) -> None:
+        if not hasattr(self, "colors"):
+            return
+        for row in self.ability_rows:
+            canvas: tk.Canvas = row["bar"]
+            canvas.delete("all")
+            width = max(1, canvas.winfo_width())
+            canvas.create_rectangle(0, 0, width, 3, fill=self.colors["bar_bg"], outline="")
+            canvas.create_rectangle(0, 0, width * float(row["percent"]) / 100.0, 3, fill=self.colors["bar"], outline="")
+
+    def find_and_follow(self, force: bool = False) -> None:
+        found = self.win.find_soulbound() if hasattr(self, "win") else None
+        if found is None:
+            self.game_window = self.game_pid = None
+            self.process_connected = False
+            self.process_status = "Soulbound is not running"
+            return
+        self.game_window, self.game_pid = found
+        self.process_connected = True
+        self.process_status = f"Attached · PID {self.game_pid}"
+        if not self.follow_var.get():
+            return
+        rect = self.win.window_rect(self.game_window)
+        if rect is None:
+            return
+        target_left = rect[2] - self.root.winfo_width() - 22
+        target_top = rect[1] + 54
+        if force or abs(self.root.winfo_x() - target_left) > 1 or abs(self.root.winfo_y() - target_top) > 1:
+            self.root.geometry(f"+{target_left}+{target_top}")
+
+    def toggle_lock(self) -> None:
+        self.locked = not self.locked
+        self.root.attributes("-alpha", 0.92 if self.locked else 1.0)
+        self.win.set_click_through(self.locked)
+
+    def start_drag(self, event: tk.Event) -> None:
+        if self.locked:
+            return
+        if self.follow_var.get():
+            self.follow_var.set(False)
+            self.follow_changed()
+        self._drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
+
+    def drag_window(self, event: tk.Event) -> None:
+        if not self._drag_start or self.locked:
+            return
+        start_x, start_y, left, top = self._drag_start
+        self.root.geometry(f"+{left + event.x_root - start_x}+{top + event.y_root - start_y}")
+
+    def start_resize(self, event: tk.Event) -> None:
+        if not self.locked:
+            self._resize_start = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
+
+    def resize_window(self, event: tk.Event) -> None:
+        if not self._resize_start or self.locked:
+            return
+        start_x, start_y, width, height = self._resize_start
+        new_width = max(320, width + event.x_root - start_x)
+        new_height = max(560, height + event.y_root - start_y)
+        self.root.geometry(f"{new_width}x{new_height}")
+
+    def minimize(self) -> None:
+        self.win.minimize()
+
+    def tick(self) -> None:
+        if self.closed:
+            return
+        try:
+            self.watcher.poll()
+            now = time.monotonic()
+            if now - self.last_process_poll >= 0.75:
+                self.find_and_follow()
+                self.last_process_poll = now
+            if self.win.poll_hotkey():
+                self.toggle_lock()
+            self.refresh()
+        except Exception as error:
+            self.log_connected = False
+            self.log_status = f"Meter error: {type(error).__name__}"
+        self.root.after(250, self.tick)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.settings.data["FollowGameWindow"] = bool(self.follow_var.get())
+        self.settings.data["WindowLeft"] = self.root.winfo_x()
+        self.settings.data["WindowTop"] = self.root.winfo_y()
+        self.settings.save()
+        self.records.save(force=True)
+        if hasattr(self, "win"):
+            self.win.close()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def replay_log(path: Path) -> dict[str, Any]:
+    session = CombatSession()
+    resolver = CombatAbilityResolver()
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            try:
+                root = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(root, dict):
+                continue
+            resolver.observe(root)
+            event = parse_combat_event(root)
+            if event:
+                session.apply(resolver.resolve(event))
+    return session.snapshot()
+
+
+def run_self_test(log_path: str | None = None) -> int:
+    event = parse_combat_event({
+        "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
+        "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
+                 "post_target_mitigation_amount": 300, "applied_amount": 1, "is_crit": True, "is_heavy_hit": True},
+    })
+    assert event and event.amount == 300
+    session = CombatSession()
+    session.apply(event)
+    unknown = replace(event, event_id="unknown", sequence=2, ability_name="Unknown Ability", amount=209, critical=False, heavy_hit=False)
+    session.apply(unknown)
+    snap = session.snapshot()
+    assert snap["damage"] == 509 and snap["abilities"][0]["name"] == "Bomb"
+    assert snap["dev_rate"] == 50 and snap["highest_dev"] == 300
+
+    resolver = CombatAbilityResolver()
+    resolver.observe({"event": "LOADOUT_SNAPSHOT", "data": {"abilities": [{"ability_display_name": "Fortify"}, {"ability_display_name": "Healing Pulse"}]}})
+    shield = parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "SHIELD_GAINED", "data": {"source": {"type": "self"}, "ability_display_name": "Unknown Ability", "amount": 100}})
+    heal = parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "HEAL_DEALT", "data": {"source": {"type": "self"}, "ability_display_name": "Unknown Ability", "effective_amount": 50}})
+    assert shield and resolver.resolve(shield).ability_name == "Fortify"
+    assert heal and resolver.resolve(heal).ability_name == "Healing Pulse"
+
+    with tempfile.TemporaryDirectory(prefix="DpsMeterPythonTest-") as folder:
+        store = FlexRecordStore(Path(folder) / "records.txt")
+        store.begin_log(str(Path(folder) / "run.log"))
+        store.apply(event)
+        store.save(force=True)
+        loaded = json.loads((Path(folder) / "records.txt").read_text(encoding="utf-8"))
+        assert loaded["LifetimeDamage"] == 300 and loaded["RunsTracked"] == 1
+
+    print(f"PASS Python DPS Meter {VERSION}")
+    if log_path:
+        real = replay_log(Path(log_path))
+        print(f"REAL damage={real['damage']:.3f} healing={real['healing']:.3f} shield={real['shielding']:.3f}")
+        for ability in real["abilities"]:
+            print(f"ABILITY {ability['name']}={ability['amount']:.3f}")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Soulbound DPS Meter Python edition")
+    parser.add_argument("--log", help="Combat-log file or folder to use")
+    parser.add_argument("--self-test", action="store_true", help="Run parser and persistence tests without opening the UI")
+    parser.add_argument("--smoke-ui", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="version", version=VERSION)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_test:
+        return run_self_test(args.log)
+    app = MeterApp(args.log, args.smoke_ui)
+    app.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
