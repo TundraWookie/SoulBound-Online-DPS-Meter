@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.2-py.3"
+VERSION = "0.8.3-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -136,6 +136,7 @@ class CombatEvent:
     target_name: str | None
     ability_id: str | None
     ability_name: str
+    impact_type: str | None
     amount: float
     raw_amount: float
     overheal: float
@@ -181,6 +182,9 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
     ability_name = first_value(payload, "ability_display_name", "ability_name", "skill_name", "action_name", "weapon_display_name")
     ability_name = ability_name or first_value(cast, "display_name") or first_value(ability, "name")
     ability_name = ability_name or first_value(payload, "ability_id", "skill_id", default="Unknown")
+    impact_type_value = first_value(payload, "impact_type", "damage_type", "element_type")
+    impact_type = str(impact_type_value).strip() if impact_type_value is not None else None
+    impact_type = impact_type or None
     sequence_value = first_value(root, "sequence")
     try:
         sequence = float(sequence_value) if sequence_value is not None else None
@@ -200,6 +204,7 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         first_value(target, "display_name", "name", "alias") or first_value(payload, "target_name", "victim_name"),
         first_value(payload, "ability_id", "skill_id", "action_id") or first_value(ability, "id"),
         str(ability_name),
+        impact_type,
         max(0.0, amount),
         max(0.0, first_number(payload, "pre_target_mitigation_amount", "raw_amount", "unmitigated_amount", "raw_value", default=amount)),
         max(0.0, first_number(payload, "overheal", "overhealing")),
@@ -362,8 +367,10 @@ class CombatSession:
             self.total_shielding += event.amount
         key = (event.ability_id or event.ability_name).lower()
         if key not in self.abilities:
-            self.abilities[key] = [event.ability_name, 0.0]
+            self.abilities[key] = [event.ability_name, 0.0, set()]
         self.abilities[key][1] += event.amount
+        if event.type == "damage" and event.impact_type:
+            self.abilities[key][2].add(event.impact_type)
 
     @staticmethod
     def _rolling(queue: deque[tuple[float, float]], now: float) -> float:
@@ -384,7 +391,15 @@ class CombatSession:
             duration = max(0.0, end - self.started_at)
         visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
         largest = visible[0][1] if visible else 1.0
-        top = [{"name": name, "amount": amount, "percent": amount / largest * 100.0} for name, amount in visible[:6]]
+        top = [
+            {
+                "name": name,
+                "amount": amount,
+                "percent": amount / largest * 100.0,
+                "damage_type": " / ".join(sorted(impact_types, key=str.casefold)).upper(),
+            }
+            for name, amount, impact_types in visible[:6]
+        ]
         hits = self.damage_hit_count or 1
         return {
             "damage": self.total_damage, "healing": self.total_healing, "shielding": self.total_shielding,
@@ -1184,15 +1199,22 @@ class MeterApp:
             icon = self.role(tk.Label(icon_holder, borderwidth=0), "bg", None)
             icon.place(relx=0.5, rely=0.5, anchor="center")
             middle = self.role(tk.Frame(row), "bg", None)
-            name = self.label(middle, "", 8, foreground="text", anchor="w")
-            name.pack(fill="x")
+            name_line = self.role(tk.Frame(middle), "bg", None)
+            name_line.pack(fill="x")
+            damage_type = self.label(name_line, "", 6, "bold", "muted", anchor="e")
+            damage_type.pack(side="right", padx=(5, 10))
+            name = self.label(name_line, "", 8, foreground="text", anchor="w")
+            name.pack(side="left", fill="x", expand=True)
             bar = tk.Canvas(middle, height=3, borderwidth=0, highlightthickness=0)
             self.role(bar, "bar_bg", None)
             bar.pack(fill="x", pady=(3, 0), padx=(0, 10))
             amount = self.label(row, "", 8, "bold", "text", anchor="ne")
             amount.pack(side="right", anchor="n")
             middle.pack(side="left", fill="x", expand=True)
-            self.ability_rows.append({"frame": row, "icon": icon, "name": name, "bar": bar, "amount": amount, "percent": 0.0})
+            self.ability_rows.append({
+                "frame": row, "icon": icon, "name": name, "damage_type": damage_type,
+                "bar": bar, "amount": amount, "percent": 0.0,
+            })
 
         footer = self.role(tk.Frame(self.meter_view), "bg", None)
         footer.pack(fill="x", side="bottom", pady=(5, 0))
@@ -1536,6 +1558,7 @@ class MeterApp:
                 row["frame"].pack(fill="x", pady=2)
             ability = abilities[index]
             row["name"].configure(text=ability["name"])
+            row["damage_type"].configure(text=ability["damage_type"])
             row["amount"].configure(text=format_number(ability["amount"]))
             row["percent"] = ability["percent"]
             icon = self.icons.get(normalize_ability(ability["name"]))
@@ -1694,7 +1717,8 @@ def run_self_test(log_path: str | None = None) -> int:
     event = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
         "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
-                 "post_target_mitigation_amount": 300, "applied_amount": 1, "is_crit": True, "is_heavy_hit": True},
+                 "impact_type": "void", "post_target_mitigation_amount": 300, "applied_amount": 1,
+                 "is_crit": True, "is_heavy_hit": True},
     })
     assert event and event.amount == 300
     session = CombatSession()
@@ -1703,6 +1727,7 @@ def run_self_test(log_path: str | None = None) -> int:
     session.apply(unknown)
     snap = session.snapshot()
     assert snap["damage"] == 509 and snap["abilities"][0]["name"] == "Bomb"
+    assert snap["abilities"][0]["damage_type"] == "VOID"
     assert snap["dev_rate"] == 50 and snap["highest_dev"] == 300
 
     resolver = CombatAbilityResolver()
@@ -1725,7 +1750,7 @@ def run_self_test(log_path: str | None = None) -> int:
         real = replay_log(Path(log_path))
         print(f"REAL damage={real['damage']:.3f} healing={real['healing']:.3f} shield={real['shielding']:.3f}")
         for ability in real["abilities"]:
-            print(f"ABILITY {ability['name']}={ability['amount']:.3f}")
+            print(f"ABILITY {ability['name']} [{ability['damage_type']}]={ability['amount']:.3f}")
     return 0
 
 
