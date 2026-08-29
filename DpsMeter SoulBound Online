@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.3-py.1"
+VERSION = "0.8.8-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -138,6 +138,7 @@ class CombatEvent:
     ability_name: str
     impact_type: str | None
     amount: float
+    applied_amount: float
     raw_amount: float
     overheal: float
     absorbed: float
@@ -175,8 +176,10 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
 
     if event_type == "damage":
         amount = first_number(payload, "post_target_mitigation_amount", "applied_amount", "effective_amount", "amount", "value")
+        applied_amount = first_number(payload, "applied_amount", "effective_amount", "amount", "value", default=amount)
     else:
         amount = first_number(payload, "effective_amount", "applied_amount", "amount", "value")
+        applied_amount = amount
     cast = payload.get("cast") if isinstance(payload.get("cast"), dict) else {}
     ability = payload.get("ability") if isinstance(payload.get("ability"), dict) else {}
     ability_name = first_value(payload, "ability_display_name", "ability_name", "skill_name", "action_name", "weapon_display_name")
@@ -206,6 +209,7 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         str(ability_name),
         impact_type,
         max(0.0, amount),
+        max(0.0, applied_amount),
         max(0.0, first_number(payload, "pre_target_mitigation_amount", "raw_amount", "unmitigated_amount", "raw_value", default=amount)),
         max(0.0, first_number(payload, "overheal", "overhealing")),
         max(0.0, first_number(payload, "absorbed", "blocked", "mitigated")),
@@ -214,6 +218,12 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         first_bool(payload, "periodic", "is_periodic", "dot", "hot"),
         sequence,
     )
+
+
+def live_damage_event(event: CombatEvent, include_overkill: bool) -> CombatEvent:
+    if event.type == "damage" and not include_overkill:
+        return replace(event, amount=event.applied_amount)
+    return event
 
 
 class CombatAbilityResolver:
@@ -291,6 +301,7 @@ class CombatSession:
         self.encounter_started_at: float | None = None
         self.completed_combat_time = 0.0
         self.is_active = False
+        self.in_run = False
         self.run_controlled = False
         self.has_encounter_timing = False
         self.abilities: dict[str, list[Any]] = {}
@@ -318,6 +329,7 @@ class CombatSession:
             self.reset()
             self.started_at = self.last_event_at = event.timestamp
             self.is_active = True
+            self.in_run = True
             self.run_controlled = True
             return
         if event.type == "encounter_start":
@@ -326,6 +338,7 @@ class CombatSession:
                 self._close_encounter(event.timestamp)
             self.encounter_started_at = self.last_event_at = event.timestamp
             self.is_active = True
+            self.in_run = True
             return
         if event.type == "encounter_end":
             self.has_encounter_timing = True
@@ -337,6 +350,7 @@ class CombatSession:
             self._close_encounter(event.timestamp)
             self.last_event_at = event.timestamp
             self.is_active = False
+            self.in_run = False
             self.run_controlled = False
             return
         if event.type not in {"damage", "heal", "shield"} or event.amount <= 0 or not is_own_event(event):
@@ -346,6 +360,7 @@ class CombatSession:
                 self.reset()
             self.started_at = self.started_at or event.timestamp
             self.is_active = True
+        self.in_run = True
         self.last_event_at = event.timestamp
         if event.type == "damage":
             self.total_damage += event.amount
@@ -367,10 +382,21 @@ class CombatSession:
             self.total_shielding += event.amount
         key = (event.ability_id or event.ability_name).lower()
         if key not in self.abilities:
-            self.abilities[key] = [event.ability_name, 0.0, set()]
-        self.abilities[key][1] += event.amount
-        if event.type == "damage" and event.impact_type:
-            self.abilities[key][2].add(event.impact_type)
+            self.abilities[key] = [
+                event.ability_name, 0.0, set(),
+                {"normal": [0, 0.0], "crit": [0, 0.0], "heavy": [0, 0.0], "dev": [0, 0.0]},
+                0.0,
+            ]
+        ability = self.abilities[key]
+        ability[1] += event.amount
+        if event.type == "damage":
+            category = "dev" if event.critical and event.heavy_hit else "crit" if event.critical else "heavy" if event.heavy_hit else "normal"
+            ability[3][category][0] += 1
+            ability[3][category][1] += event.amount
+            if event.impact_type:
+                ability[2].add(event.impact_type)
+        else:
+            ability[4] += event.amount
 
     @staticmethod
     def _rolling(queue: deque[tuple[float, float]], now: float) -> float:
@@ -391,20 +417,38 @@ class CombatSession:
             duration = max(0.0, end - self.started_at)
         visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
         largest = visible[0][1] if visible else 1.0
-        top = [
-            {
+        top = []
+        for name, amount, impact_types, buckets, non_damage in visible[:6]:
+            damage_amount = sum(float(bucket[1]) for bucket in buckets.values())
+            breakdown = {}
+            for category, bucket in buckets.items():
+                category_hits = int(bucket[0])
+                category_damage = float(bucket[1])
+                breakdown[category] = {
+                    "hits": category_hits,
+                    "damage": category_damage,
+                    "percent": category_damage * 100.0 / damage_amount if damage_amount else 0.0,
+                    "average": category_damage / category_hits if category_hits else 0.0,
+                }
+            top.append({
                 "name": name,
                 "amount": amount,
                 "percent": amount / largest * 100.0,
                 "damage_type": " / ".join(sorted(impact_types, key=str.casefold)).upper(),
-            }
-            for name, amount, impact_types in visible[:6]
-        ]
+                "breakdown": breakdown,
+                "non_damage": float(non_damage),
+                "segments": {
+                    "normal": (float(buckets["normal"][1]) + float(non_damage)) * 100.0 / largest,
+                    "crit": float(buckets["crit"][1]) * 100.0 / largest,
+                    "heavy": float(buckets["heavy"][1]) * 100.0 / largest,
+                    "dev": float(buckets["dev"][1]) * 100.0 / largest,
+                },
+            })
         hits = self.damage_hit_count or 1
         return {
             "damage": self.total_damage, "healing": self.total_healing, "shielding": self.total_shielding,
             "dps": self._rolling(self.recent_damage, now), "hps": self._rolling(self.recent_healing, now),
-            "duration": duration, "active": self.is_active, "abilities": top,
+            "duration": duration, "active": self.is_active, "in_run": self.in_run, "abilities": top,
             "highest_crit": self.highest_critical_hit, "highest_heavy": self.highest_heavy_hit,
             "highest_dev": self.highest_devastating_hit,
             "crit_rate": self.critical_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
@@ -673,6 +717,8 @@ class AppSettings:
     DEFAULTS = {
         "CombatLogPath": None, "CombatLogFolder": None, "CleanupOldCombatLogs": False,
         "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
+        "OverlayOpacity": 1.0, "FadeWhenAfk": False, "AfkFadeSeconds": 6.0,
+        "IncludeOverkillDamage": False,
     }
 
     def __init__(self) -> None:
@@ -1030,10 +1076,19 @@ class MeterApp:
         self.game_pid: int | None = None
         self.last_process_poll = 0.0
         self.locked = False
+        try:
+            configured_opacity = float(self.settings.get("OverlayOpacity"))
+        except (TypeError, ValueError):
+            configured_opacity = 1.0
+        self.current_opacity = min(1.0, max(0.2, configured_opacity))
+        self.settings.data["OverlayOpacity"] = self.current_opacity
         self.current_view = "meter"
         self.closed = False
         self.theme_roles: list[tuple[tk.Widget, str | None, str | None]] = []
         self.ability_rows: list[dict[str, Any]] = []
+        self._ability_tooltip: tk.Toplevel | None = None
+        self._ability_tooltip_row: dict[str, Any] | None = None
+        self._ability_tooltip_hide_job: str | None = None
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
@@ -1044,6 +1099,7 @@ class MeterApp:
         self.root.minsize(320, 560)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", self.current_opacity)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Configure>", lambda _event: self._position_settings_entry())
 
@@ -1211,21 +1267,19 @@ class MeterApp:
             amount = self.label(row, "", 8, "bold", "text", anchor="ne")
             amount.pack(side="right", anchor="n")
             middle.pack(side="left", fill="x", expand=True)
-            self.ability_rows.append({
+            row_info = {
                 "frame": row, "icon": icon, "name": name, "damage_type": damage_type,
-                "bar": bar, "amount": amount, "percent": 0.0,
-            })
+                "bar": bar, "amount": amount, "percent": 0.0, "segments": {}, "ability": None,
+            }
+            self.ability_rows.append(row_info)
+            for hover_widget in (row, icon_holder, icon, middle, name_line, damage_type, name, bar, amount):
+                hover_widget.bind("<Enter>", lambda event, info=row_info: self._show_ability_tooltip(info, event))
+                hover_widget.bind("<Leave>", self._schedule_hide_ability_tooltip)
 
         footer = self.role(tk.Frame(self.meter_view), "bg", None)
         footer.pack(fill="x", side="bottom", pady=(5, 0))
         self.log_path_label = self.label(footer, "Log folder: auto-detect", 6, foreground="dim", anchor="w")
         self.log_path_label.pack(fill="x", pady=(0, 5))
-        buttons = self.role(tk.Frame(footer), "bg", None)
-        buttons.pack(fill="x")
-        for index, (text, command) in enumerate((("Attach", lambda: self.find_and_follow(force=True)), ("Log folder", self.pick_log_folder), ("Reset", self.reset_session))):
-            button = self.button(buttons, text, command)
-            button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 3, 0 if index == 2 else 3))
-            buttons.grid_columnconfigure(index, weight=1, uniform="footer")
         self.follow_var = tk.BooleanVar(value=bool(self.settings.get("FollowGameWindow")))
         self.follow_check = tk.Checkbutton(footer, text="Follow game window", variable=self.follow_var, command=self.follow_changed,
                                            font=(self.FONT, 7), borderwidth=0, highlightthickness=0, anchor="w")
@@ -1357,7 +1411,57 @@ class MeterApp:
         self.label(self.settings_view, "Enter any #RRGGBB color or use the RGB sliders. Changes preview instantly and are saved automatically.",
                    7, foreground="muted", justify="left", wraplength=300).pack(anchor="w", padx=15, pady=(8, 0))
 
-        self.label(self.settings_view, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(20, 5))
+        self.label(self.settings_view, "OVERLAY", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(14, 4))
+        opacity_row = self.role(tk.Frame(self.settings_view), "bg", None)
+        opacity_row.pack(fill="x", padx=15)
+        self.label(opacity_row, "Opacity", 8, foreground="text", width=7, anchor="w").grid(row=0, column=0, sticky="w")
+        self.opacity_var = tk.DoubleVar(value=self.current_opacity * 100.0)
+        opacity_scale = tk.Scale(opacity_row, from_=20, to=100, orient="horizontal", showvalue=False,
+                                 variable=self.opacity_var, command=self.opacity_changed, borderwidth=0,
+                                 highlightthickness=0, sliderlength=14)
+        self.role(opacity_scale, "bg", "text")
+        opacity_scale.grid(row=0, column=1, sticky="ew", padx=4)
+        self.opacity_value_label = self.label(opacity_row, f"{self.current_opacity * 100:.0f}%", 8,
+                                              foreground="muted", width=4, anchor="e")
+        self.opacity_value_label.grid(row=0, column=2, sticky="e")
+        opacity_row.grid_columnconfigure(1, weight=1)
+        self.fade_when_afk_var = tk.BooleanVar(value=bool(self.settings.get("FadeWhenAfk")))
+        fade_when_afk = tk.Checkbutton(self.settings_view, text="Fade when AFK / outside a dungeon",
+                                       variable=self.fade_when_afk_var, command=self.fade_when_afk_changed,
+                                       font=(self.FONT, 8), borderwidth=0, highlightthickness=0, anchor="w")
+        self.role(fade_when_afk, "bg", "text")
+        fade_when_afk.pack(anchor="w", padx=15, pady=(2, 0))
+        try:
+            fade_seconds = min(60.0, max(1.0, float(self.settings.get("AfkFadeSeconds"))))
+        except (TypeError, ValueError):
+            fade_seconds = 6.0
+        self.settings.data["AfkFadeSeconds"] = fade_seconds
+        fade_time_row = self.role(tk.Frame(self.settings_view), "bg", None)
+        fade_time_row.pack(fill="x", padx=(34, 15), pady=(2, 0))
+        self.label(fade_time_row, "Fade time", 7, foreground="text", width=8, anchor="w").grid(row=0, column=0, sticky="w")
+        self.afk_fade_seconds_var = tk.DoubleVar(value=fade_seconds)
+        fade_time_scale = tk.Scale(fade_time_row, from_=1, to=60, orient="horizontal", showvalue=False,
+                                   variable=self.afk_fade_seconds_var, command=self.afk_fade_seconds_changed,
+                                   borderwidth=0, highlightthickness=0, sliderlength=14)
+        self.role(fade_time_scale, "bg", "text")
+        fade_time_scale.grid(row=0, column=1, sticky="ew", padx=4)
+        self.afk_fade_seconds_label = self.label(fade_time_row, self.format_fade_seconds(fade_seconds), 7,
+                                                 foreground="muted", width=6, anchor="e")
+        self.afk_fade_seconds_label.grid(row=0, column=2, sticky="e")
+        fade_time_row.grid_columnconfigure(1, weight=1)
+        self.label(self.settings_view, "Sets how long fading to 8% takes. Combat wakes the meter quickly.",
+                   7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(1, 0))
+
+        self.label(self.settings_view, "DAMAGE", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
+        self.include_overkill_var = tk.BooleanVar(value=bool(self.settings.get("IncludeOverkillDamage")))
+        include_overkill = tk.Checkbutton(self.settings_view, text="Include overkill damage",
+                                          variable=self.include_overkill_var, command=self.include_overkill_changed,
+                                          font=(self.FONT, 8), borderwidth=0, highlightthickness=0, anchor="w")
+        self.role(include_overkill, "bg", "text")
+        include_overkill.pack(anchor="w", padx=15)
+        self.label(self.settings_view, "Off matches Gearforge using actual enemy health removed. Flex records keep full hit values.",
+                   7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        self.label(self.settings_view, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.cleanup_var = tk.BooleanVar(value=bool(self.settings.get("CleanupOldCombatLogs")))
         cleanup = tk.Checkbutton(self.settings_view, text="Delete verified old combat logs; keep newest 10",
                                  variable=self.cleanup_var, command=self.cleanup_changed, font=(self.FONT, 8),
@@ -1457,6 +1561,8 @@ class MeterApp:
     def show_settings(self) -> None:
         if self.locked:
             self.toggle_lock()
+        self.current_opacity = min(1.0, max(0.2, float(self.settings.get("OverlayOpacity") or 1.0)))
+        self.root.attributes("-alpha", self.current_opacity)
         self.settings_view.place(x=0, y=0, relwidth=1, relheight=1)
         self.settings_view.lift()
         self.credit.lift()
@@ -1469,7 +1575,9 @@ class MeterApp:
         pass
 
     def _on_combat_event(self, event: CombatEvent) -> None:
-        self.session.apply(event)
+        self.session.apply(live_damage_event(event, bool(self.settings.get("IncludeOverkillDamage"))))
+        # Flex records intentionally keep the full post-mitigation hit so a
+        # personal best is not capped by the target's remaining health.
         self.records.apply(event)
 
     def _on_active_log(self, path: str) -> None:
@@ -1504,6 +1612,44 @@ class MeterApp:
             if removed:
                 self.log_status = f"Cleared {removed} old combat logs"
 
+    def include_overkill_changed(self) -> None:
+        enabled = bool(self.include_overkill_var.get())
+        self.settings.set("IncludeOverkillDamage", enabled)
+        self.session.reset()
+        if self.watcher.active_path is not None:
+            self.watcher.position = 0
+            self.watcher.partial = b""
+            self.watcher.resolver.reset()
+            self.log_status = "Recalculating damage totals..."
+        self.refresh()
+
+    def opacity_changed(self, value: str) -> None:
+        try:
+            percent = min(100.0, max(20.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        self.opacity_value_label.configure(text=f"{percent:.0f}%")
+        self.current_opacity = percent / 100.0
+        self.settings.set("OverlayOpacity", self.current_opacity)
+        self.root.attributes("-alpha", self.current_opacity)
+
+    def fade_when_afk_changed(self) -> None:
+        self.settings.set("FadeWhenAfk", bool(self.fade_when_afk_var.get()))
+        self.refresh()
+
+    @staticmethod
+    def format_fade_seconds(seconds: float) -> str:
+        rounded = round(seconds)
+        return "1 sec" if rounded == 1 else f"{rounded} sec"
+
+    def afk_fade_seconds_changed(self, value: str) -> None:
+        try:
+            seconds = float(round(min(60.0, max(1.0, float(value)))))
+        except (TypeError, ValueError):
+            return
+        self.afk_fade_seconds_label.configure(text=self.format_fade_seconds(seconds))
+        self.settings.set("AfkFadeSeconds", seconds)
+
     def follow_changed(self) -> None:
         enabled = bool(self.follow_var.get())
         self.settings.set("FollowGameWindow", enabled)
@@ -1532,6 +1678,7 @@ class MeterApp:
 
     def refresh(self) -> None:
         snapshot = self.session.snapshot()
+        self._update_overlay_opacity(bool(snapshot["in_run"]))
         total_seconds = max(0, round(snapshot["duration"]))
         self.duration_label.configure(text=f"{(total_seconds // 60) % 60:02d}:{total_seconds % 60:02d}")
         self.state_label.configure(text="ACTIVE" if snapshot["active"] else "IDLE")
@@ -1552,7 +1699,10 @@ class MeterApp:
         abilities = snapshot["abilities"]
         for index, row in enumerate(self.ability_rows):
             if index >= len(abilities):
+                if self._ability_tooltip_row is row:
+                    self._hide_ability_tooltip()
                 row["frame"].pack_forget()
+                row["ability"] = None
                 continue
             if not row["frame"].winfo_manager():
                 row["frame"].pack(fill="x", pady=2)
@@ -1561,6 +1711,8 @@ class MeterApp:
             row["damage_type"].configure(text=ability["damage_type"])
             row["amount"].configure(text=format_number(ability["amount"]))
             row["percent"] = ability["percent"]
+            row["segments"] = ability["segments"]
+            row["ability"] = ability
             icon = self.icons.get(normalize_ability(ability["name"]))
             row["icon"].configure(image=icon or "")
         self._redraw_bars()
@@ -1597,6 +1749,29 @@ class MeterApp:
         folder = self.watcher.folder
         self.log_path_label.configure(text=f"Log folder: {folder}" if folder else "Log folder: auto-detect")
 
+    def _update_overlay_opacity(self, in_run: bool) -> None:
+        try:
+            normal_opacity = min(1.0, max(0.2, float(self.settings.get("OverlayOpacity"))))
+        except (TypeError, ValueError):
+            normal_opacity = 1.0
+        settings_open = bool(self.settings_view.winfo_ismapped())
+        should_fade = bool(self.settings.get("FadeWhenAfk")) and not in_run and not settings_open
+        lock_factor = 0.92 if self.locked else 1.0
+        target = (0.08 if should_fade else normal_opacity) * lock_factor
+        try:
+            fade_seconds = min(60.0, max(1.0, float(self.settings.get("AfkFadeSeconds"))))
+        except (TypeError, ValueError):
+            fade_seconds = 6.0
+        faded_target = 0.08 * lock_factor
+        normal_target = normal_opacity * lock_factor
+        fade_step = max(0.0001, abs(normal_target - faded_target) / (fade_seconds * 4.0))
+        step = 0.12 if target > self.current_opacity else fade_step
+        if abs(target - self.current_opacity) <= step:
+            self.current_opacity = target
+        else:
+            self.current_opacity += step if target > self.current_opacity else -step
+        self.root.attributes("-alpha", min(1.0, max(0.05, self.current_opacity)))
+
     def _redraw_bars(self) -> None:
         if not hasattr(self, "colors"):
             return
@@ -1605,7 +1780,95 @@ class MeterApp:
             canvas.delete("all")
             width = max(1, canvas.winfo_width())
             canvas.create_rectangle(0, 0, width, 3, fill=self.colors["bar_bg"], outline="")
-            canvas.create_rectangle(0, 0, width * float(row["percent"]) / 100.0, 3, fill=self.colors["bar"], outline="")
+            left = 0.0
+            segment_colors = {"normal": "#F4F7FB", "crit": self.colors["red"], "heavy": self.colors["orange"], "dev": self.colors["purple"]}
+            for category in ("normal", "crit", "heavy", "dev"):
+                segment_width = width * float(row.get("segments", {}).get(category, 0.0)) / 100.0
+                if segment_width > 0:
+                    canvas.create_rectangle(left, 0, min(width, left + segment_width), 3,
+                                            fill=segment_colors[category], outline="")
+                left += segment_width
+
+    def _show_ability_tooltip(self, row: dict[str, Any], event: tk.Event) -> None:
+        if row.get("ability") is None:
+            return
+        if self._ability_tooltip_hide_job is not None:
+            self.root.after_cancel(self._ability_tooltip_hide_job)
+            self._ability_tooltip_hide_job = None
+        if self._ability_tooltip is not None and self._ability_tooltip_row is row:
+            self._position_ability_tooltip(row)
+            return
+        self._hide_ability_tooltip()
+        ability = row["ability"]
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        outer = tk.Frame(tip, background="#171C27", highlightbackground="#3A4352", highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text=ability["name"], background="#171C27", foreground="#F4F7FB",
+                 font=(self.FONT, 9, "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 5))
+        colors = {"normal": "#F4F7FB", "crit": self.colors["red"], "heavy": self.colors["orange"], "dev": self.colors["purple"]}
+        titles = {"normal": "Normal", "crit": "Crit", "heavy": "Heavy", "dev": "Devastating"}
+        for category in ("normal", "crit", "heavy", "dev"):
+            stats = ability["breakdown"][category]
+            line = tk.Frame(outer, background="#171C27")
+            line.pack(fill="x", padx=10, pady=1)
+            tk.Label(line, text=titles[category], width=11, background="#171C27", foreground=colors[category],
+                     font=(self.FONT, 8), anchor="w").pack(side="left")
+            hits = int(stats["hits"])
+            hit_word = "hit" if hits == 1 else "hits"
+            detail = f"{hits:,} {hit_word}   {format_number(float(stats['damage']))} · {stats['percent']:.1f}%   avg {format_number(float(stats['average']))}"
+            tk.Label(line, text=detail, background="#171C27", foreground="#F4F7FB",
+                     font=(self.FONT, 8), anchor="w").pack(side="left")
+        if float(ability.get("non_damage", 0.0)) > 0:
+            tk.Label(outer, text=f"Healing / shielding   {format_number(float(ability['non_damage']))}",
+                     background="#171C27", foreground=self.colors["green"], font=(self.FONT, 8),
+                     anchor="w").pack(fill="x", padx=10, pady=(5, 8))
+        else:
+            tk.Frame(outer, height=7, background="#171C27").pack()
+        self._ability_tooltip = tip
+        self._ability_tooltip_row = row
+        tip.bind("<Enter>", self._cancel_hide_ability_tooltip, add="+")
+        tip.bind("<Leave>", self._schedule_hide_ability_tooltip, add="+")
+        self._position_ability_tooltip(row)
+
+    def _position_ability_tooltip(self, row: dict[str, Any]) -> None:
+        if self._ability_tooltip is None:
+            return
+        self._ability_tooltip.update_idletasks()
+        row_widget: tk.Widget = row["frame"]
+        row_x = row_widget.winfo_rootx()
+        row_y = row_widget.winfo_rooty()
+        row_width = row_widget.winfo_width()
+        tip_width = self._ability_tooltip.winfo_width()
+        x = row_x + row_width + 2
+        if x + tip_width > self.root.winfo_screenwidth() - 8:
+            x = row_x - tip_width - 2
+        y = row_y
+        y = min(y, self.root.winfo_screenheight() - self._ability_tooltip.winfo_height() - 8)
+        self._ability_tooltip.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cancel_hide_ability_tooltip(self, _event: tk.Event | None = None) -> None:
+        if self._ability_tooltip_hide_job is not None:
+            self.root.after_cancel(self._ability_tooltip_hide_job)
+            self._ability_tooltip_hide_job = None
+
+    def _schedule_hide_ability_tooltip(self, _event: tk.Event) -> None:
+        if self._ability_tooltip_hide_job is not None:
+            self.root.after_cancel(self._ability_tooltip_hide_job)
+        self._ability_tooltip_hide_job = self.root.after(250, self._hide_ability_tooltip)
+
+    def _hide_ability_tooltip(self) -> None:
+        if self._ability_tooltip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._ability_tooltip_hide_job)
+            except tk.TclError:
+                pass
+            self._ability_tooltip_hide_job = None
+        if self._ability_tooltip is not None:
+            self._ability_tooltip.destroy()
+        self._ability_tooltip = None
+        self._ability_tooltip_row = None
 
     def find_and_follow(self, force: bool = False) -> None:
         found = self.win.find_soulbound() if hasattr(self, "win") else None
@@ -1629,8 +1892,8 @@ class MeterApp:
 
     def toggle_lock(self) -> None:
         self.locked = not self.locked
-        self.root.attributes("-alpha", 0.92 if self.locked else 1.0)
         self.win.set_click_through(self.locked)
+        self.refresh()
 
     def start_drag(self, event: tk.Event) -> None:
         if self.locked:
@@ -1695,7 +1958,7 @@ class MeterApp:
         self.root.mainloop()
 
 
-def replay_log(path: Path) -> dict[str, Any]:
+def replay_log(path: Path, include_overkill: bool = False) -> dict[str, Any]:
     session = CombatSession()
     resolver = CombatAbilityResolver()
     with path.open("r", encoding="utf-8-sig") as handle:
@@ -1709,7 +1972,7 @@ def replay_log(path: Path) -> dict[str, Any]:
             resolver.observe(root)
             event = parse_combat_event(root)
             if event:
-                session.apply(resolver.resolve(event))
+                session.apply(live_damage_event(resolver.resolve(event), include_overkill))
     return session.snapshot()
 
 
@@ -1720,15 +1983,26 @@ def run_self_test(log_path: str | None = None) -> int:
                  "impact_type": "void", "post_target_mitigation_amount": 300, "applied_amount": 1,
                  "is_crit": True, "is_heavy_hit": True},
     })
-    assert event and event.amount == 300
+    assert event and event.amount == 300 and event.applied_amount == 1
+    assert live_damage_event(event, False).amount == 1 and live_damage_event(event, True).amount == 300
     session = CombatSession()
-    session.apply(event)
-    unknown = replace(event, event_id="unknown", sequence=2, ability_name="Unknown Ability", amount=209, critical=False, heavy_hit=False)
-    session.apply(unknown)
+    session.apply(live_damage_event(event, False))
+    unknown = replace(event, event_id="unknown", sequence=2, ability_name="Unknown Ability", amount=209,
+                      applied_amount=209, critical=False, heavy_hit=False)
+    session.apply(live_damage_event(unknown, False))
     snap = session.snapshot()
-    assert snap["damage"] == 509 and snap["abilities"][0]["name"] == "Bomb"
+    assert snap["damage"] == 210 and snap["abilities"][0]["name"] == "Bomb"
     assert snap["abilities"][0]["damage_type"] == "VOID"
-    assert snap["dev_rate"] == 50 and snap["highest_dev"] == 300
+    assert snap["dev_rate"] == 50 and snap["highest_dev"] == 1
+    assert snap["abilities"][0]["breakdown"]["dev"]["hits"] == 1
+    assert snap["abilities"][0]["segments"]["dev"] == 100
+    assert snap["in_run"]
+    ended = parse_combat_event({
+        "timestamp_utc": timestamp_text(utc_now()), "event": "RUN_END", "sequence": 3,
+    })
+    assert ended
+    session.apply(ended)
+    assert not session.snapshot()["in_run"]
 
     resolver = CombatAbilityResolver()
     resolver.observe({"event": "LOADOUT_SNAPSHOT", "data": {"abilities": [{"ability_display_name": "Fortify"}, {"ability_display_name": "Healing Pulse"}]}})
