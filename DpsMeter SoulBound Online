@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.8-py.1"
+VERSION = "0.8.9-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -306,6 +306,7 @@ class CombatSession:
         self.has_encounter_timing = False
         self.abilities: dict[str, list[Any]] = {}
         self.seen_event_ids: set[str] = set()
+        self.seen_sequences: set[float] = set()
         self.recent_damage: deque[tuple[float, float]] = deque()
         self.recent_healing: deque[tuple[float, float]] = deque()
 
@@ -321,17 +322,21 @@ class CombatSession:
             queue.popleft()
 
     def apply(self, event: CombatEvent) -> None:
-        if event.event_id and event.event_id in self.seen_event_ids:
+        if ((event.event_id and event.event_id in self.seen_event_ids)
+                or (event.sequence is not None and event.sequence in self.seen_sequences)):
             return
-        if event.event_id:
-            self.seen_event_ids.add(event.event_id)
+        self._remember(event)
         if event.type == "combat_start":
             self.reset()
+            # RUN_START currently has no event_id. Preserve its sequence after
+            # reset so rereading an in-place rewritten log does not clear the UI.
+            self._remember(event)
             self.started_at = self.last_event_at = event.timestamp
             self.is_active = True
             self.in_run = True
             self.run_controlled = True
             return
+
         if event.type == "encounter_start":
             self.has_encounter_timing = True
             if self.encounter_started_at is not None:
@@ -358,6 +363,7 @@ class CombatSession:
         if not self.is_active:
             if self.started_at is None:
                 self.reset()
+                self._remember(event)
             self.started_at = self.started_at or event.timestamp
             self.is_active = True
         self.in_run = True
@@ -397,6 +403,12 @@ class CombatSession:
                 ability[2].add(event.impact_type)
         else:
             ability[4] += event.amount
+
+    def _remember(self, event: CombatEvent) -> None:
+        if event.event_id:
+            self.seen_event_ids.add(event.event_id)
+        if event.sequence is not None:
+            self.seen_sequences.add(event.sequence)
 
     @staticmethod
     def _rolling(queue: deque[tuple[float, float]], now: float) -> float:
@@ -2003,6 +2015,29 @@ def run_self_test(log_path: str | None = None) -> int:
     assert ended
     session.apply(ended)
     assert not session.snapshot()["in_run"]
+
+    rewrite_events = [
+        parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "RUN_START", "sequence": 10}),
+        parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "ENCOUNTER_START", "sequence": 11}),
+        parse_combat_event({
+            "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 12,
+            "data": {"source": {"type": "self"}, "ability_display_name": "Bomb", "applied_amount": 123},
+        }),
+    ]
+    assert all(rewrite_events)
+    rewrite_session = CombatSession()
+    for rewrite_event in rewrite_events:
+        assert rewrite_event
+        rewrite_session.apply(rewrite_event)
+    assert rewrite_session.snapshot()["damage"] == 123
+    assert rewrite_events[0]
+    rewrite_session.apply(rewrite_events[0])
+    assert rewrite_session.snapshot()["damage"] == 123
+    for rewrite_event in rewrite_events[1:]:
+        assert rewrite_event
+        rewrite_session.apply(rewrite_event)
+    rewrite_snapshot = rewrite_session.snapshot()
+    assert rewrite_snapshot["damage"] == 123 and rewrite_session.damage_hit_count == 1 and rewrite_snapshot["in_run"]
 
     resolver = CombatAbilityResolver()
     resolver.observe({"event": "LOADOUT_SNAPSHOT", "data": {"abilities": [{"ability_display_name": "Fortify"}, {"ability_display_name": "Healing Pulse"}]}})
