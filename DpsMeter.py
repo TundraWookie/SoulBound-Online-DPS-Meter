@@ -12,6 +12,7 @@ import base64
 import ctypes
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.9-py.1"
+VERSION = "0.8.12-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -327,14 +328,13 @@ class CombatSession:
             return
         self._remember(event)
         if event.type == "combat_start":
-            self.reset()
-            # RUN_START currently has no event_id. Preserve its sequence after
-            # reset so rereading an in-place rewritten log does not clear the UI.
-            self._remember(event)
-            self.started_at = self.last_event_at = event.timestamp
-            self.is_active = True
-            self.in_run = True
-            self.run_controlled = True
+            # Selecting a new log is the only automatic run reset. A repeated
+            # RUN_START inside the active file must never clear visible totals.
+            if self.started_at is None:
+                self.started_at = self.last_event_at = event.timestamp
+                self.is_active = True
+                self.in_run = True
+                self.run_controlled = True
             return
 
         if event.type == "encounter_start":
@@ -361,9 +361,6 @@ class CombatSession:
         if event.type not in {"damage", "heal", "shield"} or event.amount <= 0 or not is_own_event(event):
             return
         if not self.is_active:
-            if self.started_at is None:
-                self.reset()
-                self._remember(event)
             self.started_at = self.started_at or event.timestamp
             self.is_active = True
         self.in_run = True
@@ -730,7 +727,7 @@ class AppSettings:
         "CombatLogPath": None, "CombatLogFolder": None, "CleanupOldCombatLogs": False,
         "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
         "OverlayOpacity": 1.0, "FadeWhenAfk": False, "AfkFadeSeconds": 6.0,
-        "IncludeOverkillDamage": False,
+        "IncludeOverkillDamage": False, "WindowWidth": None, "WindowHeight": None, "FontScale": 1.0,
     }
 
     def __init__(self) -> None:
@@ -759,6 +756,8 @@ class AppSettings:
 
 
 class CombatLogWatcher:
+    LOG_START_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}Z)$", re.IGNORECASE)
+
     def __init__(self, configured_folder: str | None, cleanup_enabled: bool,
                  event_callback: Callable[[CombatEvent], None], log_callback: Callable[[str], None],
                  status_callback: Callable[[bool, str], None]) -> None:
@@ -830,6 +829,20 @@ class CombatLogWatcher:
             return None
 
     @classmethod
+    def log_start_key(cls, path: Path) -> int:
+        match = cls.LOG_START_PATTERN.search(path.stem)
+        if match:
+            try:
+                parsed = datetime.strptime(match.group(1), "%Y-%m-%d_%H-%M-%SZ").replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp() * 1_000_000_000)
+            except ValueError:
+                pass
+        try:
+            return path.stat().st_ctime_ns
+        except OSError:
+            return 0
+
+    @classmethod
     def cleanup_old_logs(cls, folder: Path, keep: int = 10) -> int:
         verified = [path for path in cls.files(folder) if cls.verified(path)]
         try:
@@ -863,19 +876,30 @@ class CombatLogWatcher:
         if self.folder is None or not self.folder.is_dir():
             self._status(False, "Waiting for combat-log folder")
             return
-        newest = self.find_newest(self.folder)
-        if newest is None:
+        candidate = self.find_newest(self.folder)
+        if self.active_path is None and candidate is None:
             self._status(False, "Waiting for a combat log")
             return
-        if self.active_path is None or str(self.active_path).casefold() != str(newest).casefold():
-            self.active_path = newest
+        should_switch = self.active_path is None
+        if (self.active_path is not None and candidate is not None
+                and str(self.active_path).casefold() != str(candidate).casefold()):
+            # The active file can be temporarily empty or unverifiable while the
+            # game rewrites it. Never fall back to an older dungeon during that
+            # window; switch only when a genuinely newer run filename appears.
+            should_switch = self.log_start_key(candidate) > self.log_start_key(self.active_path)
+        if should_switch and candidate is not None:
+            self.active_path = candidate
             self.position = 0
             self.partial = b""
             self.resolver.reset()
-            self.log_callback(str(newest))
+            self.log_callback(str(candidate))
             removed = self.cleanup_old_logs(self.folder, 10) if self.cleanup_enabled else 0
             suffix = f" · cleared {removed} old" if removed else ""
-            self._status(True, f"Reading {newest.name}{suffix}")
+            self._status(True, f"Reading {candidate.name}{suffix}")
+        newest = self.active_path
+        if newest is None:
+            self._status(False, "Waiting for a combat log")
+            return
         try:
             size = newest.stat().st_size
             if size < self.position:
@@ -1094,9 +1118,16 @@ class MeterApp:
             configured_opacity = 1.0
         self.current_opacity = min(1.0, max(0.2, configured_opacity))
         self.settings.data["OverlayOpacity"] = self.current_opacity
+        try:
+            configured_font_scale = float(self.settings.get("FontScale"))
+        except (TypeError, ValueError):
+            configured_font_scale = 1.0
+        self.font_scale = min(1.5, max(0.8, configured_font_scale))
+        self.settings.data["FontScale"] = self.font_scale
         self.current_view = "meter"
         self.closed = False
         self.theme_roles: list[tuple[tk.Widget, str | None, str | None]] = []
+        self._font_targets: list[tuple[tk.Widget, int, str]] = []
         self.ability_rows: list[dict[str, Any]] = []
         self._ability_tooltip: tk.Toplevel | None = None
         self._ability_tooltip_row: dict[str, Any] | None = None
@@ -1104,6 +1135,9 @@ class MeterApp:
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
+        self._minimized = False
+        self._restore_binding: str | None = None
+        self._settings_wheel_binding: str | None = None
 
         self.root = tk.Tk()
         self.root.title("DPS Meter")
@@ -1143,11 +1177,30 @@ class MeterApp:
 
     def _initial_geometry(self) -> str:
         width, height = 360, 650
+        configured_width = self.settings.get("WindowWidth")
+        configured_height = self.settings.get("WindowHeight")
+        if isinstance(configured_width, (int, float)):
+            width = max(320, min(self.root.winfo_screenwidth(), round(configured_width)))
+        if isinstance(configured_height, (int, float)):
+            height = max(560, min(self.root.winfo_screenheight(), round(configured_height)))
         left = self.settings.get("WindowLeft")
         top = self.settings.get("WindowTop")
         if not self.settings.get("FollowGameWindow") and isinstance(left, (int, float)) and isinstance(top, (int, float)):
             return f"{width}x{height}+{round(left)}+{round(top)}"
         return f"{width}x{height}+40+40"
+
+    def _scaled_font_size(self, base_size: int) -> int:
+        return max(6, round(base_size * self.font_scale))
+
+    def _register_font(self, widget: tk.Widget, size: int, weight: str = "normal") -> None:
+        self._font_targets.append((widget, size, weight))
+
+    def _apply_font_scale(self) -> None:
+        for widget, base_size, weight in self._font_targets:
+            try:
+                widget.configure(font=(self.FONT, self._scaled_font_size(base_size), weight))
+            except tk.TclError:
+                continue
 
     def role(self, widget: tk.Widget, background: str | None = None, foreground: str | None = None) -> tk.Widget:
         self.theme_roles.append((widget, background, foreground))
@@ -1155,12 +1208,14 @@ class MeterApp:
 
     def label(self, parent: tk.Misc, text: str = "", size: int = 10, weight: str = "normal",
               foreground: str = "text", **kwargs: Any) -> tk.Label:
-        widget = tk.Label(parent, text=text, font=(self.FONT, size, weight), borderwidth=0, **kwargs)
+        widget = tk.Label(parent, text=text, font=(self.FONT, self._scaled_font_size(size), weight), borderwidth=0, **kwargs)
+        self._register_font(widget, size, weight)
         return self.role(widget, "bg", foreground)  # type: ignore[return-value]
 
     def button(self, parent: tk.Misc, text: str, command: Callable[[], None], width: int | None = None, **kwargs: Any) -> tk.Button:
-        widget = tk.Button(parent, text=text, command=command, font=(self.FONT, 9), relief="flat", borderwidth=1,
+        widget = tk.Button(parent, text=text, command=command, font=(self.FONT, self._scaled_font_size(9)), relief="flat", borderwidth=1,
                            highlightthickness=0, cursor="hand2", padx=6, pady=4, width=width, **kwargs)
+        self._register_font(widget, 9)
         return self.role(widget, "button", "text")  # type: ignore[return-value]
 
     def panel(self, parent: tk.Misc, **kwargs: Any) -> tk.Frame:
@@ -1294,7 +1349,8 @@ class MeterApp:
         self.log_path_label.pack(fill="x", pady=(0, 5))
         self.follow_var = tk.BooleanVar(value=bool(self.settings.get("FollowGameWindow")))
         self.follow_check = tk.Checkbutton(footer, text="Follow game window", variable=self.follow_var, command=self.follow_changed,
-                                           font=(self.FONT, 7), borderwidth=0, highlightthickness=0, anchor="w")
+                                           font=(self.FONT, self._scaled_font_size(7)), borderwidth=0, highlightthickness=0, anchor="w")
+        self._register_font(self.follow_check, 7)
         self.role(self.follow_check, "bg", "muted")
         self.follow_check.pack(anchor="w", pady=(4, 0))
         self.label(footer, "Alt+Shift+D toggles click-through lock", 6, foreground="dim").pack(anchor="w")
@@ -1382,8 +1438,21 @@ class MeterApp:
         header.pack(fill="x", padx=15, pady=(14, 0))
         self.label(header, "APPEARANCE", 10, "bold", "text").pack(side="left")
         self.button(header, "×", self.hide_settings, width=2).pack(side="right")
-        self.label(self.settings_view, "Menu color", 8, foreground="muted").pack(anchor="w", padx=15, pady=(15, 4))
-        sliders = self.role(tk.Frame(self.settings_view), "bg", None)
+        settings_scroll_host = self.role(tk.Frame(self.settings_view), "bg", None)
+        settings_scroll_host.pack(fill="both", expand=True, pady=(8, 0))
+        self.settings_canvas = self.role(tk.Canvas(settings_scroll_host, borderwidth=0, highlightthickness=0), "bg", None)
+        self.settings_scrollbar = self.role(tk.Scrollbar(settings_scroll_host, orient="vertical", width=8,
+                                                         command=self.settings_canvas.yview), "panel", None)
+        self.settings_canvas.configure(yscrollcommand=self.settings_scrollbar.set)
+        self.settings_scrollbar.pack(side="right", fill="y")
+        self.settings_canvas.pack(side="left", fill="both", expand=True)
+        self.settings_body = self.role(tk.Frame(self.settings_canvas), "bg", None)
+        self.settings_body_window = self.settings_canvas.create_window((0, 0), window=self.settings_body, anchor="nw")
+        self.settings_body.bind("<Configure>", self._sync_settings_scroll_region)
+        self.settings_canvas.bind("<Configure>", self._size_settings_body)
+
+        self.label(self.settings_body, "Menu color", 8, foreground="muted").pack(anchor="w", padx=15, pady=(3, 4))
+        sliders = self.role(tk.Frame(self.settings_body), "bg", None)
         sliders.pack(fill="x", padx=15)
         self.rgb_vars: dict[str, tk.DoubleVar] = {}
         self.rgb_value_labels: dict[str, tk.Label] = {}
@@ -1401,30 +1470,31 @@ class MeterApp:
             self.rgb_vars[key] = variable
             self.rgb_value_labels[key] = value
 
-        hex_row = self.role(tk.Frame(self.settings_view), "bg", None)
+        hex_row = self.role(tk.Frame(self.settings_body), "bg", None)
         hex_row.pack(fill="x", padx=15, pady=(12, 0))
         self.color_preview = self.role(tk.Frame(hex_row, width=30, height=30, highlightthickness=1), "bg", None)
         self.color_preview.pack(side="left")
         self.color_preview.pack_propagate(False)
         self.hex_var = tk.StringVar(value="#10151D")
-        self.hex_entry = tk.Entry(hex_row, textvariable=self.hex_var, font=(self.FONT, 9), relief="flat", borderwidth=1)
+        self.hex_entry = tk.Entry(hex_row, textvariable=self.hex_var, font=(self.FONT, self._scaled_font_size(9)), relief="flat", borderwidth=1)
+        self._register_font(self.hex_entry, 9)
         self.role(self.hex_entry, "panel", "text")
         self.hex_entry.pack(side="left", fill="x", expand=True, padx=7, ipady=5)
         self.hex_entry.bind("<Return>", lambda _event: self.apply_hex())
         self.button(hex_row, "Apply", self.apply_hex).pack(side="right")
 
-        self.label(self.settings_view, "Presets", 8, foreground="muted").pack(anchor="w", padx=15, pady=(15, 5))
-        presets = self.role(tk.Frame(self.settings_view), "bg", None)
+        self.label(self.settings_body, "Presets", 8, foreground="muted").pack(anchor="w", padx=15, pady=(15, 5))
+        presets = self.role(tk.Frame(self.settings_body), "bg", None)
         presets.pack(fill="x", padx=15)
         for color in ("#10151D", "#14293A", "#17352F", "#382040", "#40221F", "#3D321A"):
             button = tk.Button(presets, text="", width=3, height=1, background=color, activebackground=color,
                                relief="flat", borderwidth=1, command=lambda value=color: self.apply_theme(value))
             button.pack(side="left", padx=(0, 5))
-        self.label(self.settings_view, "Enter any #RRGGBB color or use the RGB sliders. Changes preview instantly and are saved automatically.",
+        self.label(self.settings_body, "Enter any #RRGGBB color or use the RGB sliders. Changes preview instantly and are saved automatically.",
                    7, foreground="muted", justify="left", wraplength=300).pack(anchor="w", padx=15, pady=(8, 0))
 
-        self.label(self.settings_view, "OVERLAY", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(14, 4))
-        opacity_row = self.role(tk.Frame(self.settings_view), "bg", None)
+        self.label(self.settings_body, "OVERLAY", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(14, 4))
+        opacity_row = self.role(tk.Frame(self.settings_body), "bg", None)
         opacity_row.pack(fill="x", padx=15)
         self.label(opacity_row, "Opacity", 8, foreground="text", width=7, anchor="w").grid(row=0, column=0, sticky="w")
         self.opacity_var = tk.DoubleVar(value=self.current_opacity * 100.0)
@@ -1437,10 +1507,24 @@ class MeterApp:
                                               foreground="muted", width=4, anchor="e")
         self.opacity_value_label.grid(row=0, column=2, sticky="e")
         opacity_row.grid_columnconfigure(1, weight=1)
+        font_row = self.role(tk.Frame(self.settings_body), "bg", None)
+        font_row.pack(fill="x", padx=15, pady=(3, 0))
+        self.label(font_row, "Font size", 8, foreground="text", width=7, anchor="w").grid(row=0, column=0, sticky="w")
+        self.font_scale_var = tk.DoubleVar(value=self.font_scale * 100.0)
+        font_scale = tk.Scale(font_row, from_=80, to=150, orient="horizontal", showvalue=False,
+                              variable=self.font_scale_var, command=self.font_scale_changed, borderwidth=0,
+                              highlightthickness=0, sliderlength=14, resolution=5)
+        self.role(font_scale, "bg", "text")
+        font_scale.grid(row=0, column=1, sticky="ew", padx=4)
+        self.font_scale_value_label = self.label(font_row, f"{self.font_scale * 100:.0f}%", 8,
+                                                  foreground="muted", width=4, anchor="e")
+        self.font_scale_value_label.grid(row=0, column=2, sticky="e")
+        font_row.grid_columnconfigure(1, weight=1)
         self.fade_when_afk_var = tk.BooleanVar(value=bool(self.settings.get("FadeWhenAfk")))
-        fade_when_afk = tk.Checkbutton(self.settings_view, text="Fade when AFK / outside a dungeon",
+        fade_when_afk = tk.Checkbutton(self.settings_body, text="Fade when AFK / outside a dungeon",
                                        variable=self.fade_when_afk_var, command=self.fade_when_afk_changed,
-                                       font=(self.FONT, 8), borderwidth=0, highlightthickness=0, anchor="w")
+                                       font=(self.FONT, self._scaled_font_size(8)), borderwidth=0, highlightthickness=0, anchor="w")
+        self._register_font(fade_when_afk, 8)
         self.role(fade_when_afk, "bg", "text")
         fade_when_afk.pack(anchor="w", padx=15, pady=(2, 0))
         try:
@@ -1448,7 +1532,7 @@ class MeterApp:
         except (TypeError, ValueError):
             fade_seconds = 6.0
         self.settings.data["AfkFadeSeconds"] = fade_seconds
-        fade_time_row = self.role(tk.Frame(self.settings_view), "bg", None)
+        fade_time_row = self.role(tk.Frame(self.settings_body), "bg", None)
         fade_time_row.pack(fill="x", padx=(34, 15), pady=(2, 0))
         self.label(fade_time_row, "Fade time", 7, foreground="text", width=8, anchor="w").grid(row=0, column=0, sticky="w")
         self.afk_fade_seconds_var = tk.DoubleVar(value=fade_seconds)
@@ -1461,29 +1545,31 @@ class MeterApp:
                                                  foreground="muted", width=6, anchor="e")
         self.afk_fade_seconds_label.grid(row=0, column=2, sticky="e")
         fade_time_row.grid_columnconfigure(1, weight=1)
-        self.label(self.settings_view, "Sets how long fading to 8% takes. Combat wakes the meter quickly.",
+        self.label(self.settings_body, "Sets how long fading to 8% takes. Combat wakes the meter quickly.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(1, 0))
 
-        self.label(self.settings_view, "DAMAGE", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
+        self.label(self.settings_body, "DAMAGE", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.include_overkill_var = tk.BooleanVar(value=bool(self.settings.get("IncludeOverkillDamage")))
-        include_overkill = tk.Checkbutton(self.settings_view, text="Include overkill damage",
+        include_overkill = tk.Checkbutton(self.settings_body, text="Include overkill damage",
                                           variable=self.include_overkill_var, command=self.include_overkill_changed,
-                                          font=(self.FONT, 8), borderwidth=0, highlightthickness=0, anchor="w")
+                                          font=(self.FONT, self._scaled_font_size(8)), borderwidth=0, highlightthickness=0, anchor="w")
+        self._register_font(include_overkill, 8)
         self.role(include_overkill, "bg", "text")
         include_overkill.pack(anchor="w", padx=15)
-        self.label(self.settings_view, "Off matches Gearforge using actual enemy health removed. Flex records keep full hit values.",
+        self.label(self.settings_body, "Off matches Gearforge using actual enemy health removed. Flex records keep full hit values.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
-        self.label(self.settings_view, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
+        self.label(self.settings_body, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.cleanup_var = tk.BooleanVar(value=bool(self.settings.get("CleanupOldCombatLogs")))
-        cleanup = tk.Checkbutton(self.settings_view, text="Delete verified old combat logs; keep newest 10",
-                                 variable=self.cleanup_var, command=self.cleanup_changed, font=(self.FONT, 8),
+        cleanup = tk.Checkbutton(self.settings_body, text="Delete verified old combat logs; keep newest 10",
+                                 variable=self.cleanup_var, command=self.cleanup_changed, font=(self.FONT, self._scaled_font_size(8)),
                                  borderwidth=0, highlightthickness=0, anchor="w", justify="left")
+        self._register_font(cleanup, 8)
         self.role(cleanup, "bg", "text")
         cleanup.pack(anchor="w", padx=15)
-        self.label(self.settings_view, "Only files containing a Soulbound combat-log header are eligible.", 7,
+        self.label(self.settings_body, "Only files containing a Soulbound combat-log header are eligible.", 7,
                    foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
-        bottom = self.role(tk.Frame(self.settings_view), "bg", None)
-        bottom.pack(fill="x", side="bottom", padx=15, pady=15)
+        bottom = self.role(tk.Frame(self.settings_body), "bg", None)
+        bottom.pack(fill="x", padx=15, pady=15)
         self.button(bottom, "Default color", lambda: self.apply_theme("#10151D")).pack(side="left", fill="x", expand=True, padx=(0, 4))
         self.button(bottom, "Done", self.hide_settings).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
@@ -1494,6 +1580,7 @@ class MeterApp:
         self.grip.place(relx=1.0, rely=1.0, x=-1, y=-1, anchor="se")
         self.grip.bind("<ButtonPress-1>", self.start_resize)
         self.grip.bind("<B1-Motion>", self.resize_window)
+        self.grip.bind("<ButtonRelease-1>", self.finish_resize)
 
     def _load_icons(self) -> None:
         self.icons: dict[str, tk.PhotoImage] = {}
@@ -1543,6 +1630,8 @@ class MeterApp:
             except (tk.TclError, TypeError):
                 pass
         self.color_preview.configure(background=color_hex(base), highlightbackground=self.colors["border"])
+        self.settings_scrollbar.configure(background=self.colors["panel"], activebackground=self.colors["button"],
+                                          troughcolor=self.colors["bg"])
         self._updating_theme = True
         for key, component in zip(("r", "g", "b"), base):
             self.rgb_vars[key].set(component)
@@ -1579,9 +1668,27 @@ class MeterApp:
         self.settings_view.lift()
         self.credit.lift()
         self.grip.lift()
+        if self._settings_wheel_binding is None:
+            self._settings_wheel_binding = self.root.bind("<MouseWheel>", self._scroll_settings, add="+")
 
     def hide_settings(self) -> None:
         self.settings_view.place_forget()
+        if self._settings_wheel_binding is not None:
+            self.root.unbind("<MouseWheel>", self._settings_wheel_binding)
+            self._settings_wheel_binding = None
+
+    def _sync_settings_scroll_region(self, _event: tk.Event | None = None) -> None:
+        bounds = self.settings_canvas.bbox("all")
+        if bounds is not None:
+            self.settings_canvas.configure(scrollregion=bounds)
+
+    def _size_settings_body(self, event: tk.Event) -> None:
+        self.settings_canvas.itemconfigure(self.settings_body_window, width=max(1, event.width))
+
+    def _scroll_settings(self, event: tk.Event) -> str:
+        direction = -1 if event.delta > 0 else 1
+        self.settings_canvas.yview_scroll(direction * 3, "units")
+        return "break"
 
     def _position_settings_entry(self) -> None:
         pass
@@ -1644,6 +1751,16 @@ class MeterApp:
         self.current_opacity = percent / 100.0
         self.settings.set("OverlayOpacity", self.current_opacity)
         self.root.attributes("-alpha", self.current_opacity)
+
+    def font_scale_changed(self, value: str) -> None:
+        try:
+            percent = min(150.0, max(80.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        self.font_scale = percent / 100.0
+        self.font_scale_value_label.configure(text=f"{percent:.0f}%")
+        self.settings.set("FontScale", self.font_scale)
+        self._apply_font_scale()
 
     def fade_when_afk_changed(self) -> None:
         self.settings.set("FadeWhenAfk", bool(self.fade_when_afk_var.get()))
@@ -1818,7 +1935,7 @@ class MeterApp:
         outer = tk.Frame(tip, background="#171C27", highlightbackground="#3A4352", highlightthickness=1)
         outer.pack(fill="both", expand=True)
         tk.Label(outer, text=ability["name"], background="#171C27", foreground="#F4F7FB",
-                 font=(self.FONT, 9, "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 5))
+                 font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 5))
         colors = {"normal": "#F4F7FB", "crit": self.colors["red"], "heavy": self.colors["orange"], "dev": self.colors["purple"]}
         titles = {"normal": "Normal", "crit": "Crit", "heavy": "Heavy", "dev": "Devastating"}
         for category in ("normal", "crit", "heavy", "dev"):
@@ -1826,15 +1943,15 @@ class MeterApp:
             line = tk.Frame(outer, background="#171C27")
             line.pack(fill="x", padx=10, pady=1)
             tk.Label(line, text=titles[category], width=11, background="#171C27", foreground=colors[category],
-                     font=(self.FONT, 8), anchor="w").pack(side="left")
+                     font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(side="left")
             hits = int(stats["hits"])
             hit_word = "hit" if hits == 1 else "hits"
             detail = f"{hits:,} {hit_word}   {format_number(float(stats['damage']))} · {stats['percent']:.1f}%   avg {format_number(float(stats['average']))}"
             tk.Label(line, text=detail, background="#171C27", foreground="#F4F7FB",
-                     font=(self.FONT, 8), anchor="w").pack(side="left")
+                     font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(side="left")
         if float(ability.get("non_damage", 0.0)) > 0:
             tk.Label(outer, text=f"Healing / shielding   {format_number(float(ability['non_damage']))}",
-                     background="#171C27", foreground=self.colors["green"], font=(self.FONT, 8),
+                     background="#171C27", foreground=self.colors["green"], font=(self.FONT, self._scaled_font_size(8)),
                      anchor="w").pack(fill="x", padx=10, pady=(5, 8))
         else:
             tk.Frame(outer, height=7, background="#171C27").pack()
@@ -1933,8 +2050,44 @@ class MeterApp:
         new_height = max(560, height + event.y_root - start_y)
         self.root.geometry(f"{new_width}x{new_height}")
 
+    def _store_window_size(self) -> None:
+        if self.root.state() != "iconic":
+            self.settings.data["WindowWidth"] = max(320, self.root.winfo_width())
+            self.settings.data["WindowHeight"] = max(560, self.root.winfo_height())
+
+    def finish_resize(self, _event: tk.Event | None = None) -> None:
+        self._resize_start = None
+        self._store_window_size()
+        self.settings.save()
+
     def minimize(self) -> None:
-        self.win.minimize()
+        if self.closed or self._minimized:
+            return
+        self._hide_ability_tooltip()
+        self._minimized = True
+        # A borderless Tk window cannot be safely iconified directly. Temporarily
+        # give it standard Windows chrome so it has a real taskbar entry and can
+        # be restored, then put the custom overlay chrome back after it maps.
+        self.root.attributes("-topmost", False)
+        self.root.overrideredirect(False)
+        self.root.update_idletasks()
+        self.root.iconify()
+        self._restore_binding = self.root.bind("<Map>", self._restore_from_minimize, add="+")
+
+    def _restore_from_minimize(self, _event: tk.Event | None = None) -> None:
+        if self._minimized:
+            self.root.after_idle(self._finish_restore)
+
+    def _finish_restore(self) -> None:
+        if not self._minimized or self.root.state() == "iconic":
+            return
+        if self._restore_binding:
+            self.root.unbind("<Map>", self._restore_binding)
+            self._restore_binding = None
+        self._minimized = False
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.lift()
 
     def tick(self) -> None:
         if self.closed:
@@ -1960,6 +2113,7 @@ class MeterApp:
         self.settings.data["FollowGameWindow"] = bool(self.follow_var.get())
         self.settings.data["WindowLeft"] = self.root.winfo_x()
         self.settings.data["WindowTop"] = self.root.winfo_y()
+        self._store_window_size()
         self.settings.save()
         self.records.save(force=True)
         if hasattr(self, "win"):
@@ -2053,6 +2207,32 @@ def run_self_test(log_path: str | None = None) -> int:
         store.save(force=True)
         loaded = json.loads((Path(folder) / "records.txt").read_text(encoding="utf-8"))
         assert loaded["LifetimeDamage"] == 300 and loaded["RunsTracked"] == 1
+
+    with tempfile.TemporaryDirectory(prefix="DpsMeterLogPinTest-") as folder:
+        test_folder = Path(folder)
+        old_log = test_folder / "dungeon__Test__1__2026-08-30_21-00-00Z.log"
+        active_log = test_folder / "dungeon__Test__1__2026-08-30_22-00-00Z.log"
+        header = '{"event":"LOG_HEADER","data":{"format":"soulbound_combat_log"},"sequence":1}\n'
+        run_start = '{"timestamp_utc":"2026-08-30T22:00:00Z","event":"RUN_START","sequence":2}\n'
+        first_hit = '{"timestamp_utc":"2026-08-30T22:00:01Z","event":"DAMAGE_DEALT","data":{"source":{"type":"self"},"ability_display_name":"Bomb","applied_amount":20},"sequence":3}\n'
+        next_hit = '{"timestamp_utc":"2026-08-30T22:00:02Z","event":"DAMAGE_DEALT","data":{"source":{"type":"self"},"ability_display_name":"Bomb","applied_amount":10},"sequence":4}\n'
+        old_log.write_text(header + run_start, encoding="utf-8")
+        active_log.write_text(header + run_start + first_hit, encoding="utf-8")
+        watcher_session = CombatSession()
+        selected_logs: list[str] = []
+        watcher = CombatLogWatcher(str(test_folder), False, watcher_session.apply, selected_logs.append,
+                                   lambda _connected, _message: None)
+        watcher.poll()
+        first_watch_snapshot = watcher_session.snapshot()
+        assert first_watch_snapshot["damage"] == 20 and len(selected_logs) == 1 and Path(selected_logs[0]) == active_log.resolve(), (
+            first_watch_snapshot["damage"], selected_logs, watcher.active_path)
+        active_log.write_text("", encoding="utf-8")
+        watcher.poll()
+        assert watcher.active_path == active_log.resolve() and len(selected_logs) == 1
+        assert watcher_session.snapshot()["damage"] == 20
+        active_log.write_text(header + run_start + first_hit + next_hit, encoding="utf-8")
+        watcher.poll()
+        assert watcher_session.snapshot()["damage"] == 30 and len(selected_logs) == 1
 
     print(f"PASS Python DPS Meter {VERSION}")
     if log_path:

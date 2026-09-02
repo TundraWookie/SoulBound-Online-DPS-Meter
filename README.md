@@ -8,15 +8,21 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 
 - Automatically finds Soulbound and the default combat-log folder.
 - Automatically switches to the newest verified dungeon log.
+- Handles in-place combat-log rewrites without resetting or replaying the visible totals.
 - Tracks damage dealt, healing done, and shielding gained.
 - Shows damage and healing during the last 30 seconds, plus DPS and HPS.
 - Tracks critical, heavy, and devastating hit chances for the current run.
 - Tracks the highest critical, heavy, and devastating hits during the current run.
-- Shows ability names, bundled ability icons, contribution bars, and totals.
+- Shows ability names, bundled ability icons, damage types, contribution bars, and totals.
+- Splits each ability bar into Normal, Crit, Heavy, and Devastating damage colors.
+- Shows per-ability hit counts, damage, percentages, and averages when you hover over an ability.
 - Resolves Healing Pulse and Fortify events when the log reports them as unknown.
 - Hides unresolved `Unknown Ability` rows while retaining their amounts in the totals.
 - Includes a permanent **Flex** tab for personal records and lifetime statistics.
 - Supports custom menu colors.
+- Supports adjustable overlay opacity and optional AFK fading between dungeon runs.
+- Supports adjustable font size and remembers the resized window dimensions.
+- Excludes overkill from live damage by default so totals match Gearforge, with an option to include it.
 - Can follow the Soulbound game window.
 - Optional combat-log cleanup keeps the newest 10 verified logs.
 - Creates and updates `records.txt` live beside the program.
@@ -45,15 +51,13 @@ Do not download or run files posted by third parties. Official project releases 
 ### Python Version
 
 1. Install Python 3.10 or newer with Tkinter.
-2. Download the latest `DpsMeter-*.py` file.
+2. Download `DpsMeter.py`.
 3. Put it in its own folder.
-4. Open PowerShell or Command Prompt in that folder and run / should be able to double click to run also.
+4. Open PowerShell or Command Prompt in that folder and run:
 
 ```powershell
-python DpsMeter-0.8.2-py.3.py
+python DpsMeter.py
 ```
-
-The exact filename may change in later releases.
 
 ## Automatic Log Detection
 
@@ -65,9 +69,7 @@ The meter checks the following default folder first:
 
 Each dungeon creates a separate combat log. The meter watches the folder and automatically begins reading the newest verified Soulbound log.
 
-If your logs are stored elsewhere, click **Log folder** and select the folder manually. Files are only treated as combat logs when they contain a valid Soulbound combat-log header.
-
-The **Attach** button looks for the Soulbound game window and positions the overlay. Combat statistics come from the log files, not from reading game memory.
+Files are only treated as combat logs when they contain a valid Soulbound combat-log header. Combat statistics come from the log files, not from reading game memory.
 
 ## Understanding the Meter
 
@@ -79,7 +81,7 @@ The **Attach** button looks for the Soulbound game window and positions the over
 - **Healing · Last 30s** and **HPS** work the same way for healing.
 - **Healing** and **Shielding** are tracked separately.
 
-Damage uses the post-mitigation amount reported by the game, so it represents damage that reached the target after mitigation.
+By default, live damage uses the game's `applied_amount`, excluding damage beyond the target's remaining health. This matches Gearforge's damage totals. Enable **Include overkill damage** in Settings to use the full post-mitigation hit instead. Flex records always retain full hit values so personal-best hits are not capped by a nearly defeated target.
 
 ### Hit Chances
 
@@ -103,6 +105,8 @@ When the combat log provides encounter start and end events, the timer counts ac
 ### Top Abilities
 
 The ability list shows the combined amount attributed to each ability during the current run. Damage, healing, and shielding abilities can appear in this list. Unresolved `Unknown Ability` entries are hidden from the list but remain included in the appropriate overall total.
+
+Ability damage bars are split by hit type: white for Normal, red for Crit, orange for Heavy, and purple for Devastating. Hover over an ability to see each category's hit count, total damage, share of that ability's damage, and average hit. Healing and shielding amounts remain visible but are identified separately instead of being counted as damage hits.
 
 ## Flex Records
 
@@ -131,12 +135,11 @@ Do not include your personal `records.txt` when sharing the meter with somebody 
 ## Controls
 
 - **Flex / Meter:** Switch between the live meter and permanent records.
-- **Settings button:** Change the menu color and log-cleanup preference.
-- **Attach:** Find the Soulbound window immediately.
-- **Log folder:** Select a combat-log folder manually.
-- **Reset:** Clear the currently displayed run. Permanent Flex records are not deleted.
+- **Settings button:** Change the menu color, opacity, font size, AFK fading, overkill handling, and log-cleanup preference.
 - **Follow game window:** Keep the overlay positioned relative to Soulbound.
 - **Alt+Shift+D:** Toggle click-through mode so mouse clicks pass through the overlay.
+
+When **Fade when AFK / outside a dungeon** is enabled, the overlay gradually fades to 8% opacity after a dungeon run ends. The **Fade time** slider selects how long that transition takes, from 1 to 60 seconds. A new dungeon or encounter—or any detected player damage, healing, or shielding—quickly restores the selected normal opacity. Opening Settings also restores normal opacity so the controls remain easy to use.
 
 ## Settings and Local Files
 
@@ -145,6 +148,8 @@ The meter stores its appearance and window preferences here:
 ```text
 %LOCALAPPDATA%\SoulboundMeter\settings.json
 ```
+
+The saved preferences include the window position, resized width and height, font size, theme color, and overlay options.
 
 Permanent records are stored beside the program in `records.txt`.
 
@@ -171,12 +176,11 @@ The Python release is provided as a single readable script for users who want to
 
 - Start Soulbound and enter a dungeon so the game creates a log.
 - Confirm the log folder exists at `%LOCALAPPDATA%\worldwidewebb\combat_logs`.
-- Click **Log folder** and select it manually if automatic detection fails.
-- Make sure the selected file is a real Soulbound combat log with a valid header.
+- Make sure the newest file is a real Soulbound combat log with a valid header.
 
 ### Soulbound is not running
 
-The meter cannot currently find the Soulbound game window. Start the game and click **Attach**. Log tracking can still work without attachment if a valid log folder is selected; attachment is primarily used for window following.
+The meter cannot currently find the Soulbound game window. Start the game and allow automatic attachment to retry. Log tracking can still work without window attachment; attachment is primarily used for window following.
 
 ### A skill is missing or named incorrectly
 
@@ -219,29 +223,18 @@ Open a GitHub issue and include:
 
 Please do not upload an entire log if a smaller sample demonstrates the problem.
 
-## Building From Source
-
-### .NET Version
-
-Requires the .NET 8 SDK:
-
-```powershell
-dotnet build work/SoulboundMeter/SoulboundMeter.csproj -c Release
-dotnet publish work/SoulboundMeter/SoulboundMeter.csproj -c Release
-```
-
-### Python Version
+## Running From Source
 
 The Python edition has no third-party package requirements:
 
 ```powershell
-python work/DpsMeterPython/DpsMeter.py
+python DpsMeter.py
 ```
 
 Run its included self-test with:
 
 ```powershell
-python work/DpsMeterPython/DpsMeter.py --self-test
+python DpsMeter.py --self-test
 ```
 
 ## Credits
@@ -250,4 +243,3 @@ python work/DpsMeterPython/DpsMeter.py --self-test
 - Soulbound Online created by Tom Landon and the Soulbound development team.
 - Combat-log support provided by the Soulbound development team.
 - Ability names and imagery belong to Soulbound and their respective rights holders.
-
