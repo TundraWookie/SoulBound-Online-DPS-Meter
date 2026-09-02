@@ -26,7 +26,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.12-py.1"
+VERSION = "0.8.13-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -728,6 +728,8 @@ class AppSettings:
         "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
         "OverlayOpacity": 1.0, "FadeWhenAfk": False, "AfkFadeSeconds": 6.0,
         "IncludeOverkillDamage": False, "WindowWidth": None, "WindowHeight": None, "FontScale": 1.0,
+        "CompactMode": False, "NormalWindowWidth": None, "NormalWindowHeight": None,
+        "CompactWindowWidth": None, "CompactWindowHeight": None,
     }
 
     def __init__(self) -> None:
@@ -1098,6 +1100,10 @@ def mix_color(source: tuple[int, int, int], target: tuple[int, int, int], amount
 
 class MeterApp:
     FONT = "Segoe UI"
+    NORMAL_WINDOW_SIZE = (360, 650)
+    COMPACT_WINDOW_SIZE = (520, 325)
+    NORMAL_MIN_SIZE = (320, 560)
+    COMPACT_MIN_SIZE = (420, 300)
 
     def __init__(self, log_override: str | None = None, smoke_seconds: float | None = None) -> None:
         self.settings = AppSettings()
@@ -1125,9 +1131,15 @@ class MeterApp:
         self.font_scale = min(1.5, max(0.8, configured_font_scale))
         self.settings.data["FontScale"] = self.font_scale
         self.current_view = "meter"
+        self.compact_mode = bool(self.settings.get("CompactMode"))
         self.closed = False
         self.theme_roles: list[tuple[tk.Widget, str | None, str | None]] = []
         self._font_targets: list[tuple[tk.Widget, int, str]] = []
+        self.metric_cards: list[tk.Frame] = []
+        self.flex_cards: list[tk.Frame] = []
+        self.flex_card_details: list[tk.Label] = []
+        self.chance_boxes: list[tk.Frame] = []
+        self.run_high_boxes: list[tk.Frame] = []
         self.ability_rows: list[dict[str, Any]] = []
         self._ability_tooltip: tk.Toplevel | None = None
         self._ability_tooltip_row: dict[str, Any] | None = None
@@ -1142,7 +1154,7 @@ class MeterApp:
         self.root = tk.Tk()
         self.root.title("DPS Meter")
         self.root.geometry(self._initial_geometry())
-        self.root.minsize(320, 560)
+        self.root.minsize(*self._active_min_size())
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", self.current_opacity)
@@ -1162,6 +1174,7 @@ class MeterApp:
         self._build_credit_and_grip()
         self._load_icons()
         self.apply_theme(str(self.settings.get("ThemeColorHex") or "#10151D"), save=False)
+        self._apply_compact_mode(initial=True)
 
         self.watcher = CombatLogWatcher(
             configured, bool(self.settings.get("CleanupOldCombatLogs")), self._on_combat_event,
@@ -1176,21 +1189,45 @@ class MeterApp:
             self.root.after(max(100, round(smoke_seconds * 1000)), self.close)
 
     def _initial_geometry(self) -> str:
-        width, height = 360, 650
-        configured_width = self.settings.get("WindowWidth")
-        configured_height = self.settings.get("WindowHeight")
-        if isinstance(configured_width, (int, float)):
-            width = max(320, min(self.root.winfo_screenwidth(), round(configured_width)))
-        if isinstance(configured_height, (int, float)):
-            height = max(560, min(self.root.winfo_screenheight(), round(configured_height)))
+        width, height = self._configured_size(self.compact_mode)
         left = self.settings.get("WindowLeft")
         top = self.settings.get("WindowTop")
         if not self.settings.get("FollowGameWindow") and isinstance(left, (int, float)) and isinstance(top, (int, float)):
             return f"{width}x{height}+{round(left)}+{round(top)}"
         return f"{width}x{height}+40+40"
 
+    def _active_min_size(self) -> tuple[int, int]:
+        return self.COMPACT_MIN_SIZE if self.compact_mode else self.NORMAL_MIN_SIZE
+
+    @staticmethod
+    def _mode_size_keys(compact: bool) -> tuple[str, str]:
+        return ("CompactWindowWidth", "CompactWindowHeight") if compact else ("NormalWindowWidth", "NormalWindowHeight")
+
+    def _configured_size(self, compact: bool) -> tuple[int, int]:
+        width_key, height_key = self._mode_size_keys(compact)
+        default_width, default_height = self.COMPACT_WINDOW_SIZE if compact else self.NORMAL_WINDOW_SIZE
+        min_width, min_height = self.COMPACT_MIN_SIZE if compact else self.NORMAL_MIN_SIZE
+        width_raw = self.settings.get(width_key)
+        height_raw = self.settings.get(height_key)
+        if not compact:
+            width_raw = width_raw if isinstance(width_raw, (int, float)) else self.settings.get("WindowWidth")
+            height_raw = height_raw if isinstance(height_raw, (int, float)) else self.settings.get("WindowHeight")
+        width = max(min_width, round(width_raw)) if isinstance(width_raw, (int, float)) else default_width
+        height = max(min_height, round(height_raw)) if isinstance(height_raw, (int, float)) else default_height
+        return min(self.root.winfo_screenwidth(), width), min(self.root.winfo_screenheight(), height)
+
     def _scaled_font_size(self, base_size: int) -> int:
-        return max(6, round(base_size * self.font_scale))
+        adjusted = base_size
+        if self.compact_mode:
+            if base_size <= 7:
+                adjusted = base_size + 1
+            elif base_size >= 18:
+                adjusted = base_size - 5
+            elif base_size >= 15:
+                adjusted = base_size - 2
+            elif base_size >= 11:
+                adjusted = base_size - 1
+        return max(6, round(adjusted * self.font_scale))
 
     def _register_font(self, widget: tk.Widget, size: int, weight: str = "normal") -> None:
         self._font_targets.append((widget, size, weight))
@@ -1230,25 +1267,29 @@ class MeterApp:
         self.view_button = self.button(controls, "Flex", self.toggle_view, width=4)
         self.view_button.pack(side="left", padx=(0, 4))
         self.button(controls, "⚙", self.show_settings, width=2).pack(side="left", padx=(0, 4))
+        self.compact_button = self.button(controls, "Compact", self.toggle_compact_mode, width=7)
+        self.compact_button.pack(side="left", padx=(0, 4))
         self.button(controls, "—", self.minimize, width=2).pack(side="left", padx=(0, 4))
         self.button(controls, "×", self.close, width=2).pack(side="left")
-        left = self.role(tk.Frame(self.header), "bg", None)
-        left.pack(side="left", fill="x", expand=True)
-        title = self.label(left, "DPS METER", 11, "bold", anchor="w")
-        title.pack(anchor="w")
-        status1 = self.role(tk.Frame(left), "bg", None)
-        status1.pack(anchor="w", pady=(3, 0))
-        self.process_dot = self.label(status1, "●", 8, foreground="neutral")
+        self.header_credit = self.label(self.header, "Made by TundraWooK", 7, "bold", "neon")
+        self.header_left = self.role(tk.Frame(self.header), "bg", None)
+        self.header_left.pack(side="left", fill="x", expand=True)
+        self.header_title = self.label(self.header_left, "DPS METER", 11, "bold", anchor="w")
+        self.header_title.pack(anchor="w")
+        self.status1 = self.role(tk.Frame(self.header_left), "bg", None)
+        self.status1.pack(anchor="w", pady=(3, 0))
+        self.process_dot = self.label(self.status1, "●", 8, foreground="neutral")
         self.process_dot.pack(side="left")
-        self.process_label = self.label(status1, self.process_status, 8, foreground="muted", width=25, anchor="w")
+        self.process_label = self.label(self.status1, self.process_status, 8, foreground="muted", width=25, anchor="w")
         self.process_label.pack(side="left", padx=(3, 0))
-        status2 = self.role(tk.Frame(left), "bg", None)
-        status2.pack(anchor="w")
-        self.log_dot = self.label(status2, "●", 8, foreground="neutral")
+        self.status2 = self.role(tk.Frame(self.header_left), "bg", None)
+        self.status2.pack(anchor="w")
+        self.log_dot = self.label(self.status2, "●", 8, foreground="neutral")
         self.log_dot.pack(side="left")
-        self.log_label = self.label(status2, self.log_status, 8, foreground="muted", width=25, anchor="w")
+        self.log_label = self.label(self.status2, self.log_status, 8, foreground="muted", width=25, anchor="w")
         self.log_label.pack(side="left", padx=(3, 0))
-        for widget in (self.header, left, title, status1, self.process_dot, self.process_label, status2, self.log_dot, self.log_label):
+        for widget in (self.header, self.header_left, self.header_title, self.status1, self.process_dot,
+                       self.process_label, self.status2, self.log_dot, self.log_label, self.header_credit):
             widget.bind("<ButtonPress-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag_window)
 
@@ -1256,61 +1297,65 @@ class MeterApp:
         self.meter_view = self.role(tk.Frame(self.view_host), "bg", None)
         self.meter_view.pack(fill="both", expand=True, pady=(10, 21))
 
-        encounter = self.role(tk.Frame(self.meter_view), "bg", None)
-        encounter.pack(fill="x", pady=(0, 9))
-        timer = self.role(tk.Frame(encounter), "bg", None)
-        timer.pack(side="left")
-        self.label(timer, "COMBAT TIME", 7, "bold", "muted").pack(anchor="w")
-        self.duration_label = self.label(timer, "00:00", 19, "normal", "text")
+        self.encounter = self.role(tk.Frame(self.meter_view), "bg", None)
+        self.encounter.pack(fill="x", pady=(0, 9))
+        self.timer = self.role(tk.Frame(self.encounter), "bg", None)
+        self.timer.pack(side="left")
+        self.label(self.timer, "COMBAT TIME", 7, "bold", "muted").pack(anchor="w")
+        self.duration_label = self.label(self.timer, "00:00", 19, "normal", "text")
         self.duration_label.pack(anchor="w")
-        self.state_label = self.label(encounter, "IDLE", 8, "bold", "accent", padx=8, pady=5)
+        self.state_label = self.label(self.encounter, "IDLE", 8, "bold", "accent", padx=8, pady=5)
         self.state_label.pack(side="right")
-        chances = self.role(tk.Frame(encounter), "bg", None)
-        chances.pack(side="right", padx=(0, 7))
+        self.chances = self.role(tk.Frame(self.encounter), "bg", None)
+        self.chances.pack(side="right", padx=(0, 7))
         self.chance_labels: dict[str, tk.Label] = {}
         for column, (key, title, role) in enumerate((("crit", "CRIT CHANCE", "red"), ("heavy", "HEAVY CHANCE", "orange"), ("dev", "DEV CHANCE", "purple"))):
-            box = self.role(tk.Frame(chances), "bg", None)
+            box = self.role(tk.Frame(self.chances), "bg", None)
             box.grid(row=0, column=column, padx=4)
             self.label(box, title, 6, foreground="muted").pack()
             value = self.label(box, "0%", 11, "bold", role)
             value.pack()
             self.chance_labels[key] = value
+            self.chance_boxes.append(box)
 
-        metrics = self.role(tk.Frame(self.meter_view), "bg", None)
-        metrics.pack(fill="x")
-        metrics.grid_columnconfigure((0, 1), weight=1, uniform="metrics")
-        self.dps_value, self.dps_sub = self._metric_card(metrics, 0, 0, "DAMAGE · LAST 30S", "red", True)
-        self.damage_value, _ = self._metric_card(metrics, 0, 1, "DAMAGE", "text", False)
-        self.hps_value, self.hps_sub = self._metric_card(metrics, 1, 0, "HEALING · LAST 30S", "green", True)
-        combined = self.panel(metrics)
-        combined.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
-        healing_box = self.role(tk.Frame(combined), "panel", None)
-        healing_box.pack(side="left", fill="both", expand=True, padx=8, pady=7)
-        self.label(healing_box, "HEALING", 7, foreground="muted").pack(anchor="w")
-        self.healing_value = self.label(healing_box, "0", 15, "bold", "text")
+        self.metrics = self.role(tk.Frame(self.meter_view), "bg", None)
+        self.metrics.pack(fill="x")
+        self.metrics.grid_columnconfigure((0, 1), weight=1, uniform="metrics")
+        self.dps_value, self.dps_sub, self.dps_title_label = self._metric_card(self.metrics, 0, 0, "DAMAGE · LAST 30S", "red", True)
+        self.damage_value, _, self.damage_title_label = self._metric_card(self.metrics, 0, 1, "DAMAGE", "text", False)
+        self.hps_value, self.hps_sub, self.hps_title_label = self._metric_card(self.metrics, 1, 0, "HEALING · LAST 30S", "green", True)
+        self.combined = self.panel(self.metrics)
+        self.combined.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
+        self.healing_box = self.role(tk.Frame(self.combined), "panel", None)
+        self.healing_box.pack(side="left", fill="both", expand=True, padx=8, pady=7)
+        self.healing_title_label = self.label(self.healing_box, "HEALING", 7, foreground="muted")
+        self.healing_title_label.pack(anchor="w")
+        self.healing_value = self.label(self.healing_box, "0", 15, "bold", "text")
         self.healing_value.pack(anchor="w")
-        shield_box = self.role(tk.Frame(combined), "panel", None)
-        shield_box.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=7)
-        self.label(shield_box, "SHIELDING", 7, foreground="blue").pack(anchor="w")
-        self.shielding_value = self.label(shield_box, "0", 15, "bold", "blue")
+        self.shield_box = self.role(tk.Frame(self.combined), "panel", None)
+        self.shield_box.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=7)
+        self.shielding_title_label = self.label(self.shield_box, "SHIELDING", 7, foreground="blue")
+        self.shielding_title_label.pack(anchor="w")
+        self.shielding_value = self.label(self.shield_box, "0", 15, "bold", "blue")
         self.shielding_value.pack(anchor="w")
 
-        run_high = self.panel(self.meter_view)
-        run_high.pack(fill="x", pady=(10, 0))
-        self.label(run_high, "RUN HIGH", 6, foreground="muted").pack(side="left", padx=7)
+        self.run_high = self.panel(self.meter_view)
+        self.run_high.pack(fill="x", pady=(10, 0))
+        self.label(self.run_high, "RUN HIGH", 6, foreground="muted").pack(side="left", padx=7)
         self.run_high_labels: dict[str, tk.Label] = {}
         for key, title, role in (("crit", "CRIT", "red"), ("heavy", "HEAVY", "orange"), ("dev", "DEVASTATING", "purple")):
-            box = self.role(tk.Frame(run_high), "panel", None)
+            box = self.role(tk.Frame(self.run_high), "panel", None)
             box.pack(side="left", fill="x", expand=True, pady=5)
             self.label(box, title, 6, foreground=role).pack(anchor="w")
             value = self.label(box, "0", 8, "bold", "purple" if key == "dev" else "text")
             value.pack(anchor="w")
             self.run_high_labels[key] = value
+            self.run_high_boxes.append(box)
 
-        abilities_header = self.role(tk.Frame(self.meter_view), "bg", None)
-        abilities_header.pack(fill="x", pady=(8, 2))
-        self.label(abilities_header, "TOP ABILITIES", 7, "bold", "muted").pack(side="left")
-        self.label(abilities_header, "AMOUNT", 7, "bold", "muted").pack(side="right")
+        self.abilities_header = self.role(tk.Frame(self.meter_view), "bg", None)
+        self.abilities_header.pack(fill="x", pady=(8, 2))
+        self.label(self.abilities_header, "TOP ABILITIES", 7, "bold", "muted").pack(side="left")
+        self.label(self.abilities_header, "AMOUNT", 7, "bold", "muted").pack(side="right")
         self.abilities_frame = self.role(tk.Frame(self.meter_view), "bg", None)
         self.abilities_frame.pack(fill="both", expand=True)
         for _ in range(6):
@@ -1336,34 +1381,38 @@ class MeterApp:
             middle.pack(side="left", fill="x", expand=True)
             row_info = {
                 "frame": row, "icon": icon, "name": name, "damage_type": damage_type,
-                "bar": bar, "amount": amount, "percent": 0.0, "segments": {}, "ability": None,
+                "bar": bar, "amount": amount, "icon_holder": icon_holder,
+                "percent": 0.0, "segments": {}, "ability": None,
             }
             self.ability_rows.append(row_info)
             for hover_widget in (row, icon_holder, icon, middle, name_line, damage_type, name, bar, amount):
                 hover_widget.bind("<Enter>", lambda event, info=row_info: self._show_ability_tooltip(info, event))
                 hover_widget.bind("<Leave>", self._schedule_hide_ability_tooltip)
 
-        footer = self.role(tk.Frame(self.meter_view), "bg", None)
-        footer.pack(fill="x", side="bottom", pady=(5, 0))
-        self.log_path_label = self.label(footer, "Log folder: auto-detect", 6, foreground="dim", anchor="w")
+        self.footer = self.role(tk.Frame(self.meter_view), "bg", None)
+        self.footer.pack(fill="x", side="bottom", pady=(5, 0))
+        self.log_path_label = self.label(self.footer, "Log folder: auto-detect", 6, foreground="dim", anchor="w")
         self.log_path_label.pack(fill="x", pady=(0, 5))
         self.follow_var = tk.BooleanVar(value=bool(self.settings.get("FollowGameWindow")))
-        self.follow_check = tk.Checkbutton(footer, text="Follow game window", variable=self.follow_var, command=self.follow_changed,
+        self.follow_check = tk.Checkbutton(self.footer, text="Follow game window", variable=self.follow_var, command=self.follow_changed,
                                            font=(self.FONT, self._scaled_font_size(7)), borderwidth=0, highlightthickness=0, anchor="w")
         self._register_font(self.follow_check, 7)
         self.role(self.follow_check, "bg", "muted")
         self.follow_check.pack(anchor="w", pady=(4, 0))
-        self.label(footer, "Alt+Shift+D toggles click-through lock", 6, foreground="dim").pack(anchor="w")
+        self.hotkey_hint = self.label(self.footer, "Alt+Shift+D toggles click-through lock", 6, foreground="dim")
+        self.hotkey_hint.pack(anchor="w")
         # Repack the expandable list after the bottom-anchored footer so the
         # footer always reserves its space and ability rows fill the gap.
         self.abilities_frame.pack_forget()
         self.abilities_frame.pack(fill="both", expand=True)
 
     def _metric_card(self, parent: tk.Misc, row: int, column: int, title: str, value_role: str,
-                     has_sub: bool) -> tuple[tk.Label, tk.Label | None]:
+                     has_sub: bool) -> tuple[tk.Label, tk.Label | None, tk.Label]:
         card = self.panel(parent)
+        self.metric_cards.append(card)
         card.grid(row=row, column=column, sticky="nsew", padx=(0, 4) if column == 0 else (4, 0), pady=(0, 4) if row == 0 else (4, 0))
-        self.label(card, title, 7, foreground="muted").pack(anchor="w", padx=8, pady=(6, 0))
+        title_label = self.label(card, title, 7, foreground="muted")
+        title_label.pack(anchor="w", padx=8, pady=(6, 0))
         value = self.label(card, "0", 15, "bold", value_role)
         value.pack(anchor="w", padx=8)
         sub = None
@@ -1372,22 +1421,25 @@ class MeterApp:
             sub.pack(anchor="w", padx=8, pady=(0, 5))
         else:
             self.label(card, "", 6).pack(pady=(0, 5))
-        return value, sub
+        return value, sub, title_label
 
     def _build_flex_view(self) -> None:
         self.flex_view = self.role(tk.Frame(self.view_host), "bg", None)
-        top = self.role(tk.Frame(self.flex_view), "bg", None)
-        top.pack(fill="x", pady=(12, 8))
-        left = self.role(tk.Frame(top), "bg", None)
-        left.pack(side="left")
-        self.label(left, "FLEX RECORDS", 10, "bold", "text").pack(anchor="w")
-        self.label(left, "Your permanent personal bests", 7, foreground="muted").pack(anchor="w")
-        self.label(top, "SAVED LIVE", 7, "bold", "accent").pack(side="right")
+        self.flex_top = self.role(tk.Frame(self.flex_view), "bg", None)
+        self.flex_top.pack(fill="x", pady=(12, 8))
+        self.flex_top_left = self.role(tk.Frame(self.flex_top), "bg", None)
+        self.flex_top_left.pack(side="left")
+        self.flex_title = self.label(self.flex_top_left, "FLEX RECORDS", 10, "bold", "text")
+        self.flex_title.pack(anchor="w")
+        self.flex_subtitle = self.label(self.flex_top_left, "Your permanent personal bests", 7, foreground="muted")
+        self.flex_subtitle.pack(anchor="w")
+        self.flex_saved_label = self.label(self.flex_top, "SAVED LIVE", 7, "bold", "accent")
+        self.flex_saved_label.pack(side="right")
 
-        cards = self.role(tk.Frame(self.flex_view), "bg", None)
-        cards.pack(fill="both", expand=True)
-        cards.grid_columnconfigure((0, 1), weight=1, uniform="flex")
-        cards.grid_rowconfigure((0, 1, 2), weight=1, uniform="flexrow")
+        self.flex_grid = self.role(tk.Frame(self.flex_view), "bg", None)
+        self.flex_grid.pack(fill="both", expand=True)
+        self.flex_grid.grid_columnconfigure((0, 1), weight=1, uniform="flex")
+        self.flex_grid.grid_rowconfigure((0, 1, 2), weight=1, uniform="flexrow")
         self.flex_card_values: dict[str, tuple[tk.Label, tk.Label]] = {}
         card_specs = (
             ("big_hit", "BIGGEST HIT", "red"), ("big_heal", "BIGGEST HEAL", "green"),
@@ -1396,34 +1448,36 @@ class MeterApp:
         )
         for index, (key, title, value_role) in enumerate(card_specs):
             row, column = divmod(index, 2)
-            card = self.panel(cards)
+            card = self.panel(self.flex_grid)
+            self.flex_cards.append(card)
             card.grid(row=row, column=column, sticky="nsew", padx=(0, 4) if column == 0 else (4, 0), pady=(0, 4) if row == 0 else ((4, 4) if row == 1 else (4, 0)))
             self.label(card, title, 7, foreground="muted").pack(anchor="w", padx=8, pady=(7, 0))
             value = self.label(card, "0", 14, "bold", value_role)
             value.pack(anchor="w", padx=8)
             detail = self.label(card, "No record yet", 6, foreground="muted", anchor="w")
             detail.pack(fill="x", padx=8, pady=(0, 6))
+            self.flex_card_details.append(detail)
             self.flex_card_values[key] = (value, detail)
 
-        hit_panel = self.panel(self.flex_view)
-        hit_panel.pack(fill="x", pady=(8, 7))
-        self.label(hit_panel, "PERSONAL BEST BY HIT TYPE", 6, foreground="muted").pack(anchor="w", padx=8, pady=(6, 3))
-        hit_row = self.role(tk.Frame(hit_panel), "panel", None)
-        hit_row.pack(fill="x", padx=8, pady=(0, 6))
+        self.hit_panel = self.panel(self.flex_view)
+        self.hit_panel.pack(fill="x", pady=(8, 7))
+        self.label(self.hit_panel, "PERSONAL BEST BY HIT TYPE", 6, foreground="muted").pack(anchor="w", padx=8, pady=(6, 3))
+        self.hit_row = self.role(tk.Frame(self.hit_panel), "panel", None)
+        self.hit_row.pack(fill="x", padx=8, pady=(0, 6))
         self.flex_hit_labels: dict[str, tk.Label] = {}
         for key, title, role in (("normal", "NORMAL", "muted"), ("crit", "CRIT", "red"), ("heavy", "HEAVY", "orange"), ("dev", "DEVASTATING", "purple")):
-            box = self.role(tk.Frame(hit_row), "panel", None)
+            box = self.role(tk.Frame(self.hit_row), "panel", None)
             box.pack(side="left", fill="x", expand=True)
             self.label(box, title, 6, foreground=role).pack(anchor="w")
             value = self.label(box, "0", 8, "bold", "purple" if key == "dev" else "text")
             value.pack(anchor="w")
             self.flex_hit_labels[key] = value
 
-        lifetime = self.panel(self.flex_view)
-        lifetime.pack(fill="x")
+        self.lifetime = self.panel(self.flex_view)
+        self.lifetime.pack(fill="x")
         self.flex_lifetime_labels: dict[str, tk.Label] = {}
         for key, title in (("damage", "LIFETIME DAMAGE"), ("healing", "LIFETIME HEALING"), ("runs", "RUNS RECORDED")):
-            box = self.role(tk.Frame(lifetime), "panel", None)
+            box = self.role(tk.Frame(self.lifetime), "panel", None)
             box.pack(side="left", fill="x", expand=True, padx=8, pady=7)
             self.label(box, title, 6, foreground="muted").pack(anchor="w")
             value = self.label(box, "0", 9, "bold", "text")
@@ -1793,9 +1847,160 @@ class MeterApp:
             self.view_button.configure(text="Meter")
         else:
             self.flex_view.pack_forget()
-            self.meter_view.pack(fill="both", expand=True, pady=(10, 21))
+            self.meter_view.pack(fill="both", expand=True, pady=(4, 6) if self.compact_mode else (10, 21))
             self.current_view = "meter"
             self.view_button.configure(text="Flex")
+        self.refresh()
+
+    def _sync_compact_button_text(self) -> None:
+        self.compact_button.configure(text="Normal" if self.compact_mode else "Compact")
+
+    @staticmethod
+    def _set_packed(widget: tk.Widget, visible: bool, **pack_options: Any) -> None:
+        if visible:
+            if widget.winfo_manager():
+                widget.pack_configure(**pack_options)
+            else:
+                widget.pack(**pack_options)
+        elif widget.winfo_manager():
+            widget.pack_forget()
+
+    def _apply_compact_mode(self, initial: bool = False) -> None:
+        self._apply_font_scale()
+        outer_pad = 3 if self.compact_mode else 7
+        self.outer.pack_configure(padx=outer_pad, pady=outer_pad)
+        self.content.pack_configure(padx=6 if self.compact_mode else 14, pady=5 if self.compact_mode else 11)
+        if self.meter_view.winfo_manager():
+            self.meter_view.pack_configure(pady=(4, 6) if self.compact_mode else (10, 21))
+
+        if self.compact_mode:
+            self._set_packed(self.status1, False)
+            self._set_packed(self.status2, False)
+            self._set_packed(self.footer, False)
+            self._set_packed(self.header_credit, True, side="right", padx=(0, 8))
+            self.credit.place_forget()
+        else:
+            self._set_packed(self.status1, True, anchor="w", pady=(3, 0))
+            self._set_packed(self.status2, True, anchor="w")
+            self._set_packed(self.footer, True, fill="x", side="bottom", pady=(5, 0))
+            self._set_packed(self.header_credit, False)
+            self.credit.place(relx=1.0, rely=1.0, x=-18, y=-8, anchor="se")
+
+        self.abilities_frame.pack_forget()
+        self.abilities_frame.pack(fill="both", expand=True)
+        self.encounter.pack_configure(pady=(0, 3) if self.compact_mode else (0, 9))
+        self.state_label.configure(padx=5 if self.compact_mode else 8, pady=2 if self.compact_mode else 5)
+        self.chances.pack_configure(padx=(0, 3) if self.compact_mode else (0, 7))
+        for box in self.chance_boxes:
+            box.grid_configure(padx=2 if self.compact_mode else 4)
+
+        self.dps_title_label.configure(text="DAMAGE 30S" if self.compact_mode else "DAMAGE · LAST 30S")
+        self.damage_title_label.configure(text="TOTAL" if self.compact_mode else "DAMAGE")
+        self.hps_title_label.configure(text="HEAL 30S" if self.compact_mode else "HEALING · LAST 30S")
+        self.healing_title_label.configure(text="H" if self.compact_mode else "HEALING")
+        self.shielding_title_label.configure(text="S" if self.compact_mode else "SHIELDING")
+
+        if self.compact_mode:
+            for column in range(4):
+                self.metrics.grid_columnconfigure(column, weight=1, uniform="metrics")
+            self.metric_cards[0].grid_configure(row=0, column=0, padx=(0, 2), pady=0)
+            self.metric_cards[1].grid_configure(row=0, column=1, padx=2, pady=0)
+            self.metric_cards[2].grid_configure(row=0, column=2, padx=2, pady=0)
+            self.combined.grid_configure(row=0, column=3, padx=(2, 0), pady=0)
+        else:
+            for column in range(4):
+                self.metrics.grid_columnconfigure(column, weight=1 if column < 2 else 0,
+                                                   uniform="metrics" if column < 2 else "")
+            self.metric_cards[0].grid_configure(row=0, column=0, padx=(0, 4), pady=(0, 4))
+            self.metric_cards[1].grid_configure(row=0, column=1, padx=(4, 0), pady=(0, 4))
+            self.metric_cards[2].grid_configure(row=1, column=0, padx=(0, 4), pady=(4, 0))
+            self.combined.grid_configure(row=1, column=1, padx=(4, 0), pady=(4, 0))
+
+        for card in self.metric_cards:
+            labels = [child for child in card.winfo_children() if isinstance(child, tk.Label)]
+            if len(labels) >= 2:
+                labels[0].pack_configure(padx=5 if self.compact_mode else 8,
+                                         pady=(3, 0) if self.compact_mode else (6, 0))
+                labels[1].pack_configure(padx=5 if self.compact_mode else 8)
+            if len(labels) >= 3:
+                labels[2].pack_configure(padx=5 if self.compact_mode else 8,
+                                         pady=(0, 3) if self.compact_mode else (0, 5))
+
+        self.healing_box.pack_configure(padx=5 if self.compact_mode else 8, pady=4 if self.compact_mode else 7)
+        self.shield_box.pack_configure(padx=(0, 5) if self.compact_mode else (0, 8),
+                                       pady=4 if self.compact_mode else 7)
+        self.run_high.pack_configure(pady=(4, 0) if self.compact_mode else (10, 0))
+        for box in self.run_high_boxes:
+            box.pack_configure(pady=3 if self.compact_mode else 5)
+        self.abilities_header.pack_configure(pady=(4, 1) if self.compact_mode else (8, 2))
+
+        if self.compact_mode:
+            self.flex_top.pack_configure(pady=(3, 4))
+            self._set_packed(self.flex_subtitle, False)
+            self._set_packed(self.flex_saved_label, False)
+        else:
+            self.flex_top.pack_configure(pady=(12, 8))
+            self._set_packed(self.flex_subtitle, True, anchor="w")
+            self._set_packed(self.flex_saved_label, True, side="right")
+
+        compact_columns = 3 if self.compact_mode else 2
+        compact_rows = 2 if self.compact_mode else 3
+        for column in range(3):
+            self.flex_grid.grid_columnconfigure(column, weight=1 if column < compact_columns else 0, uniform="flex")
+        for row_index in range(3):
+            self.flex_grid.grid_rowconfigure(row_index, weight=1 if row_index < compact_rows else 0, uniform="flexrow")
+        for index, card in enumerate(self.flex_cards):
+            row_index, column = divmod(index, compact_columns) if self.compact_mode else divmod(index, 2)
+            if self.compact_mode:
+                pady = (0, 2) if row_index == 0 else (2, 0)
+                padx = (0, 2) if column == 0 else (2, 2) if column == 1 else (2, 0)
+            else:
+                pady = (0, 4) if row_index == 0 else ((4, 4) if row_index == 1 else (4, 0))
+                padx = (0, 4) if column == 0 else (4, 0)
+            card.grid_configure(row=row_index, column=column, padx=padx, pady=pady)
+            labels = [child for child in card.winfo_children() if isinstance(child, tk.Label)]
+            if len(labels) >= 2:
+                labels[0].pack_configure(padx=5 if self.compact_mode else 8,
+                                         pady=(3, 0) if self.compact_mode else (7, 0))
+                labels[1].pack_configure(padx=5 if self.compact_mode else 8)
+        for detail in self.flex_card_details:
+            self._set_packed(detail, not self.compact_mode, fill="x", padx=8, pady=(0, 6))
+
+        self.hit_panel.pack_configure(pady=(4, 4) if self.compact_mode else (8, 7))
+        self.hit_row.pack_configure(padx=5 if self.compact_mode else 8,
+                                    pady=(0, 4) if self.compact_mode else (0, 6))
+        for child in self.lifetime.winfo_children():
+            if isinstance(child, tk.Frame):
+                child.pack_configure(padx=5 if self.compact_mode else 8, pady=4 if self.compact_mode else 7)
+        self._set_packed(self.records_path_label, not self.compact_mode, fill="x", pady=(7, 18))
+
+        icon_size = 18 if self.compact_mode else 25
+        for row in self.ability_rows:
+            row["frame"].pack_configure(pady=1 if self.compact_mode else 2)
+            row["icon_holder"].configure(width=icon_size, height=icon_size)
+            row["bar"].configure(height=2 if self.compact_mode else 3)
+            row["icon_holder"].pack_configure(padx=(0, 4) if self.compact_mode else (0, 7))
+            row["bar"].pack_configure(padx=(0, 6) if self.compact_mode else (0, 10),
+                                      pady=(2, 0) if self.compact_mode else (3, 0))
+
+        self.root.minsize(*self._active_min_size())
+        self.root.update_idletasks()
+        min_width, min_height = self._active_min_size()
+        current_width, current_height = self.root.winfo_width(), self.root.winfo_height()
+        if initial or current_width < min_width or current_height < min_height:
+            self.root.geometry(f"{max(min_width, current_width)}x{max(min_height, current_height)}+"
+                               f"{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self._sync_compact_button_text()
+        self._redraw_bars()
+
+    def toggle_compact_mode(self) -> None:
+        self._store_window_size()
+        self.compact_mode = not self.compact_mode
+        self.settings.data["CompactMode"] = self.compact_mode
+        width, height = self._configured_size(self.compact_mode)
+        self.root.geometry(f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self.settings.save()
+        self._apply_compact_mode()
         self.refresh()
 
     @staticmethod
@@ -1834,7 +2039,7 @@ class MeterApp:
                 row["ability"] = None
                 continue
             if not row["frame"].winfo_manager():
-                row["frame"].pack(fill="x", pady=2)
+                row["frame"].pack(fill="x", pady=1 if self.compact_mode else 2)
             ability = abilities[index]
             row["name"].configure(text=ability["name"])
             row["damage_type"].configure(text=ability["damage_type"])
@@ -2052,8 +2257,15 @@ class MeterApp:
 
     def _store_window_size(self) -> None:
         if self.root.state() != "iconic":
-            self.settings.data["WindowWidth"] = max(320, self.root.winfo_width())
-            self.settings.data["WindowHeight"] = max(560, self.root.winfo_height())
+            min_width, min_height = self._active_min_size()
+            width = max(min_width, self.root.winfo_width())
+            height = max(min_height, self.root.winfo_height())
+            width_key, height_key = self._mode_size_keys(self.compact_mode)
+            self.settings.data[width_key] = width
+            self.settings.data[height_key] = height
+            if not self.compact_mode:
+                self.settings.data["WindowWidth"] = width
+                self.settings.data["WindowHeight"] = height
 
     def finish_resize(self, _event: tk.Event | None = None) -> None:
         self._resize_start = None
@@ -2111,6 +2323,7 @@ class MeterApp:
             return
         self.closed = True
         self.settings.data["FollowGameWindow"] = bool(self.follow_var.get())
+        self.settings.data["CompactMode"] = self.compact_mode
         self.settings.data["WindowLeft"] = self.root.winfo_x()
         self.settings.data["WindowTop"] = self.root.winfo_y()
         self._store_window_size()

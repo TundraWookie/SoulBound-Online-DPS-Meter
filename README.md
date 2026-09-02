@@ -22,6 +22,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Supports custom menu colors.
 - Supports adjustable overlay opacity and optional AFK fading between dungeon runs.
 - Supports adjustable font size and remembers the resized window dimensions.
+- Includes a compact horizontal layout with its own remembered window size.
 - Excludes overkill from live damage by default so totals match Gearforge, with an option to include it.
 - Can follow the Soulbound game window.
 - Optional combat-log cleanup keeps the newest 10 verified logs.
@@ -135,6 +136,7 @@ Do not include your personal `records.txt` when sharing the meter with somebody 
 ## Controls
 
 - **Flex / Meter:** Switch between the live meter and permanent records.
+- **Compact / Normal:** Switch between the full vertical meter and compact horizontal layout.
 - **Settings button:** Change the menu color, opacity, font size, AFK fading, overkill handling, and log-cleanup preference.
 - **Follow game window:** Keep the overlay positioned relative to Soulbound.
 - **Alt+Shift+D:** Toggle click-through mode so mouse clicks pass through the overlay.
