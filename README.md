@@ -8,6 +8,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 
 - Automatically finds Soulbound and the default combat-log folder.
 - Automatically switches to the newest verified dungeon log.
+- Shows the current map beneath an animated DPS Meter emblem.
 - Handles in-place combat-log rewrites without resetting or replaying the visible totals.
 - Tracks damage dealt, healing done, and shielding gained.
 - Shows damage and healing during the last 30 seconds, plus DPS and HPS.
@@ -23,6 +24,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Supports adjustable overlay opacity and optional AFK fading between dungeon runs.
 - Supports adjustable font size and remembers the resized window dimensions.
 - Includes a compact horizontal layout with its own remembered window size.
+- Uses embedded branding and application icons in both downloads; no extra asset files are required.
 - Excludes overkill from live damage by default so totals match Gearforge, with an option to include it.
 - Can follow the Soulbound game window.
 - Optional combat-log cleanup keeps the newest 10 verified logs.
