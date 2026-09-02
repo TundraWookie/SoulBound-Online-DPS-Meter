@@ -1,4 +1,9 @@
+# Python cache
 __pycache__/
 *.py[cod]
+
+# Local DPS Meter data and logs
 records.txt
 settings.json
+*.log
+*.tmp
