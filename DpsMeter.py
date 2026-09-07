@@ -26,7 +26,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.14-py.1"
+VERSION = "0.8.15-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -96,6 +96,15 @@ def map_name_from_log_path(path: str) -> str:
     return " ".join(words) if words else "Unknown map"
 
 
+def split_dungeon_difficulty(display_name: str) -> tuple[str, str]:
+    """Split names such as 'Eastern Reach - Abyssal' without breaking 'Abyssal Raid'."""
+    cleaned = display_name.strip() or "Unknown Dungeon"
+    if " - " not in cleaned:
+        return cleaned, "Normal"
+    dungeon, difficulty = cleaned.rsplit(" - ", 1)
+    return (dungeon.strip() or cleaned), (difficulty.strip() or "Normal")
+
+
 def is_unknown_ability(name: str | None) -> bool:
     return not name or name.strip().lower() in {"unknown", "unknown ability"}
 
@@ -156,6 +165,9 @@ class CombatEvent:
     heavy_hit: bool
     periodic: bool
     sequence: float | None
+    dungeon_name: str | None
+    run_end_reason: str | None
+    run_completed: bool
 
 
 def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | None:
@@ -227,6 +239,9 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         first_bool(payload, "is_heavy_hit", "heavy_hit"),
         first_bool(payload, "periodic", "is_periodic", "dot", "hot"),
         sequence,
+        str(first_value(payload, "dungeon_display_name", "dungeon_name") or "").strip() or None,
+        str(first_value(payload, "reason", "end_reason") or "").strip().lower() or None,
+        first_bool(payload, "completed", "is_completed"),
     )
 
 
@@ -504,6 +519,7 @@ def default_record_data() -> dict[str, Any]:
         "LifetimeDamage": 0.0, "LifetimeHealing": 0.0, "RunsTracked": 0,
         "LastUpdatedUtc": None, "CountedLogs": [], "LogSequenceCheckpoints": {},
         "LogDamageTotals": {}, "LogHealingTotals": {}, "LogHitDamageTotals": {},
+        "DungeonRuns": {}, "DungeonRunLedger": {},
         "LifetimeHitDamage": {"Normal": 0.0, "Critical": 0.0, "Heavy": 0.0, "Devastating": 0.0},
         "RecentEventIds": [],
     }
@@ -514,7 +530,8 @@ def merge_defaults(loaded: Any, defaults: dict[str, Any]) -> dict[str, Any]:
         return defaults
     result = dict(defaults)
     result.update(loaded)
-    for key in ("LogSequenceCheckpoints", "LogDamageTotals", "LogHealingTotals", "LogHitDamageTotals"):
+    for key in ("LogSequenceCheckpoints", "LogDamageTotals", "LogHealingTotals", "LogHitDamageTotals",
+                "DungeonRuns", "DungeonRunLedger"):
         if not isinstance(result.get(key), dict):
             result[key] = {}
     for key in ("CountedLogs", "RecentEventIds"):
@@ -539,6 +556,7 @@ class FlexRecordStore:
         self.healing_window: deque[tuple[float, float]] = deque()
         self.sequences_this_read: set[float] = set()
         self.ids_this_read: set[str] = set()
+        self.active_run_id: str | None = None
         self.dirty = False
         self.last_save = 0.0
         if records_path is None:
@@ -581,6 +599,112 @@ class FlexRecordStore:
         self.healing_window.clear()
         self.sequences_this_read.clear()
         self.ids_this_read.clear()
+        self.active_run_id = None
+
+    @staticmethod
+    def _run_id(started_at: float, display_name: str) -> str:
+        return f"{int(started_at * 1000)}|{display_name.strip().lower()}"
+
+    def _run_bucket(self, dungeon: str, difficulty: str) -> dict[str, Any]:
+        dungeons = self.data["DungeonRuns"]
+        dungeon_key = dict_key_casefold(dungeons, dungeon) or dungeon
+        if dungeon_key not in dungeons or not isinstance(dungeons[dungeon_key], dict):
+            dungeons[dungeon_key] = {}
+        difficulties = dungeons[dungeon_key]
+        difficulty_key = dict_key_casefold(difficulties, difficulty) or difficulty
+        if difficulty_key not in difficulties or not isinstance(difficulties[difficulty_key], dict):
+            difficulties[difficulty_key] = {"Attempts": 0, "Extracted": 0, "Abandoned": 0, "LastRunAt": None}
+        bucket = difficulties[difficulty_key]
+        for key in ("Attempts", "Extracted", "Abandoned"):
+            bucket[key] = int(bucket.get(key, 0))
+        return bucket
+
+    def _upsert_run(self, run_id: str, display_name: str, started_at: float, status: str,
+                    path: str | None = None) -> None:
+        ledger = self.data["DungeonRunLedger"]
+        actual_id = dict_key_casefold(ledger, run_id) or run_id
+        dungeon, difficulty = split_dungeon_difficulty(display_name)
+        existing = ledger.get(actual_id) if isinstance(ledger.get(actual_id), dict) else None
+        bucket = self._run_bucket(dungeon, difficulty)
+        if existing is None:
+            bucket["Attempts"] += 1
+            old_status = ""
+        else:
+            old_status = str(existing.get("Status", "")).lower()
+        if old_status != status:
+            if old_status in {"extracted", "abandoned"}:
+                bucket[old_status.title()] = max(0, int(bucket.get(old_status.title(), 0)) - 1)
+            if status in {"extracted", "abandoned"}:
+                bucket[status.title()] = int(bucket.get(status.title(), 0)) + 1
+        started_text = str(existing.get("StartedAt")) if existing and existing.get("StartedAt") else timestamp_text(started_at)
+        bucket["LastRunAt"] = max(str(bucket.get("LastRunAt") or ""), started_text)
+        ledger[actual_id] = {
+            "Dungeon": dungeon, "Difficulty": difficulty, "StartedAt": started_text,
+            "Status": status, "SourceFile": Path(path).name if path else (existing or {}).get("SourceFile"),
+        }
+        self.data["LastUpdatedUtc"] = timestamp_text(utc_now())
+        self.dirty = True
+
+    def _track_run_event(self, event: CombatEvent) -> None:
+        if event.type == "combat_start":
+            display = event.dungeon_name or map_name_from_log_path(self._log_key())
+            self.active_run_id = self._run_id(event.timestamp, display)
+            self._upsert_run(self.active_run_id, display, event.timestamp, "started", self._log_key())
+        elif event.type == "combat_end" and self.active_run_id:
+            ledger = self.data["DungeonRunLedger"]
+            existing = ledger.get(self.active_run_id, {})
+            display = " - ".join(filter(None, (existing.get("Dungeon"),
+                                                  None if existing.get("Difficulty") == "Normal" else existing.get("Difficulty"))))
+            status = "extracted" if event.run_completed or event.run_end_reason == "extracted" else (
+                "abandoned" if event.run_end_reason == "abandoned" else "ended")
+            self._upsert_run(self.active_run_id, display or "Unknown Dungeon", event.timestamp, status, self._log_key())
+        self.save_if_due()
+
+    def import_log_history(self, folder: Path | str | None) -> int:
+        """Import every existing log once; the persisted run ID makes rescans idempotent."""
+        if folder is None:
+            return 0
+        root_folder = Path(folder)
+        imported_before = len(self.data["DungeonRunLedger"])
+        try:
+            paths = sorted((p for p in root_folder.iterdir()
+                            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS), key=lambda p: p.name.casefold())
+        except OSError:
+            return 0
+        for path in paths:
+            start: CombatEvent | None = None
+            end: CombatEvent | None = None
+            try:
+                with path.open("rb") as handle:
+                    head = handle.read(256 * 1024)
+                    size = handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, size - 512 * 1024))
+                    tail = handle.read()
+                raw_lines = head.splitlines() + tail.splitlines()
+                for raw in raw_lines:
+                    try:
+                        event = parse_combat_event(raw.decode("utf-8-sig"))
+                    except UnicodeError:
+                        continue
+                    if event is None:
+                        continue
+                    if event.type == "combat_start" and start is None:
+                        start = event
+                    elif event.type == "combat_end":
+                        end = event
+            except (OSError, UnicodeError):
+                continue
+            if start is None:
+                continue
+            display = start.dungeon_name or map_name_from_log_path(str(path))
+            run_id = self._run_id(start.timestamp, display)
+            status = "started"
+            if end is not None:
+                status = "extracted" if end.run_completed or end.run_end_reason == "extracted" else (
+                    "abandoned" if end.run_end_reason == "abandoned" else "ended")
+            self._upsert_run(run_id, display, start.timestamp, status, str(path))
+        self.save(force=True)
+        return max(0, len(self.data["DungeonRunLedger"]) - imported_before)
 
     def _log_key(self) -> str:
         return self.active_log or "legacy-or-manual-source"
@@ -641,6 +765,9 @@ class FlexRecordStore:
         return mapping[actual_key]
 
     def apply(self, event: CombatEvent) -> None:
+        if event.type in {"combat_start", "combat_end"}:
+            self._track_run_event(event)
+            return
         if not is_own_event(event) or event.type not in {"damage", "heal"} or event.amount <= 0:
             return
         if event.sequence is not None:
@@ -1154,6 +1281,8 @@ class MeterApp:
         self._ability_tooltip: tk.Toplevel | None = None
         self._ability_tooltip_row: dict[str, Any] | None = None
         self._ability_tooltip_hide_job: str | None = None
+        self._dungeon_tooltip: tk.Toplevel | None = None
+        self._dungeon_tooltip_hide_job: str | None = None
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
@@ -1203,6 +1332,9 @@ class MeterApp:
             configured, bool(self.settings.get("CleanupOldCombatLogs")), self._on_combat_event,
             self._on_active_log, self._on_log_status,
         )
+        if self.watcher.folder is None:
+            self.watcher.folder = self.watcher.default_folder()
+        self.records.import_log_history(self.watcher.folder)
         if self.watcher.folder:
             self.settings.set("CombatLogFolder", str(self.watcher.folder))
         self.win = WindowsApi(self.root)
@@ -1538,6 +1670,20 @@ class MeterApp:
             value = self.label(box, "0", 9, "bold", "text")
             value.pack(anchor="w")
             self.flex_lifetime_labels[key] = value
+
+        self.dungeon_history_panel = self.panel(self.flex_view)
+        self.dungeon_history_panel.pack(fill="x", pady=(7, 0))
+        self.dungeon_history_left = self.role(tk.Frame(self.dungeon_history_panel), "panel", None)
+        self.dungeon_history_left.pack(side="left", fill="x", expand=True, padx=8, pady=6)
+        self.label(self.dungeon_history_left, "DUNGEON HISTORY", 6, foreground="muted").pack(anchor="w")
+        self.dungeon_history_summary = self.label(self.dungeon_history_left, "0 runs · 0 dungeons", 9, "bold", "text")
+        self.dungeon_history_summary.pack(anchor="w")
+        self.dungeon_history_hint = self.label(self.dungeon_history_panel, "HOVER FOR DETAILS", 6, foreground="accent")
+        self.dungeon_history_hint.pack(side="right", padx=8)
+        for widget in (self.dungeon_history_panel, self.dungeon_history_left, self.dungeon_history_summary,
+                       self.dungeon_history_hint):
+            widget.bind("<Enter>", self._show_dungeon_tooltip, add="+")
+            widget.bind("<Leave>", self._schedule_hide_dungeon_tooltip, add="+")
         self.records_path_label = self.label(self.flex_view, f"Records: {self.records.path}", 6, foreground="dim", anchor="w")
         self.records_path_label.pack(fill="x", pady=(7, 18))
 
@@ -1827,6 +1973,7 @@ class MeterApp:
         if not selected:
             return
         self.watcher.change_folder(selected)
+        self.records.import_log_history(self.watcher.folder)
         self.settings.data["CombatLogFolder"] = str(Path(selected).resolve())
         self.settings.data["CombatLogPath"] = None
         self.settings.save()
@@ -2026,6 +2173,9 @@ class MeterApp:
         for child in self.lifetime.winfo_children():
             if isinstance(child, tk.Frame):
                 child.pack_configure(padx=5 if self.compact_mode else 8, pady=4 if self.compact_mode else 7)
+        self.dungeon_history_left.pack_configure(padx=5 if self.compact_mode else 8,
+                                                 pady=3 if self.compact_mode else 6)
+        self.dungeon_history_hint.pack_configure(padx=5 if self.compact_mode else 8)
         self._set_packed(self.records_path_label, not self.compact_mode, fill="x", pady=(7, 18))
 
         icon_size = 18 if self.compact_mode else 25
@@ -2129,6 +2279,13 @@ class MeterApp:
         self.flex_lifetime_labels["damage"].configure(text=format_number(float(flex.get("LifetimeDamage", 0))))
         self.flex_lifetime_labels["healing"].configure(text=format_number(float(flex.get("LifetimeHealing", 0))))
         self.flex_lifetime_labels["runs"].configure(text=str(int(flex.get("RunsTracked", 0))))
+        dungeon_runs = flex.get("DungeonRuns", {})
+        attempts = sum(int(stats.get("Attempts", 0))
+                       for difficulties in dungeon_runs.values() if isinstance(difficulties, dict)
+                       for stats in difficulties.values() if isinstance(stats, dict))
+        self.dungeon_history_summary.configure(
+            text=f"{attempts:,} {'run' if attempts == 1 else 'runs'} · {len(dungeon_runs):,} "
+                 f"{'dungeon' if len(dungeon_runs) == 1 else 'dungeons'}")
 
         self.map_label.configure(text=self.current_map)
         folder = self.watcher.folder
@@ -2255,6 +2412,67 @@ class MeterApp:
         self._ability_tooltip = None
         self._ability_tooltip_row = None
 
+    def _show_dungeon_tooltip(self, _event: tk.Event | None = None) -> None:
+        if self._dungeon_tooltip_hide_job is not None:
+            self.root.after_cancel(self._dungeon_tooltip_hide_job)
+            self._dungeon_tooltip_hide_job = None
+        if self._dungeon_tooltip is not None:
+            return
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        outer = tk.Frame(tip, background="#171C27", highlightbackground="#3A4352", highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text="DUNGEON HISTORY", background="#171C27", foreground="#F4F7FB",
+                 font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 3))
+        runs = self.records.snapshot().get("DungeonRuns", {})
+        if not runs:
+            tk.Label(outer, text="No dungeon runs found yet.", background="#171C27", foreground="#8F9BAA",
+                     font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(fill="x", padx=10, pady=(2, 9))
+        for dungeon in sorted(runs, key=str.casefold):
+            difficulties = runs[dungeon]
+            tk.Label(outer, text=dungeon, background="#171C27", foreground=self.colors["accent"],
+                     font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w").pack(fill="x", padx=10, pady=(5, 1))
+            for difficulty in sorted(difficulties, key=str.casefold):
+                stats = difficulties[difficulty]
+                attempts = int(stats.get("Attempts", 0))
+                extracted = int(stats.get("Extracted", 0))
+                abandoned = int(stats.get("Abandoned", 0))
+                line = f"{difficulty}:  {attempts:,} run{'s' if attempts != 1 else ''}  ·  {extracted:,} extracted  ·  {abandoned:,} abandoned"
+                tk.Label(outer, text=line, background="#171C27", foreground="#F4F7FB",
+                         font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(fill="x", padx=16, pady=1)
+        tk.Frame(outer, height=7, background="#171C27").pack()
+        self._dungeon_tooltip = tip
+        tip.bind("<Enter>", self._cancel_hide_dungeon_tooltip, add="+")
+        tip.bind("<Leave>", self._schedule_hide_dungeon_tooltip, add="+")
+        tip.update_idletasks()
+        x = self.dungeon_history_panel.winfo_rootx() + self.dungeon_history_panel.winfo_width() + 2
+        if x + tip.winfo_width() > self.root.winfo_screenwidth() - 8:
+            x = self.dungeon_history_panel.winfo_rootx() - tip.winfo_width() - 2
+        y = min(self.dungeon_history_panel.winfo_rooty(), self.root.winfo_screenheight() - tip.winfo_height() - 8)
+        tip.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cancel_hide_dungeon_tooltip(self, _event: tk.Event | None = None) -> None:
+        if self._dungeon_tooltip_hide_job is not None:
+            self.root.after_cancel(self._dungeon_tooltip_hide_job)
+            self._dungeon_tooltip_hide_job = None
+
+    def _schedule_hide_dungeon_tooltip(self, _event: tk.Event | None = None) -> None:
+        if self._dungeon_tooltip_hide_job is not None:
+            self.root.after_cancel(self._dungeon_tooltip_hide_job)
+        self._dungeon_tooltip_hide_job = self.root.after(250, self._hide_dungeon_tooltip)
+
+    def _hide_dungeon_tooltip(self) -> None:
+        if self._dungeon_tooltip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._dungeon_tooltip_hide_job)
+            except tk.TclError:
+                pass
+            self._dungeon_tooltip_hide_job = None
+        if self._dungeon_tooltip is not None:
+            self._dungeon_tooltip.destroy()
+        self._dungeon_tooltip = None
+
     def find_and_follow(self, force: bool = False) -> None:
         found = self.win.find_soulbound() if hasattr(self, "win") else None
         if found is None:
@@ -2327,6 +2545,7 @@ class MeterApp:
         if self.closed or self._minimized:
             return
         self._hide_ability_tooltip()
+        self._hide_dungeon_tooltip()
         self._minimized = True
         # A borderless Tk window cannot be safely iconified directly. Temporarily
         # give it standard Windows chrome so it has a real taskbar entry and can
@@ -2373,6 +2592,8 @@ class MeterApp:
         if self.closed:
             return
         self.closed = True
+        self._hide_ability_tooltip()
+        self._hide_dungeon_tooltip()
         if self._brand_animation_job is not None:
             try:
                 self.root.after_cancel(self._brand_animation_job)

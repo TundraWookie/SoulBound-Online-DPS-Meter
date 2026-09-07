@@ -20,6 +20,8 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Resolves Healing Pulse and Fortify events when the log reports them as unknown.
 - Hides unresolved `Unknown Ability` rows while retaining their amounts in the totals.
 - Includes a permanent **Flex** tab for personal records and lifetime statistics.
+- Tracks dungeon runs by dungeon and difficulty, including extracted and abandoned runs.
+- Imports existing combat logs once and keeps a permanent duplicate-prevention ledger in `records.txt`.
 - Supports custom menu colors.
 - Supports adjustable overlay opacity and optional AFK fading between dungeon runs.
 - Supports adjustable font size and remembers the resized window dimensions.
@@ -124,6 +126,7 @@ The **Flex** tab stores permanent personal records, including:
 - Highest normal, critical, heavy, and devastating hits.
 - Lifetime damage and healing.
 - Number of runs recorded.
+- Dungeon history grouped by dungeon and difficulty. Hover over the summary for run, extraction, and abandonment totals.
 
 Records are saved live in:
 
@@ -131,7 +134,9 @@ Records are saved live in:
 records.txt
 ```
 
-The file is created beside the EXE or Python script. It is never removed by the combat-log cleanup option. Keep this file when updating the meter if you want to preserve your records.
+The file is created beside the EXE or Python script. On the first launch of a version with dungeon history, the meter scans the existing combat-log folder and imports every run once. Its permanent ledger prevents those logs from being counted again on later launches or rescans. After a log has been imported, deleting the original combat log does not remove its saved dungeon history.
+
+It is never removed by the combat-log cleanup option. Keep this file when updating the meter if you want to preserve your records and duplicate-prevention ledger.
 
 Do not include your personal `records.txt` when sharing the meter with somebody else unless you intentionally want to share your records.
 
