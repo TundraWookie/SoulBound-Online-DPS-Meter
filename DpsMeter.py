@@ -26,7 +26,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.15-py.1"
+VERSION = "0.8.16-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -142,6 +142,17 @@ def format_date(value: str | None) -> str:
         return "No record yet"
 
 
+def format_duration_ms(value: Any) -> str:
+    try:
+        centiseconds = max(0, round(float(value) / 10.0))
+    except (TypeError, ValueError):
+        return "--:--"
+    seconds, fraction = divmod(centiseconds, 100)
+    minutes, second = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}:{minute:02d}:{second:02d}.{fraction:02d}" if hours else f"{minute:02d}:{second:02d}.{fraction:02d}"
+
+
 @dataclass(slots=True)
 class CombatEvent:
     type: str
@@ -168,6 +179,7 @@ class CombatEvent:
     dungeon_name: str | None
     run_end_reason: str | None
     run_completed: bool
+    run_duration_ms: float
 
 
 def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | None:
@@ -242,6 +254,7 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         str(first_value(payload, "dungeon_display_name", "dungeon_name") or "").strip() or None,
         str(first_value(payload, "reason", "end_reason") or "").strip().lower() or None,
         first_bool(payload, "completed", "is_completed"),
+        max(0.0, first_number(payload, "duration_ms", "run_duration_ms")),
     )
 
 
@@ -613,14 +626,17 @@ class FlexRecordStore:
         difficulties = dungeons[dungeon_key]
         difficulty_key = dict_key_casefold(difficulties, difficulty) or difficulty
         if difficulty_key not in difficulties or not isinstance(difficulties[difficulty_key], dict):
-            difficulties[difficulty_key] = {"Attempts": 0, "Extracted": 0, "Abandoned": 0, "LastRunAt": None}
+            difficulties[difficulty_key] = {
+                "Attempts": 0, "Extracted": 0, "Abandoned": 0, "LastRunAt": None,
+                "FastestMs": None, "FastestAt": None,
+            }
         bucket = difficulties[difficulty_key]
         for key in ("Attempts", "Extracted", "Abandoned"):
             bucket[key] = int(bucket.get(key, 0))
         return bucket
 
     def _upsert_run(self, run_id: str, display_name: str, started_at: float, status: str,
-                    path: str | None = None) -> None:
+                    path: str | None = None, duration_ms: float = 0.0) -> None:
         ledger = self.data["DungeonRunLedger"]
         actual_id = dict_key_casefold(ledger, run_id) or run_id
         dungeon, difficulty = split_dungeon_difficulty(display_name)
@@ -631,6 +647,8 @@ class FlexRecordStore:
             old_status = ""
         else:
             old_status = str(existing.get("Status", "")).lower()
+        if old_status in {"extracted", "abandoned"} and status in {"started", "ended"}:
+            status = old_status
         if old_status != status:
             if old_status in {"extracted", "abandoned"}:
                 bucket[old_status.title()] = max(0, int(bucket.get(old_status.title(), 0)) - 1)
@@ -638,9 +656,15 @@ class FlexRecordStore:
                 bucket[status.title()] = int(bucket.get(status.title(), 0)) + 1
         started_text = str(existing.get("StartedAt")) if existing and existing.get("StartedAt") else timestamp_text(started_at)
         bucket["LastRunAt"] = max(str(bucket.get("LastRunAt") or ""), started_text)
+        if status == "extracted" and duration_ms > 0:
+            fastest = bucket.get("FastestMs")
+            if fastest is None or float(fastest) <= 0 or duration_ms < float(fastest):
+                bucket["FastestMs"] = duration_ms
+                bucket["FastestAt"] = started_text
         ledger[actual_id] = {
             "Dungeon": dungeon, "Difficulty": difficulty, "StartedAt": started_text,
             "Status": status, "SourceFile": Path(path).name if path else (existing or {}).get("SourceFile"),
+            "DurationMs": duration_ms if duration_ms > 0 else (existing or {}).get("DurationMs"),
         }
         self.data["LastUpdatedUtc"] = timestamp_text(utc_now())
         self.dirty = True
@@ -657,7 +681,10 @@ class FlexRecordStore:
                                                   None if existing.get("Difficulty") == "Normal" else existing.get("Difficulty"))))
             status = "extracted" if event.run_completed or event.run_end_reason == "extracted" else (
                 "abandoned" if event.run_end_reason == "abandoned" else "ended")
-            self._upsert_run(self.active_run_id, display or "Unknown Dungeon", event.timestamp, status, self._log_key())
+            started_at = parse_timestamp(existing.get("StartedAt"))
+            duration_ms = event.run_duration_ms or max(0.0, (event.timestamp - started_at) * 1000.0)
+            self._upsert_run(self.active_run_id, display or "Unknown Dungeon", started_at, status,
+                             self._log_key(), duration_ms)
         self.save_if_due()
 
     def import_log_history(self, folder: Path | str | None) -> int:
@@ -702,7 +729,8 @@ class FlexRecordStore:
             if end is not None:
                 status = "extracted" if end.run_completed or end.run_end_reason == "extracted" else (
                     "abandoned" if end.run_end_reason == "abandoned" else "ended")
-            self._upsert_run(run_id, display, start.timestamp, status, str(path))
+            duration_ms = (end.run_duration_ms or max(0.0, (end.timestamp - start.timestamp) * 1000.0)) if end else 0.0
+            self._upsert_run(run_id, display, start.timestamp, status, str(path), duration_ms)
         self.save(force=True)
         return max(0, len(self.data["DungeonRunLedger"]) - imported_before)
 
@@ -2438,7 +2466,9 @@ class MeterApp:
                 attempts = int(stats.get("Attempts", 0))
                 extracted = int(stats.get("Extracted", 0))
                 abandoned = int(stats.get("Abandoned", 0))
-                line = f"{difficulty}:  {attempts:,} run{'s' if attempts != 1 else ''}  ·  {extracted:,} extracted  ·  {abandoned:,} abandoned"
+                fastest = format_duration_ms(stats.get("FastestMs")) if stats.get("FastestMs") else "--:--"
+                line = (f"{difficulty}:  {attempts:,} run{'s' if attempts != 1 else ''}  ·  "
+                        f"{extracted:,} extracted  ·  {abandoned:,} abandoned  ·  fastest {fastest}")
                 tk.Label(outer, text=line, background="#171C27", foreground="#F4F7FB",
                          font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(fill="x", padx=16, pady=1)
         tk.Frame(outer, height=7, background="#171C27").pack()
