@@ -126,7 +126,7 @@ The **Flex** tab stores permanent personal records, including:
 - Highest normal, critical, heavy, and devastating hits.
 - Lifetime damage and healing.
 - Number of runs recorded.
-- Dungeon history grouped by dungeon and difficulty. Hover over the summary for run, extraction, abandonment, and fastest extracted-run times.
+- Dungeon history grouped by dungeon and difficulty. Hover over the summary for color-coded completed, abandoned, and ended-early counts plus the fastest completed wall-clock time. New dungeons automatically receive their own persistent color.
 
 Records are saved live in:
 

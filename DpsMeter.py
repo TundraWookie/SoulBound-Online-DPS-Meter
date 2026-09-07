@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import colorsys
 import ctypes
 import json
 import os
@@ -26,7 +27,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.16-py.1"
+VERSION = "0.8.17-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -532,7 +533,7 @@ def default_record_data() -> dict[str, Any]:
         "LifetimeDamage": 0.0, "LifetimeHealing": 0.0, "RunsTracked": 0,
         "LastUpdatedUtc": None, "CountedLogs": [], "LogSequenceCheckpoints": {},
         "LogDamageTotals": {}, "LogHealingTotals": {}, "LogHitDamageTotals": {},
-        "DungeonRuns": {}, "DungeonRunLedger": {},
+        "DungeonRuns": {}, "DungeonRunLedger": {}, "DungeonColors": {},
         "LifetimeHitDamage": {"Normal": 0.0, "Critical": 0.0, "Heavy": 0.0, "Devastating": 0.0},
         "RecentEventIds": [],
     }
@@ -544,7 +545,7 @@ def merge_defaults(loaded: Any, defaults: dict[str, Any]) -> dict[str, Any]:
     result = dict(defaults)
     result.update(loaded)
     for key in ("LogSequenceCheckpoints", "LogDamageTotals", "LogHealingTotals", "LogHitDamageTotals",
-                "DungeonRuns", "DungeonRunLedger"):
+                "DungeonRuns", "DungeonRunLedger", "DungeonColors"):
         if not isinstance(result.get(key), dict):
             result[key] = {}
     for key in ("CountedLogs", "RecentEventIds"):
@@ -562,6 +563,12 @@ def dict_key_casefold(mapping: dict[str, Any], key: str) -> str | None:
 
 
 class FlexRecordStore:
+    DUNGEON_COLOR_PALETTE = (
+        "#56F39A", "#4CC9F0", "#FF6B6B", "#F9C74F", "#B388FF", "#FF8A4C",
+        "#45A3FF", "#F15BB5", "#9EF01A", "#00E5FF", "#FF5D8F", "#C77DFF",
+        "#72EFDD", "#F9844A", "#90BE6D", "#00BBF9", "#FEE440", "#A8DADC",
+    )
+
     def __init__(self, records_path: Path | None = None) -> None:
         self.path = records_path or RECORDS_PATH
         self.active_log: str | None = None
@@ -570,11 +577,14 @@ class FlexRecordStore:
         self.sequences_this_read: set[float] = set()
         self.ids_this_read: set[str] = set()
         self.active_run_id: str | None = None
+        self.active_run_completed = False
         self.dirty = False
         self.last_save = 0.0
         if records_path is None:
             self._migrate_legacy()
         self.data = self._load()
+        for dungeon in sorted(self.data["DungeonRuns"], key=str.casefold):
+            self._ensure_dungeon_color(dungeon)
         self.save(force=True)
 
     def _migrate_legacy(self) -> None:
@@ -613,12 +623,14 @@ class FlexRecordStore:
         self.sequences_this_read.clear()
         self.ids_this_read.clear()
         self.active_run_id = None
+        self.active_run_completed = False
 
     @staticmethod
     def _run_id(started_at: float, display_name: str) -> str:
         return f"{int(started_at * 1000)}|{display_name.strip().lower()}"
 
     def _run_bucket(self, dungeon: str, difficulty: str) -> dict[str, Any]:
+        self._ensure_dungeon_color(dungeon)
         dungeons = self.data["DungeonRuns"]
         dungeon_key = dict_key_casefold(dungeons, dungeon) or dungeon
         if dungeon_key not in dungeons or not isinstance(dungeons[dungeon_key], dict):
@@ -635,8 +647,33 @@ class FlexRecordStore:
             bucket[key] = int(bucket.get(key, 0))
         return bucket
 
+    def _ensure_dungeon_color(self, dungeon: str) -> str:
+        colors = self.data["DungeonColors"]
+        existing_key = dict_key_casefold(colors, dungeon)
+        if existing_key is not None and isinstance(colors.get(existing_key), str):
+            return colors[existing_key]
+        used = {str(value).upper() for value in colors.values()}
+        color = next((candidate for candidate in self.DUNGEON_COLOR_PALETTE
+                      if candidate.upper() not in used), None)
+        if color is None:
+            seed = 2166136261
+            for character in dungeon.casefold():
+                seed = ((seed ^ ord(character)) * 16777619) & 0xFFFFFFFF
+            attempt = 0
+            while True:
+                hue = ((seed % 360) + attempt * 47) % 360 / 360.0
+                red, green, blue = colorsys.hsv_to_rgb(hue, 0.68, 0.96)
+                color = f"#{round(red * 255):02X}{round(green * 255):02X}{round(blue * 255):02X}"
+                if color.upper() not in used:
+                    break
+                attempt += 1
+        colors[dungeon] = color
+        self.dirty = True
+        return color
+
     def _upsert_run(self, run_id: str, display_name: str, started_at: float, status: str,
-                    path: str | None = None, duration_ms: float = 0.0) -> None:
+                    path: str | None = None, duration_ms: float = 0.0,
+                    qualifies_fastest: bool | None = None) -> None:
         ledger = self.data["DungeonRunLedger"]
         actual_id = dict_key_casefold(ledger, run_id) or run_id
         dungeon, difficulty = split_dungeon_difficulty(display_name)
@@ -647,7 +684,7 @@ class FlexRecordStore:
             old_status = ""
         else:
             old_status = str(existing.get("Status", "")).lower()
-        if old_status in {"extracted", "abandoned"} and status in {"started", "ended"}:
+        if qualifies_fastest is None and old_status in {"extracted", "abandoned"} and status in {"started", "ended"}:
             status = old_status
         if old_status != status:
             if old_status in {"extracted", "abandoned"}:
@@ -656,7 +693,8 @@ class FlexRecordStore:
                 bucket[status.title()] = int(bucket.get(status.title(), 0)) + 1
         started_text = str(existing.get("StartedAt")) if existing and existing.get("StartedAt") else timestamp_text(started_at)
         bucket["LastRunAt"] = max(str(bucket.get("LastRunAt") or ""), started_text)
-        if status == "extracted" and duration_ms > 0:
+        qualifies = bool((existing or {}).get("QualifiesFastest")) if qualifies_fastest is None else qualifies_fastest
+        if qualifies and duration_ms > 0:
             fastest = bucket.get("FastestMs")
             if fastest is None or float(fastest) <= 0 or duration_ms < float(fastest):
                 bucket["FastestMs"] = duration_ms
@@ -665,6 +703,7 @@ class FlexRecordStore:
             "Dungeon": dungeon, "Difficulty": difficulty, "StartedAt": started_text,
             "Status": status, "SourceFile": Path(path).name if path else (existing or {}).get("SourceFile"),
             "DurationMs": duration_ms if duration_ms > 0 else (existing or {}).get("DurationMs"),
+            "QualifiesFastest": qualifies,
         }
         self.data["LastUpdatedUtc"] = timestamp_text(utc_now())
         self.dirty = True
@@ -673,19 +712,46 @@ class FlexRecordStore:
         if event.type == "combat_start":
             display = event.dungeon_name or map_name_from_log_path(self._log_key())
             self.active_run_id = self._run_id(event.timestamp, display)
+            self.active_run_completed = False
             self._upsert_run(self.active_run_id, display, event.timestamp, "started", self._log_key())
+        elif event.type == "room_end" and event.run_end_reason == "extraction":
+            self.active_run_completed = True
         elif event.type == "combat_end" and self.active_run_id:
             ledger = self.data["DungeonRunLedger"]
             existing = ledger.get(self.active_run_id, {})
             display = " - ".join(filter(None, (existing.get("Dungeon"),
                                                   None if existing.get("Difficulty") == "Normal" else existing.get("Difficulty"))))
-            status = "extracted" if event.run_completed or event.run_end_reason == "extracted" else (
+            status = "extracted" if self.active_run_completed else (
                 "abandoned" if event.run_end_reason == "abandoned" else "ended")
             started_at = parse_timestamp(existing.get("StartedAt"))
-            duration_ms = event.run_duration_ms or max(0.0, (event.timestamp - started_at) * 1000.0)
+            duration_ms = max(0.0, (event.timestamp - started_at) * 1000.0)
             self._upsert_run(self.active_run_id, display or "Unknown Dungeon", started_at, status,
-                             self._log_key(), duration_ms)
+                             self._log_key(), duration_ms, status == "extracted")
         self.save_if_due()
+
+    def _rebuild_fastest_times(self) -> None:
+        for difficulties in self.data["DungeonRuns"].values():
+            if not isinstance(difficulties, dict):
+                continue
+            for stats in difficulties.values():
+                if isinstance(stats, dict):
+                    stats["FastestMs"] = None
+                    stats["FastestAt"] = None
+        for entry in self.data["DungeonRunLedger"].values():
+            if not isinstance(entry, dict) or not entry.get("QualifiesFastest"):
+                continue
+            try:
+                duration_ms = float(entry.get("DurationMs") or 0)
+            except (TypeError, ValueError):
+                continue
+            if duration_ms <= 0:
+                continue
+            bucket = self._run_bucket(str(entry.get("Dungeon") or "Unknown Dungeon"),
+                                      str(entry.get("Difficulty") or "Normal"))
+            fastest = bucket.get("FastestMs")
+            if fastest is None or duration_ms < float(fastest):
+                bucket["FastestMs"] = duration_ms
+                bucket["FastestAt"] = entry.get("StartedAt")
 
     def import_log_history(self, folder: Path | str | None) -> int:
         """Import every existing log once; the persisted run ID makes rescans idempotent."""
@@ -701,6 +767,7 @@ class FlexRecordStore:
         for path in paths:
             start: CombatEvent | None = None
             end: CombatEvent | None = None
+            completed_extraction = False
             try:
                 with path.open("rb") as handle:
                     head = handle.read(256 * 1024)
@@ -717,6 +784,8 @@ class FlexRecordStore:
                         continue
                     if event.type == "combat_start" and start is None:
                         start = event
+                    elif event.type == "room_end" and event.run_end_reason == "extraction":
+                        completed_extraction = True
                     elif event.type == "combat_end":
                         end = event
             except (OSError, UnicodeError):
@@ -727,10 +796,12 @@ class FlexRecordStore:
             run_id = self._run_id(start.timestamp, display)
             status = "started"
             if end is not None:
-                status = "extracted" if end.run_completed or end.run_end_reason == "extracted" else (
+                status = "extracted" if completed_extraction else (
                     "abandoned" if end.run_end_reason == "abandoned" else "ended")
-            duration_ms = (end.run_duration_ms or max(0.0, (end.timestamp - start.timestamp) * 1000.0)) if end else 0.0
-            self._upsert_run(run_id, display, start.timestamp, status, str(path), duration_ms)
+            duration_ms = max(0.0, (end.timestamp - start.timestamp) * 1000.0) if end else 0.0
+            self._upsert_run(run_id, display, start.timestamp, status, str(path), duration_ms,
+                             status == "extracted")
+        self._rebuild_fastest_times()
         self.save(force=True)
         return max(0, len(self.data["DungeonRunLedger"]) - imported_before)
 
@@ -793,7 +864,7 @@ class FlexRecordStore:
         return mapping[actual_key]
 
     def apply(self, event: CombatEvent) -> None:
-        if event.type in {"combat_start", "combat_end"}:
+        if event.type in {"combat_start", "room_end", "combat_end"}:
             self._track_run_event(event)
             return
         if not is_own_event(event) or event.type not in {"damage", "heal"} or event.amount <= 0:
@@ -2453,22 +2524,28 @@ class MeterApp:
         outer.pack(fill="both", expand=True)
         tk.Label(outer, text="DUNGEON HISTORY", background="#171C27", foreground="#F4F7FB",
                  font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 3))
-        runs = self.records.snapshot().get("DungeonRuns", {})
+        record_snapshot = self.records.snapshot()
+        runs = record_snapshot.get("DungeonRuns", {})
+        dungeon_colors = record_snapshot.get("DungeonColors", {})
         if not runs:
             tk.Label(outer, text="No dungeon runs found yet.", background="#171C27", foreground="#8F9BAA",
                      font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(fill="x", padx=10, pady=(2, 9))
         for dungeon in sorted(runs, key=str.casefold):
             difficulties = runs[dungeon]
-            tk.Label(outer, text=dungeon, background="#171C27", foreground=self.colors["accent"],
+            dungeon_color_key = dict_key_casefold(dungeon_colors, dungeon)
+            dungeon_color = dungeon_colors.get(dungeon_color_key, self.colors["accent"])
+            tk.Label(outer, text=f"●  {dungeon}", background="#171C27", foreground=dungeon_color,
                      font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w").pack(fill="x", padx=10, pady=(5, 1))
             for difficulty in sorted(difficulties, key=str.casefold):
                 stats = difficulties[difficulty]
                 attempts = int(stats.get("Attempts", 0))
                 extracted = int(stats.get("Extracted", 0))
                 abandoned = int(stats.get("Abandoned", 0))
+                ended_early = max(0, attempts - extracted - abandoned)
                 fastest = format_duration_ms(stats.get("FastestMs")) if stats.get("FastestMs") else "--:--"
                 line = (f"{difficulty}:  {attempts:,} run{'s' if attempts != 1 else ''}  ·  "
-                        f"{extracted:,} extracted  ·  {abandoned:,} abandoned  ·  fastest {fastest}")
+                        f"{extracted:,} completed  ·  {abandoned:,} abandoned  ·  "
+                        f"{ended_early:,} ended early  ·  fastest {fastest}")
                 tk.Label(outer, text=line, background="#171C27", foreground="#F4F7FB",
                          font=(self.FONT, self._scaled_font_size(8)), anchor="w").pack(fill="x", padx=16, pady=1)
         tk.Frame(outer, height=7, background="#171C27").pack()
