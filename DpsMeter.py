@@ -27,7 +27,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.17-py.1"
+VERSION = "0.8.18-py.1"
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
@@ -118,6 +118,18 @@ def is_own_event(event: "CombatEvent") -> bool:
         or (event.source_id or "").lower() == "self"
         or (event.source_name or "").lower() == "self"
     )
+
+
+def damage_effect_kind(event: "CombatEvent") -> str | None:
+    if event.type != "damage" or event.amount <= 0 or not is_own_event(event):
+        return None
+    if event.critical and event.heavy_hit:
+        return "dev"
+    if event.critical:
+        return "crit"
+    if event.heavy_hit:
+        return "heavy"
+    return None
 
 
 def format_number(value: float) -> str:
@@ -962,7 +974,8 @@ class AppSettings:
         "CombatLogPath": None, "CombatLogFolder": None, "CleanupOldCombatLogs": False,
         "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
         "OverlayOpacity": 1.0, "FadeWhenAfk": False, "AfkFadeSeconds": 6.0,
-        "IncludeOverkillDamage": False, "WindowWidth": None, "WindowHeight": None, "FontScale": 1.0,
+        "IncludeOverkillDamage": False, "DamageEffects": False,
+        "WindowWidth": None, "WindowHeight": None, "FontScale": 1.0,
         "CompactMode": False, "NormalWindowWidth": None, "NormalWindowHeight": None,
         "CompactWindowWidth": None, "CompactWindowHeight": None,
     }
@@ -1377,6 +1390,7 @@ class MeterApp:
         self.chance_boxes: list[tk.Frame] = []
         self.run_high_boxes: list[tk.Frame] = []
         self.ability_rows: list[dict[str, Any]] = []
+        self.damage_effects: dict[str, tuple[str, float]] = {}
         self._ability_tooltip: tk.Toplevel | None = None
         self._ability_tooltip_row: dict[str, Any] | None = None
         self._ability_tooltip_hide_job: str | None = None
@@ -1668,7 +1682,7 @@ class MeterApp:
             row_info = {
                 "frame": row, "icon": icon, "name": name, "damage_type": damage_type,
                 "bar": bar, "amount": amount, "icon_holder": icon_holder,
-                "percent": 0.0, "segments": {}, "ability": None,
+                "percent": 0.0, "segments": {}, "ability": None, "effect_color": None,
             }
             self.ability_rows.append(row_info)
             for hover_widget in (row, icon_holder, icon, middle, name_line, damage_type, name, bar, amount):
@@ -1912,6 +1926,17 @@ class MeterApp:
         include_overkill.pack(anchor="w", padx=15)
         self.label(self.settings_body, "Off matches Gearforge using actual enemy health removed. Flex records keep full hit values.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        self.damage_effects_var = tk.BooleanVar(value=bool(self.settings.get("DamageEffects")))
+        damage_effects = tk.Checkbutton(self.settings_body, text="Damage effects",
+                                        variable=self.damage_effects_var, command=self.damage_effects_changed,
+                                        font=(self.FONT, self._scaled_font_size(8)), borderwidth=0,
+                                        highlightthickness=0, anchor="w")
+        self._register_font(damage_effects, 8)
+        self.role(damage_effects, "bg", "text")
+        damage_effects.pack(anchor="w", padx=15, pady=(9, 0))
+        self.label(self.settings_body,
+                   "Briefly colors an ability bar and amount red for crit, orange for heavy, or purple for devastating.",
+                   7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
         self.label(self.settings_body, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.cleanup_var = tk.BooleanVar(value=bool(self.settings.get("CleanupOldCombatLogs")))
         cleanup = tk.Checkbutton(self.settings_body, text="Delete verified old combat logs; keep newest 10",
@@ -2048,6 +2073,10 @@ class MeterApp:
         pass
 
     def _on_combat_event(self, event: CombatEvent) -> None:
+        if bool(self.settings.get("DamageEffects")):
+            effect = damage_effect_kind(event)
+            if effect:
+                self.damage_effects[normalize_ability(event.ability_name)] = (effect, time.monotonic())
         self.session.apply(live_damage_event(event, bool(self.settings.get("IncludeOverkillDamage"))))
         # Flex records intentionally keep the full post-mitigation hit so a
         # personal best is not capped by the target's remaining health.
@@ -2055,6 +2084,7 @@ class MeterApp:
 
     def _on_active_log(self, path: str) -> None:
         self.session.reset()
+        self.damage_effects.clear()
         self.records.begin_log(path)
         self.current_map = map_name_from_log_path(path)
 
@@ -2064,6 +2094,7 @@ class MeterApp:
 
     def reset_session(self) -> None:
         self.session.reset()
+        self.damage_effects.clear()
         self.refresh()
 
     def pick_log_folder(self) -> None:
@@ -2096,6 +2127,13 @@ class MeterApp:
             self.watcher.partial = b""
             self.watcher.resolver.reset()
             self.log_status = "Recalculating damage totals..."
+        self.refresh()
+
+    def damage_effects_changed(self) -> None:
+        enabled = bool(self.damage_effects_var.get())
+        self.settings.set("DamageEffects", enabled)
+        if not enabled:
+            self.damage_effects.clear()
         self.refresh()
 
     def opacity_changed(self, value: str) -> None:
@@ -2350,6 +2388,18 @@ class MeterApp:
             row["percent"] = ability["percent"]
             row["segments"] = ability["segments"]
             row["ability"] = ability
+            effect_state = self.damage_effects.get(normalize_ability(ability["name"]))
+            effect_color = None
+            if bool(self.settings.get("DamageEffects")) and effect_state is not None:
+                effect_name, started_at = effect_state
+                if time.monotonic() - started_at < 0.8:
+                    effect_color = {"crit": self.colors["red"], "heavy": self.colors["orange"],
+                                    "dev": self.colors["purple"]}[effect_name]
+                else:
+                    self.damage_effects.pop(normalize_ability(ability["name"]), None)
+            row["effect_color"] = effect_color
+            row["name"].configure(foreground=effect_color or self.colors["text"])
+            row["amount"].configure(foreground=effect_color or self.colors["text"])
             icon = self.icons.get(normalize_ability(ability["name"]))
             row["icon"].configure(image=icon or "")
         self._redraw_bars()
@@ -2421,6 +2471,13 @@ class MeterApp:
             canvas.delete("all")
             width = max(1, canvas.winfo_width())
             canvas.create_rectangle(0, 0, width, 3, fill=self.colors["bar_bg"], outline="")
+            effect_color = row.get("effect_color")
+            if effect_color:
+                filled = sum(float(row.get("segments", {}).get(category, 0.0))
+                             for category in ("normal", "crit", "heavy", "dev"))
+                canvas.create_rectangle(0, 0, min(width, width * filled / 100.0), 3,
+                                        fill=effect_color, outline="")
+                continue
             left = 0.0
             segment_colors = {"normal": "#F4F7FB", "crit": self.colors["red"], "heavy": self.colors["orange"], "dev": self.colors["purple"]}
             for category in ("normal", "crit", "heavy", "dev"):
@@ -2751,6 +2808,10 @@ def run_self_test(log_path: str | None = None) -> int:
                  "is_crit": True, "is_heavy_hit": True},
     })
     assert event and event.amount == 300 and event.applied_amount == 1
+    assert damage_effect_kind(event) == "dev"
+    assert damage_effect_kind(replace(event, heavy_hit=False)) == "crit"
+    assert damage_effect_kind(replace(event, critical=False)) == "heavy"
+    assert damage_effect_kind(replace(event, critical=False, heavy_hit=False)) is None
     assert live_damage_event(event, False).amount == 1 and live_damage_event(event, True).amount == 300
     session = CombatSession()
     session.apply(live_damage_event(event, False))

@@ -88,6 +88,8 @@ Files are only treated as combat logs when they contain a valid Soulbound combat
 
 By default, live damage uses the game's `applied_amount`, excluding damage beyond the target's remaining health. This matches Gearforge's damage totals. Enable **Include overkill damage** in Settings to use the full post-mitigation hit instead. Flex records always retain full hit values so personal-best hits are not capped by a nearly defeated target.
 
+Enable **Damage effects** in Settings for live special-hit feedback. The affected ability's bar, name, and amount briefly flash red for a critical hit, orange for a heavy hit, or purple for a devastating hit, then return to the normal damage-breakdown colors.
+
 ### Hit Chances
 
 Hit chances are calculated from your damage events in the current run:
