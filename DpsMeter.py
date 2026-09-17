@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.6"
+VERSION = "0.9.7"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -59,7 +59,7 @@ LEADERBOARD_PARTY_LABELS = {
     "All Parties": "All", "Solo": "1", "2 Players": "2", "3 Players": "3",
     "4 Players": "4", "5 Players": "5", "6 Players": "6", "7 Players": "7", "8 Players": "8",
 }
-LEADERBOARD_SOURCE_LABELS = {"Live Captured": "live", "Imported History": "imported"}
+LEADERBOARD_SOURCE_LABELS = {"Recorded Runs": "imported"}
 ALL_DUNGEONS = "All Dungeons"
 ALL_DIFFICULTIES = "All Difficulties"
 
@@ -2111,7 +2111,7 @@ class AppSettings:
         "LeaderboardPlayerId": "", "LeaderboardTokenProtected": "",
         "LeaderboardCategory": "time", "LeaderboardDungeon": ALL_DUNGEONS,
         "LeaderboardDifficulty": ALL_DIFFICULTIES,
-        "LeaderboardPartySize": "All", "LeaderboardSource": "live",
+        "LeaderboardPartySize": "All", "LeaderboardSource": "imported",
         "LeaderboardHistoryScanned": False, "LeaderboardHistoryFiles": [],
         "LeaderboardHistoryVersion": LEADERBOARD_HISTORY_VERSION,
     }
@@ -2148,6 +2148,8 @@ class AppSettings:
                         self.data["LeaderboardHistoryFiles"] = []
                     self.data["LeaderboardHistoryScanned"] = False
                     self.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
+                # Recorded combat logs are now the leaderboard's single source.
+                self.data["LeaderboardSource"] = "imported"
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -2565,14 +2567,10 @@ class MeterApp:
         self.leaderboard_refresh_pending = False
         self.leaderboard_auto_refresh_job: str | None = None
         self.leaderboard_history_scanning = False
+        self.leaderboard_history_rescan_pending = False
+        self.leaderboard_completion_scan_job: str | None = None
         self.update_check_running = False
         self.update_download_running = False
-        self.leaderboard_tracker = LeaderboardRunTracker(
-            self.leaderboard_client,
-            lambda: bool(self.settings.get("LeaderboardEnabled")),
-            self._set_leaderboard_status,
-            self._leaderboard_run_submitted,
-        )
         configured = log_override or self.settings.get("CombatLogFolder") or self.settings.get("CombatLogPath")
         self.process_status = "Looking for Soulbound…"
         self.process_connected = False
@@ -2667,7 +2665,7 @@ class MeterApp:
 
         self.watcher = CombatLogWatcher(
             configured, bool(self.settings.get("CleanupOldCombatLogs")), self._on_combat_event,
-            self._on_active_log, self._on_log_status, self._on_raw_log_line,
+            self._on_active_log, self._on_log_status, None,
         )
         if self.watcher.folder is None:
             self.watcher.folder = self.watcher.default_folder()
@@ -3078,7 +3076,7 @@ class MeterApp:
         leaderboard_top_right = self.role(tk.Frame(top), "bg", None)
         leaderboard_top_right.pack(side="right", anchor="n")
         self.leaderboard_mode_badge = self.label(
-            leaderboard_top_right, "LIVE CAPTURED", 7, "bold", "accent")
+            leaderboard_top_right, "RECORDED RUNS", 7, "bold", "orange")
         self.leaderboard_mode_badge.pack(anchor="e")
         self.leaderboard_player_list_tab = self.role(
             tk.Label(leaderboard_top_right, text="Player list",
@@ -3106,7 +3104,7 @@ class MeterApp:
         self.leaderboard_name_entry.pack(side="left", fill="x", expand=True, padx=7, ipady=3)
         self.leaderboard_join_button = self.button(identity_body, "Join", self.register_leaderboard_player, width=7)
         self.leaderboard_join_button.pack(side="right")
-        self.leaderboard_scan_button = self.button(identity_body, "Scan history", self.scan_leaderboard_history, width=10)
+        self.leaderboard_scan_button = self.button(identity_body, "Scan logs", self.scan_leaderboard_history, width=10)
         self.leaderboard_scan_button.pack(side="right", padx=(0, 5))
         self._update_leaderboard_identity()
 
@@ -3179,21 +3177,10 @@ class MeterApp:
         self._register_font(self.leaderboard_party_menu, 7)
         self.role(self.leaderboard_party_menu, "button", "text")
         self.leaderboard_party_menu.pack(fill="x")
-        stored_source = str(self.settings.get("LeaderboardSource") or "live")
+        stored_source = "imported"
         source_label = next((label for label, key in LEADERBOARD_SOURCE_LABELS.items()
-                             if key == stored_source), "Live Captured")
+                             if key == stored_source), "Recorded Runs")
         self.leaderboard_source_var = tk.StringVar(value=source_label)
-        source_box = self.role(tk.Frame(lower), "panel", None)
-        source_box.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        self.label(source_box, "SOURCE", 6, "bold", "muted").pack(anchor="w")
-        source_menu = tk.OptionMenu(
-            source_box, self.leaderboard_source_var, *LEADERBOARD_SOURCE_LABELS.keys(),
-            command=self._leaderboard_source_changed)
-        source_menu.configure(font=(self.FONT, self._scaled_font_size(7)), relief="flat", borderwidth=0,
-                              highlightthickness=0, padx=4, pady=2, anchor="w")
-        self._register_font(source_menu, 7)
-        self.role(source_menu, "button", "text")
-        source_menu.pack(fill="x")
         self.button(lower, "Refresh", self.refresh_leaderboard, width=7).pack(side="right", anchor="s", pady=(12, 0))
 
         table = self.panel(self.leaderboard_view)
@@ -3248,7 +3235,7 @@ class MeterApp:
         self.leaderboard_empty_label.pack(pady=12)
         self.leaderboard_note = self.label(
             self.leaderboard_view,
-            "Live captured = the meter observed and checkpointed the run while it happened.",
+            "Completed combat logs are added automatically; abandoned and failed runs are excluded.",
             6, foreground="dim", anchor="w")
         self.leaderboard_note.pack(fill="x", pady=(5, 16))
 
@@ -3559,13 +3546,6 @@ class MeterApp:
         if hasattr(self, "leaderboard_status_label"):
             self.leaderboard_status_label.configure(text=message)
 
-    def _leaderboard_run_submitted(self) -> None:
-        if self.current_view == "leaderboard":
-            self.refresh_leaderboard()
-
-    def _on_raw_log_line(self, root: dict[str, Any], raw: bytes, event: CombatEvent | None) -> None:
-        self.leaderboard_tracker.observe(root, raw, event, self.session.snapshot())
-
     def _on_combat_event(self, event: CombatEvent) -> None:
         if bool(self.settings.get("DamageEffects")):
             effect = damage_effect_kind(event)
@@ -3575,16 +3555,33 @@ class MeterApp:
         # Flex records intentionally keep the full post-mitigation hit so a
         # personal best is not capped by the target's remaining health.
         self.records.apply(event)
+        if event.type == "combat_end" or is_boss_raid_completion(event):
+            self._schedule_completed_log_import()
+
+    def _schedule_completed_log_import(self) -> None:
+        if (not self.leaderboard_client.token
+                or not bool(self.settings.get("LeaderboardEnabled"))):
+            return
+        if self.leaderboard_completion_scan_job is not None:
+            try:
+                self.root.after_cancel(self.leaderboard_completion_scan_job)
+            except tk.TclError:
+                pass
+        # Give RUN_END and the filesystem a moment to finish writing before the
+        # completed log is hashed and submitted as a recorded run.
+        self.leaderboard_completion_scan_job = self.root.after(
+            1000, self._import_completed_log)
+
+    def _import_completed_log(self) -> None:
+        self.leaderboard_completion_scan_job = None
+        self.scan_leaderboard_history()
 
     def _on_active_log(self, path: str) -> None:
         self.session.reset()
         self.damage_effects.clear()
         self.records.begin_log(path)
-        self.leaderboard_tracker.reset_log()
         self.current_map = map_name_from_log_path(path)
         dungeon, difficulty = split_dungeon_difficulty(self.current_map)
-        self.leaderboard_tracker.dungeon = dungeon
-        self.leaderboard_tracker.difficulty = difficulty
         if hasattr(self, "leaderboard_catalog") and (dungeon, difficulty) not in self.leaderboard_catalog:
             self.leaderboard_catalog.append((dungeon, difficulty))
             self._update_leaderboard_filter_menus()
@@ -3622,7 +3619,6 @@ class MeterApp:
     def include_overkill_changed(self) -> None:
         enabled = bool(self.include_overkill_var.get())
         self.settings.set("IncludeOverkillDamage", enabled)
-        self.leaderboard_tracker.invalidate("Run excluded: damage totals were recalculated")
         self.session.reset()
         if self.watcher.active_path is not None:
             self.watcher.position = 0
@@ -3841,6 +3837,7 @@ class MeterApp:
 
     def scan_leaderboard_history(self) -> None:
         if self.leaderboard_history_scanning:
+            self.leaderboard_history_rescan_pending = True
             return
         if not bool(self.settings.get("LeaderboardEnabled")):
             self._set_leaderboard_status("Enable leaderboard submissions in Settings first.")
@@ -3920,7 +3917,10 @@ class MeterApp:
 
         def complete(data: dict[str, Any] | None, _error_message: str | None) -> None:
             self.leaderboard_history_scanning = False
-            self.leaderboard_scan_button.configure(state="normal", text="Scan history")
+            if self.leaderboard_history_rescan_pending:
+                self.leaderboard_history_rescan_pending = False
+                self.root.after(1000, self.scan_leaderboard_history)
+            self.leaderboard_scan_button.configure(state="normal", text="Scan logs")
             summary = data or {}
             imported = int(summary.get("imported", 0))
             duplicate = int(summary.get("duplicate", 0))
@@ -3938,12 +3938,12 @@ class MeterApp:
                 return
             if eligible == 0:
                 self._set_leaderboard_status(
-                    "Imported history is up to date." if int(summary.get("files", 0)) == 0
+                    "Recorded runs are up to date." if int(summary.get("files", 0)) == 0
                     else "No new completed extraction logs were found.")
                 return
             self._set_leaderboard_status(
                 f"History scan: {imported} imported · {duplicate} already added")
-            self.leaderboard_source_var.set("Imported History")
+            self.leaderboard_source_var.set("Recorded Runs")
             self.settings.set("LeaderboardSource", "imported")
             self.refresh_leaderboard_catalog(force=True)
             self.refresh_leaderboard()
@@ -4025,18 +4025,13 @@ class MeterApp:
         self.leaderboard_canvas.yview_moveto(0)
         self.refresh_leaderboard()
 
-    def _leaderboard_source_changed(self, _value: str | None = None) -> None:
-        self.leaderboard_canvas.yview_moveto(0)
-        self.refresh_leaderboard_catalog()
-        self.refresh_leaderboard()
-
     def refresh_leaderboard_catalog(self, force: bool = False) -> None:
         if not hasattr(self, "leaderboard_dungeon_menu"):
             return
         self._update_leaderboard_filter_menus()
         if self.leaderboard_catalog_loading:
             return
-        source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+        source = "imported"
         refreshed_at = self.leaderboard_catalog_refreshed_at.get(source, 0.0)
         if not force and time.monotonic() - refreshed_at < LEADERBOARD_CATALOG_CACHE_SECONDS:
             return
@@ -4058,7 +4053,7 @@ class MeterApp:
                             self.leaderboard_catalog.append(pair)
             self._update_leaderboard_filter_menus()
             current_source = LEADERBOARD_SOURCE_LABELS.get(
-                self.leaderboard_source_var.get(), "live")
+                self.leaderboard_source_var.get(), "imported")
             if current_source != source:
                 self.refresh_leaderboard_catalog()
 
@@ -4135,12 +4130,11 @@ class MeterApp:
 
     def _render_leaderboard(self) -> None:
         category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
-        source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+        source = "imported"
         overview = (self.leaderboard_dungeon_var.get() == ALL_DUNGEONS
                     or self.leaderboard_difficulty_var.get() == ALL_DIFFICULTIES)
         self.leaderboard_mode_badge.configure(
-            text="IMPORTED HISTORY" if source == "imported" else "LIVE CAPTURED",
-            foreground=self.colors["orange"] if source == "imported" else self.colors["accent"])
+            text="RECORDED RUNS", foreground=self.colors["orange"])
         headings = {
             "time": "TIME", "total_damage": "DAMAGE", "dps": "DPS", "best_30": "BEST 30S",
             "largest_hit": "HIGHEST HIT", "healing": "HEALING", "shielding": "SHIELDING",
@@ -4225,7 +4219,7 @@ class MeterApp:
         difficulty = self.leaderboard_difficulty_var.get().strip()
         category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
         party = LEADERBOARD_PARTY_LABELS.get(self.leaderboard_party_var.get(), "All")
-        source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+        source = "imported"
         self.settings.data["LeaderboardCategory"] = category
         self.settings.data["LeaderboardDungeon"] = dungeon
         self.settings.data["LeaderboardDifficulty"] = difficulty
@@ -5094,7 +5088,6 @@ class MeterApp:
         try:
             self.leaderboard_client.pump()
             self.watcher.poll()
-            self.leaderboard_tracker.tick()
             now = time.monotonic()
             if now - self.last_process_poll >= 0.75:
                 self.find_and_follow()
@@ -5117,6 +5110,12 @@ class MeterApp:
             except tk.TclError:
                 pass
             self.leaderboard_auto_refresh_job = None
+        if self.leaderboard_completion_scan_job is not None:
+            try:
+                self.root.after_cancel(self.leaderboard_completion_scan_job)
+            except tk.TclError:
+                pass
+            self.leaderboard_completion_scan_job = None
         self._hide_ability_tooltip()
         self._hide_dungeon_tooltip()
         self._hide_player_list_tooltip()
@@ -5535,7 +5534,7 @@ def run_self_test(log_path: str | None = None) -> int:
         certificate_error = ssl.SSLCertVerificationError(
             1, "certificate verify failed: unable to get local issuer certificate")
         written_path = write_leaderboard_error_log(
-            "GET", "/v1/leaderboards?source=live",
+            "GET", "/v1/leaderboards?source=imported",
             urllib.error.URLError(certificate_error), diagnostic_path)
         assert written_path == diagnostic_path
         diagnostic = diagnostic_path.read_text(encoding="utf-8")
@@ -5582,8 +5581,8 @@ def main() -> int:
     if args.leaderboard_smoke:
         saved_token = unprotect_secret(AppSettings().get("LeaderboardTokenProtected"))
         client = LeaderboardClient(saved_token)
-        path = ("/v1/leaderboards?source=live&category=time&limit=10"
-                if saved_token else "/v1/leaderboards/catalog?source=live")
+        path = ("/v1/leaderboards?source=imported&category=time&limit=10"
+                if saved_token else "/v1/leaderboards/catalog?source=imported")
         data, error_message = client.request_sync(
             "GET", path, None, authenticated=bool(saved_token))
         return 0 if data is not None and error_message is None else 1

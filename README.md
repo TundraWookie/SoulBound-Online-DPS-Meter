@@ -163,11 +163,11 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - Only completed extractions are eligible. Abandoned, failed, ended-early, and incomplete runs are excluded.
 - Boss raids such as Spectra Lair are recognized from a successful `bossraid` completion event even when the game omits normal extraction events. Events marked abandoned, failed, defeated, wiped, or death-related are rejected, and raid rankings use the active combat clock so pauses and the post-clear exit do not inflate the clear time.
 - Automatic history migrations preserve previously scanned non-Spectra files and throttle any required archive parsing so the live meter and timer stay responsive.
-- Live runs use periodic sequence/hash checkpoints to detect rewritten or recalculated logs.
-- Historical imports submit the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
-- Each player appears once per dungeon, difficulty, party-size, source, and ranking category using their best qualifying score.
+- Completed runs are read from their recorded combat logs and added automatically after the run ends.
+- Leaderboard submissions send the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
+- Each player appears once per dungeon, difficulty, party size, and ranking category using their best qualifying score.
 - Leaderboard results refresh every 2 minutes while the Ranks tab is open, immediately after your completed run is accepted, or whenever **Refresh** is selected.
-- Dungeon catalog results are cached for six hours and live-run integrity checkpoints are sent once per minute to keep community Cloudflare usage within the free allowance.
+- Dungeon catalog results are cached for six hours, and each unchanged combat log is processed only once to keep community Cloudflare usage within the free allowance.
 - Difficulty order is Stable, Unstable, Fractured, Collapsing, Shattered, Abyssal, then Raid.
 
 ## Controls
@@ -211,7 +211,7 @@ The optional cleanup setting:
 - The meter contacts GitHub to check for updates. Downloads only begin after approval.
 - It contacts the community leaderboard service to retrieve member-only rankings. Viewing names or scores and submitting runs requires joining with a display name; submissions can be disabled in Settings.
 - Every registered member can hover over **Player list** to see the registered display-name roster and which names currently have at least one qualifying score. This summary does not include authentication tokens or combat-log contents.
-- Leaderboard submissions contain run statistics, timing/checkpoint metadata, and cryptographic log fingerprints—not the combat-log contents.
+- Leaderboard submissions contain run statistics, timing metadata, and cryptographic log fingerprints—not the combat-log contents.
 - It does not inject code into Soulbound.
 - It does not read or modify Soulbound's memory.
 - It only reads the selected combat-log folder and writes its own settings and records files.
