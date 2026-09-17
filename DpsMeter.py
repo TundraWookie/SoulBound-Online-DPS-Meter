@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -77,6 +77,7 @@ def leaderboard_ssl_context() -> ssl.SSLContext:
 
 KNOWN_DUNGEON_DIFFICULTIES = {
     "Abyssal Raid": ("Raid",),
+    "Spectra Lair": ("Raid",),
     "Virelda Arena": ("Stable",),
     "Train Defence": ("Stable",),
     "Eastern Reach": ("Stable", "Fractured", "Collapsing", "Shattered", "Abyssal"),
@@ -90,6 +91,7 @@ KNOWN_DUNGEON_DIFFICULTIES = {
     "Lunar Plateau": ("Collapsing", "Shattered", "Abyssal"),
 }
 UNSUFFIXED_DUNGEON_DIFFICULTIES = {
+    "spectra lair": "Raid",
     "virelda arena": "Stable", "train defence": "Stable",
     "virelda outskirts": "Stable", "arcadia defence": "Unstable",
     "arcadia defense": "Unstable", "arcadia arena": "Unstable",
@@ -468,6 +470,11 @@ def default_difficulty_for_dungeon(dungeon: str) -> str:
     return "Stable"
 
 
+def is_boss_raid_completion(event: "CombatEvent") -> bool:
+    """Boss raids finish at ENCOUNTER_END and may omit ROOM_END/RUN_END."""
+    return event.type == "encounter_end" and event.room_subtype == "bossraid"
+
+
 def is_unknown_ability(name: str | None) -> bool:
     return not name or name.strip().lower() in {"unknown", "unknown ability"}
 
@@ -806,6 +813,9 @@ class CombatSession:
             self.timing_in_combat = False
             self.last_event_at = event.timestamp
             self.is_active = False
+            if is_boss_raid_completion(event):
+                self.in_run = False
+                self.run_controlled = False
             return
         if event.type == "room_end":
             self._update_stage_subtype(event)
@@ -1135,9 +1145,13 @@ class FlexRecordStore:
                 if not isinstance(difficulties, dict):
                     continue
                 normal_key = dict_key_casefold(difficulties, "Normal")
-                if normal_key is None:
-                    continue
                 target_name = default_difficulty_for_dungeon(str(dungeon))
+                if normal_key is None:
+                    stable_key = dict_key_casefold(difficulties, "Stable")
+                    if target_name.casefold() != "stable" and stable_key is not None:
+                        normal_key = stable_key
+                    else:
+                        continue
                 target_key = dict_key_casefold(difficulties, target_name) or target_name
                 legacy = difficulties.get(normal_key)
                 if not isinstance(legacy, dict):
@@ -1164,10 +1178,13 @@ class FlexRecordStore:
         ledger = self.data.get("DungeonRunLedger")
         if isinstance(ledger, dict):
             for entry in ledger.values():
-                if (isinstance(entry, dict)
-                        and str(entry.get("Difficulty") or "").casefold() == "normal"):
-                    entry["Difficulty"] = default_difficulty_for_dungeon(
-                        str(entry.get("Dungeon") or "Unknown Dungeon"))
+                if not isinstance(entry, dict):
+                    continue
+                current = str(entry.get("Difficulty") or "").casefold()
+                target = default_difficulty_for_dungeon(
+                    str(entry.get("Dungeon") or "Unknown Dungeon"))
+                if current == "normal" or (current == "stable" and target.casefold() != "stable"):
+                    entry["Difficulty"] = target
                     self.dirty = True
 
     def begin_log(self, path: str) -> None:
@@ -1273,6 +1290,18 @@ class FlexRecordStore:
             self._upsert_run(self.active_run_id, display, event.timestamp, "started", self._log_key())
         elif event.type == "room_end" and event.run_end_reason == "extraction":
             self.active_run_completed = True
+        elif is_boss_raid_completion(event) and self.active_run_id:
+            ledger = self.data["DungeonRunLedger"]
+            existing = ledger.get(self.active_run_id, {})
+            display = " - ".join(filter(None, (existing.get("Dungeon"), existing.get("Difficulty"))))
+            started_at = parse_timestamp(existing.get("StartedAt"))
+            duration_ms = (event.run_elapsed_ms if event.run_elapsed_ms is not None
+                           and event.run_elapsed_ms > 0 else
+                           max(0.0, (event.timestamp - started_at) * 1000.0))
+            self._upsert_run(self.active_run_id, display or "Unknown Dungeon", started_at, "extracted",
+                             self._log_key(), duration_ms, True)
+            self.active_run_completed = True
+            self.active_run_id = None
         elif event.type == "combat_end" and self.active_run_id:
             ledger = self.data["DungeonRunLedger"]
             existing = ledger.get(self.active_run_id, {})
@@ -1327,6 +1356,7 @@ class FlexRecordStore:
             start: CombatEvent | None = None
             end: CombatEvent | None = None
             completed_extraction = False
+            boss_raid_completed = False
             try:
                 with path.open("rb") as handle:
                     head = handle.read(256 * 1024)
@@ -1345,8 +1375,13 @@ class FlexRecordStore:
                         start = event
                     elif event.type == "room_end" and event.run_end_reason == "extraction":
                         completed_extraction = True
-                    elif event.type == "combat_end":
+                    elif is_boss_raid_completion(event):
+                        completed_extraction = True
+                        boss_raid_completed = True
                         end = event
+                    elif event.type == "combat_end":
+                        if not boss_raid_completed:
+                            end = event
             except (OSError, UnicodeError):
                 continue
             if start is None:
@@ -1356,7 +1391,8 @@ class FlexRecordStore:
             status = "started"
             if end is not None:
                 status = "extracted" if (
-                    completed_extraction and end.run_end_reason in {"extraction", "extracted"}) else (
+                    completed_extraction and (end.run_end_reason in {"extraction", "extracted"}
+                                              or is_boss_raid_completion(end))) else (
                     "abandoned" if end.run_end_reason == "abandoned" else "ended")
             duration_ms = max(0.0, (end.timestamp - start.timestamp) * 1000.0) if end else 0.0
             self._upsert_run(run_id, display, start.timestamp, status, str(path), duration_ms,
@@ -1424,7 +1460,7 @@ class FlexRecordStore:
         return mapping[actual_key]
 
     def apply(self, event: CombatEvent) -> None:
-        if event.type in {"combat_start", "room_end", "combat_end"}:
+        if event.type in {"combat_start", "encounter_end", "room_end", "combat_end"}:
             self._track_run_event(event)
             return
         if not is_own_event(event) or event.type not in {"damage", "heal"} or event.amount <= 0:
@@ -1716,8 +1752,12 @@ def historical_run_from_log(path: Path) -> dict[str, Any] | None:
                         party_size = 1
                 elif event.type == "room_end" and event.run_end_reason in {"extraction", "extracted"}:
                     extracted = True
-                elif event.type == "combat_end":
+                elif is_boss_raid_completion(event):
+                    extracted = True
                     end = event
+                elif event.type == "combat_end":
+                    if not (end is not None and is_boss_raid_completion(end)):
+                        end = event
                 if start is None or not is_own_event(event) or event.amount <= 0:
                     continue
                 if event.type == "damage":
@@ -1739,7 +1779,8 @@ def historical_run_from_log(path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
     if (start is None or end is None or not extracted
-            or end.run_end_reason not in {"extraction", "extracted"}):
+            or (end.run_end_reason not in {"extraction", "extracted"}
+                and not is_boss_raid_completion(end))):
         return None
     display = start.dungeon_name or map_name_from_log_path(str(path))
     dungeon, difficulty = split_dungeon_difficulty(display)
@@ -1831,6 +1872,8 @@ class LeaderboardRunTracker:
 
     def observe(self, root: dict[str, Any], raw: bytes, event: CombatEvent | None,
                 session_snapshot: dict[str, Any]) -> None:
+        if self.pending_finish is not None:
+            return
         self.digest = hashlib.sha256(self.digest + raw).digest()
         self.observed_bytes += len(raw) + 1
         if event is not None:
@@ -1863,7 +1906,10 @@ class LeaderboardRunTracker:
                 self._start_session()
             return
 
+        boss_raid_completed = is_boss_raid_completion(event)
         if event.type == "room_end" and event.run_end_reason in {"extraction", "extracted"}:
+            self.extracted = True
+        elif boss_raid_completed:
             self.extracted = True
 
         if self.run_active and is_own_event(event) and event.amount > 0:
@@ -1882,10 +1928,12 @@ class LeaderboardRunTracker:
             elif event.type == "shield":
                 self.total_shielding += event.amount
 
-        if event.type == "combat_end":
+        if event.type == "combat_end" and not self.run_active:
+            return
+        if event.type == "combat_end" or boss_raid_completed:
             self.run_active = False
-            extracted = (self.extracted
-                         and event.run_end_reason in {"extraction", "extracted"})
+            extracted = (boss_raid_completed or
+                         (self.extracted and event.run_end_reason in {"extraction", "extracted"}))
             run_time_ms = round(self.last_run_elapsed_ms or event.run_elapsed_ms or 0)
             run_time_ms = max(30_000, run_time_ms)
             combat_time_ms = round(float(session_snapshot.get("duration", 0.0)) * 1000.0)
@@ -2293,6 +2341,13 @@ class WindowsApi:
     VK_D = 0x44
     GWL_EXSTYLE = -20
     WS_EX_TRANSPARENT = 0x20
+    WS_EX_TOOLWINDOW = 0x80
+    WS_EX_APPWINDOW = 0x40000
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
 
     class RECT(ctypes.Structure):
         _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -2324,6 +2379,11 @@ class WindowsApi:
         self.user32.GetWindowLongW.restype = ctypes.c_long
         self.user32.SetWindowLongW.argtypes = [hwnd_type, ctypes.c_int, ctypes.c_long]
         self.user32.SetWindowLongW.restype = ctypes.c_long
+        self.user32.GetParent.argtypes = [hwnd_type]
+        self.user32.GetParent.restype = hwnd_type
+        self.user32.SetWindowPos.argtypes = [hwnd_type, hwnd_type, ctypes.c_int, ctypes.c_int,
+                                             ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        self.user32.SetWindowPos.restype = ctypes.c_bool
         self.user32.ShowWindow.argtypes = [hwnd_type, ctypes.c_int]
         self.user32.ShowWindow.restype = ctypes.c_bool
         self.user32.IsWindow.argtypes = [hwnd_type]
@@ -2368,6 +2428,22 @@ class WindowsApi:
         style = self.user32.GetWindowLongW(self.hwnd, self.GWL_EXSTYLE)
         new_style = style | self.WS_EX_TRANSPARENT if enabled else style & ~self.WS_EX_TRANSPARENT
         self.user32.SetWindowLongW(self.hwnd, self.GWL_EXSTYLE, new_style)
+
+    def ensure_taskbar_button(self) -> None:
+        """Keep the borderless Tk window visible in the Windows taskbar."""
+        if not self.available or not self.hwnd:
+            return
+        wrapper = self.user32.GetParent(self.hwnd)
+        taskbar_hwnd = int(wrapper) if wrapper else self.hwnd
+        style = self.user32.GetWindowLongW(taskbar_hwnd, self.GWL_EXSTYLE)
+        new_style = (style & ~self.WS_EX_TOOLWINDOW) | self.WS_EX_APPWINDOW
+        if new_style != style:
+            self.user32.SetWindowLongW(taskbar_hwnd, self.GWL_EXSTYLE, new_style)
+        self.user32.SetWindowPos(
+            taskbar_hwnd, None, 0, 0, 0, 0,
+            self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOZORDER |
+            self.SWP_NOACTIVATE | self.SWP_FRAMECHANGED,
+        )
 
     def minimize(self) -> None:
         if self.available and self.hwnd:
@@ -2529,6 +2605,7 @@ class MeterApp:
             except (AttributeError, OSError):
                 pass
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title("DPS Meter")
         self._load_app_icon()
         self.root.geometry(self._initial_geometry())
@@ -2566,6 +2643,9 @@ class MeterApp:
         if self.watcher.folder:
             self.settings.set("CombatLogFolder", str(self.watcher.folder))
         self.win = WindowsApi(self.root)
+        self.win.ensure_taskbar_button()
+        self.root.deiconify()
+        self.root.after(80, self.win.ensure_taskbar_button)
         self.find_and_follow(force=True)
         self.root.after(20, self.tick)
         if self.leaderboard_client.token and bool(self.settings.get("LeaderboardEnabled")):
@@ -4947,6 +5027,7 @@ class MeterApp:
         self.root.attributes("-topmost", False)
         self.root.overrideredirect(False)
         self.root.update_idletasks()
+        self.win.ensure_taskbar_button()
         self.root.iconify()
         self._restore_binding = self.root.bind("<Map>", self._restore_from_minimize, add="+")
 
@@ -4962,6 +5043,8 @@ class MeterApp:
             self._restore_binding = None
         self._minimized = False
         self.root.overrideredirect(True)
+        self.root.update_idletasks()
+        self.win.ensure_taskbar_button()
         self.root.attributes("-topmost", True)
         self.root.lift()
 
@@ -5067,6 +5150,7 @@ def run_self_test(log_path: str | None = None) -> int:
     assert map_name_from_log_path(
         r"C:\logs\dungeon__Virelda_Outskirts__1__2026-08-20_17-03-17Z.log"
     ) == "Virelda Outskirts"
+    assert split_dungeon_difficulty("Spectra Lair") == ("Spectra Lair", "Raid")
     event = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
         "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
@@ -5174,6 +5258,38 @@ def run_self_test(log_path: str | None = None) -> int:
     assert failed_finish[1].endswith("/finish")
     assert failed_finish[2] and failed_finish[2]["extracted"] is False
 
+    raid_client = StubLeaderboardClient()
+    raid_tracker = LeaderboardRunTracker(
+        raid_client, lambda: True, lambda _message: None, lambda: None)  # type: ignore[arg-type]
+
+    def track_raid(root: dict[str, Any], duration: float = 0.0) -> None:
+        raw = json.dumps(root, separators=(",", ":")).encode("utf-8")
+        raid_tracker.observe(root, raw, parse_combat_event(root), {"duration": duration})
+
+    track_raid({"event": "RUN_START", "sequence": 1, "run_elapsed_ms": 0,
+                "timestamp_utc": "2026-09-17T14:37:06Z",
+                "data": {"dungeon_display_name": "Spectra Lair", "party_size": 1}})
+    raid_start = raid_client.calls.pop(0)
+    assert raid_start[2] and raid_start[2]["difficulty"] == "Raid"
+    raid_start[3]({"sessionId": "raid-session"}, None)
+    raid_client.calls.pop(0)[3]({"accepted": True}, None)
+    track_raid({"event": "DAMAGE_DEALT", "sequence": 2, "run_elapsed_ms": 10_000,
+                "timestamp_utc": "2026-09-17T14:37:16Z",
+                "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
+                         "post_target_mitigation_amount": 500, "applied_amount": 500}})
+    track_raid({"event": "ENCOUNTER_END", "sequence": 3, "run_elapsed_ms": 523_000,
+                "timestamp_utc": "2026-09-17T14:45:49Z",
+                "data": {"encounter_subtype": "bossraid", "duration_ms": 522_001}},
+               duration=390.0)
+    raid_client.calls.pop(0)[3]({"accepted": True}, None)
+    raid_finish = raid_client.calls.pop(0)
+    assert raid_finish[1].endswith("/finish") and raid_finish[2]
+    assert raid_finish[2]["extracted"] is True and raid_finish[2]["runTimeMs"] == 523_000
+    raid_finish[3]({"leaderboardEligible": True}, None)
+    track_raid({"event": "RUN_END", "sequence": 4, "run_elapsed_ms": 600_000,
+                "timestamp_utc": "2026-09-17T14:47:06Z", "data": {"reason": "left_dungeon"}})
+    assert not raid_client.calls
+
     with tempfile.TemporaryDirectory(prefix="DpsMeterHistoryImportTest-") as folder:
         history_log = Path(folder) / "dungeon__Lunar_Plateau_-_Abyssal__1__2026-09-16_15-00-00Z.log"
         history_roots = [
@@ -5209,6 +5325,30 @@ def run_self_test(log_path: str | None = None) -> int:
         abandoned_log.write_text(
             "".join(json.dumps(root) + "\n" for root in abandoned_roots), encoding="utf-8")
         assert historical_run_from_log(abandoned_log) is None
+
+        spectra_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_14-37-06Z.log"
+        spectra_roots = [
+            {"event": "LOG_HEADER", "sequence": 1,
+             "data": {"format": "soulbound_combat_log", "client_version": "5.43.81"}},
+            {"event": "RUN_START", "sequence": 2, "run_elapsed_ms": 0,
+             "timestamp_utc": "2026-09-17T14:37:06Z",
+             "data": {"dungeon_display_name": "Spectra Lair", "party_size": 1}},
+            {"event": "ENCOUNTER_START", "sequence": 3, "run_elapsed_ms": 1_000,
+             "timestamp_utc": "2026-09-17T14:37:07Z",
+             "data": {"encounter_subtype": "bossraid"}},
+            {"event": "DAMAGE_DEALT", "sequence": 4, "run_elapsed_ms": 10_000,
+             "timestamp_utc": "2026-09-17T14:37:16Z",
+             "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
+                      "post_target_mitigation_amount": 500, "applied_amount": 500}},
+            {"event": "ENCOUNTER_END", "sequence": 5, "run_elapsed_ms": 523_000,
+             "timestamp_utc": "2026-09-17T14:45:49Z",
+             "data": {"encounter_subtype": "bossraid", "duration_ms": 522_001}},
+        ]
+        spectra_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in spectra_roots), encoding="utf-8")
+        spectra_history = historical_run_from_log(spectra_log)
+        assert spectra_history and spectra_history["dungeon"] == "Spectra Lair"
+        assert spectra_history["difficulty"] == "Raid" and spectra_history["runTimeMs"] == 523_000
 
     rewrite_events = [
         parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "RUN_START", "sequence": 10}),

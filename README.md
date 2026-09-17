@@ -32,6 +32,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Supports adjustable overlay opacity and optional AFK fading between dungeon runs.
 - Supports adjustable font size and remembers the resized window dimensions.
 - Includes a compact horizontal layout with its own remembered window size.
+- Keeps a normal Windows taskbar button while open, minimized, and restored.
 - Uses embedded branding and application icons in both downloads; no extra asset files are required.
 - Excludes overkill from live damage by default so totals match Gearforge, with an option to include it.
 - Can follow the Soulbound game window.
@@ -160,6 +161,7 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 
 - Rankings and player names are visible only after joining with a registered player name.
 - Only completed extractions are eligible. Abandoned, failed, ended-early, and incomplete runs are excluded.
+- Boss raids such as Spectra Lair are recognized from their `bossraid` completion event even when the game omits normal extraction events.
 - Live runs use periodic sequence/hash checkpoints to detect rewritten or recalculated logs.
 - Historical imports submit the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
 - Each player appears once per dungeon, difficulty, party-size, source, and ranking category using their best qualifying score.
