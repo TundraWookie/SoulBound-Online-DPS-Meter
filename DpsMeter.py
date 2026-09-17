@@ -42,14 +42,14 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
 LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev"
 LEADERBOARD_AUTO_REFRESH_MS = 120_000
 LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
-LEADERBOARD_HISTORY_VERSION = 3
+LEADERBOARD_HISTORY_VERSION = 4
 LEADERBOARD_CATEGORY_LABELS = {
     "Fastest Time": "time", "Total Damage": "total_damage", "DPS": "dps",
     "Best Damage · 30S": "best_30", "Highest Hit": "largest_hit",
@@ -472,7 +472,12 @@ def default_difficulty_for_dungeon(dungeon: str) -> str:
 
 def is_boss_raid_completion(event: "CombatEvent") -> bool:
     """Boss raids finish at ENCOUNTER_END and may omit ROOM_END/RUN_END."""
-    return event.type == "encounter_end" and event.room_subtype == "bossraid"
+    failure_reasons = {
+        "abandoned", "died", "death", "failed", "failure", "wipe", "wiped",
+        "defeat", "defeated", "left_dungeon", "client_exit", "session_changed",
+    }
+    return (event.type == "encounter_end" and event.room_subtype == "bossraid"
+            and event.run_end_reason not in failure_reasons)
 
 
 def is_unknown_ability(name: str | None) -> bool:
@@ -1788,12 +1793,14 @@ def historical_run_from_log(path: Path) -> dict[str, Any] | None:
         end.run_elapsed_ms
         if end.run_elapsed_ms is not None and end.run_elapsed_ms > 0
         else max(0.0, (end.timestamp - start.timestamp) * 1000.0))
-    if run_time_ms < 30_000 or run_time_ms > 28_800_000:
-        return None
     fallback_combat_ms = ((last_combat_at - first_combat_at) * 1000.0
                           if first_combat_at is not None and last_combat_at is not None else 0.0)
     combat_time_ms = round(combat_clock_ms or fallback_combat_ms)
     combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
+    if is_boss_raid_completion(end):
+        run_time_ms = combat_time_ms
+    if run_time_ms < 30_000 or run_time_ms > 28_800_000:
+        return None
     return {
         "dungeon": dungeon,
         "difficulty": difficulty,
@@ -1938,6 +1945,8 @@ class LeaderboardRunTracker:
             run_time_ms = max(30_000, run_time_ms)
             combat_time_ms = round(float(session_snapshot.get("duration", 0.0)) * 1000.0)
             combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
+            if boss_raid_completed:
+                run_time_ms = max(30_000, combat_time_ms)
             self.pending_finish = {
                 "extracted": extracted,
                 "runTimeMs": run_time_ms,
@@ -5284,7 +5293,8 @@ def run_self_test(log_path: str | None = None) -> int:
     raid_client.calls.pop(0)[3]({"accepted": True}, None)
     raid_finish = raid_client.calls.pop(0)
     assert raid_finish[1].endswith("/finish") and raid_finish[2]
-    assert raid_finish[2]["extracted"] is True and raid_finish[2]["runTimeMs"] == 523_000
+    assert raid_finish[2]["extracted"] is True and raid_finish[2]["runTimeMs"] == 390_000
+    assert raid_finish[2]["runTimeMs"] == raid_finish[2]["combatTimeMs"]
     raid_finish[3]({"leaderboardEligible": True}, None)
     track_raid({"event": "RUN_END", "sequence": 4, "run_elapsed_ms": 600_000,
                 "timestamp_utc": "2026-09-17T14:47:06Z", "data": {"reason": "left_dungeon"}})
@@ -5336,19 +5346,37 @@ def run_self_test(log_path: str | None = None) -> int:
             {"event": "ENCOUNTER_START", "sequence": 3, "run_elapsed_ms": 1_000,
              "timestamp_utc": "2026-09-17T14:37:07Z",
              "data": {"encounter_subtype": "bossraid"}},
-            {"event": "DAMAGE_DEALT", "sequence": 4, "run_elapsed_ms": 10_000,
-             "timestamp_utc": "2026-09-17T14:37:16Z",
-             "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
-                      "post_target_mitigation_amount": 500, "applied_amount": 500}},
-            {"event": "ENCOUNTER_END", "sequence": 5, "run_elapsed_ms": 523_000,
-             "timestamp_utc": "2026-09-17T14:45:49Z",
-             "data": {"encounter_subtype": "bossraid", "duration_ms": 522_001}},
         ]
+        spectra_roots.extend({
+            "event": "DAMAGE_DEALT", "sequence": second + 2,
+            "run_elapsed_ms": second * 1_000,
+            "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
+                     "post_target_mitigation_amount": 10, "applied_amount": 10},
+        } for second in range(2, 42))
+        spectra_roots.append({
+            "event": "ENCOUNTER_END", "sequence": 44, "run_elapsed_ms": 43_000,
+            "timestamp_utc": "2026-09-17T14:37:49Z",
+            "data": {"encounter_subtype": "bossraid", "duration_ms": 42_000},
+        })
         spectra_log.write_text(
             "".join(json.dumps(root) + "\n" for root in spectra_roots), encoding="utf-8")
         spectra_history = historical_run_from_log(spectra_log)
         assert spectra_history and spectra_history["dungeon"] == "Spectra Lair"
-        assert spectra_history["difficulty"] == "Raid" and spectra_history["runTimeMs"] == 523_000
+        assert spectra_history["difficulty"] == "Raid" and spectra_history["runTimeMs"] == 42_000
+        assert spectra_history["runTimeMs"] == spectra_history["combatTimeMs"]
+
+        abandoned_spectra_log = Path(folder) / "dungeon__Spectra_Lair__2__2026-09-17_16-20-08Z.log"
+        abandoned_spectra_roots = json.loads(json.dumps(spectra_roots))
+        abandoned_spectra_roots[-1]["data"]["reason"] = "abandoned"
+        abandoned_spectra_roots.extend([
+            {"event": "ROOM_END", "sequence": 45, "run_elapsed_ms": 43_000,
+             "data": {"encounter_subtype": "bossraid", "reason": "abandoned"}},
+            {"event": "RUN_END", "sequence": 46, "run_elapsed_ms": 43_000,
+             "data": {"reason": "abandoned", "completed": False}},
+        ])
+        abandoned_spectra_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in abandoned_spectra_roots), encoding="utf-8")
+        assert historical_run_from_log(abandoned_spectra_log) is None
 
     rewrite_events = [
         parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "RUN_START", "sequence": 10}),
