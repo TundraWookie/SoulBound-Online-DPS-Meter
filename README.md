@@ -25,6 +25,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Imports existing combat logs once and keeps a permanent duplicate-prevention ledger in `records.txt`.
 - Shows a room timeline below the ability list with readable combat-only checkpoint times in both normal and compact layouts.
 - Includes a community **Ranks** tab for fastest completed runs, damage, DPS, healing, shielding, and other categories.
+- Shows every returned leaderboard result in a scrollable, color-coded table, grouped by dungeon and difficulty, with your personal best beside the leading score.
 - Excludes abandoned, failed, incomplete, and edited live runs from leaderboard rankings.
 - Checks GitHub Releases on startup and asks before downloading and installing a newer version.
 - Supports custom menu colors.
@@ -161,7 +162,8 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - Live runs use periodic sequence/hash checkpoints to detect rewritten or recalculated logs.
 - Historical imports submit the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
 - Each player appears once per dungeon, difficulty, party-size, source, and ranking category using their best qualifying score.
-- Leaderboard results refresh every 30 seconds while the Ranks tab is open, or immediately when **Refresh** is selected.
+- Leaderboard results refresh every 2 minutes while the Ranks tab is open, immediately after your completed run is accepted, or whenever **Refresh** is selected.
+- Dungeon catalog results are cached for six hours and live-run integrity checkpoints are sent once per minute to keep community Cloudflare usage within the free allowance.
 - Difficulty order is Stable, Unstable, Fractured, Collapsing, Shattered, Abyssal, then Raid.
 
 ## Controls
@@ -243,6 +245,10 @@ python -m tkinter
 ### Windows warns about the EXE
 
 Community builds may be unsigned. Confirm that the file came from this repository's Releases page. If you do not want to run the EXE, use the readable Python version instead.
+
+### Leaderboard connection fails
+
+The meter writes privacy-safe connection diagnostics to `leaderboard-errors.log` beside the program. If that folder is not writable, the log is stored at `%LOCALAPPDATA%\SoulboundMeter\leaderboard-errors.log`. Attach that file when reporting the problem; authentication tokens and submitted run data are not recorded.
 
 ## Current Limitations
 

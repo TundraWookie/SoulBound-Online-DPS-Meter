@@ -15,9 +15,11 @@ import ctypes
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -34,13 +36,19 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
+try:
+    import certifi as _certifi
+except ImportError:
+    _certifi = None
 
-VERSION = "0.9.1"
+
+VERSION = "0.9.2"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
 LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev"
-LEADERBOARD_AUTO_REFRESH_MS = 30_000
+LEADERBOARD_AUTO_REFRESH_MS = 120_000
+LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
 LEADERBOARD_HISTORY_VERSION = 3
 LEADERBOARD_CATEGORY_LABELS = {
     "Fastest Time": "time", "Total Damage": "total_damage", "DPS": "dps",
@@ -54,6 +62,19 @@ LEADERBOARD_PARTY_LABELS = {
 LEADERBOARD_SOURCE_LABELS = {"Live Captured": "live", "Imported History": "imported"}
 ALL_DUNGEONS = "All Dungeons"
 ALL_DIFFICULTIES = "All Difficulties"
+
+
+def leaderboard_ssl_context() -> ssl.SSLContext:
+    """Use Windows trust plus a packaged current CA set when available."""
+    context = ssl.create_default_context()
+    if _certifi is not None:
+        try:
+            context.load_verify_locations(cafile=_certifi.where())
+        except (OSError, ssl.SSLError):
+            pass
+    return context
+
+
 KNOWN_DUNGEON_DIFFICULTIES = {
     "Abyssal Raid": ("Raid",),
     "Virelda Arena": ("Stable",),
@@ -79,6 +100,50 @@ SCRIPT_DIR = (Path(sys.executable).resolve().parent
               if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", SCRIPT_DIR))
+LEADERBOARD_ERROR_LOG_PATH = SCRIPT_DIR / "leaderboard-errors.log"
+
+
+def write_leaderboard_error_log(method: str, path: str, error: BaseException,
+                                log_path: Path | None = None) -> Path | None:
+    """Write connection diagnostics without recording tokens or request bodies."""
+    reason = getattr(error, "reason", error)
+    target = log_path or LEADERBOARD_ERROR_LOG_PATH
+    local_now = datetime.now().astimezone()
+    try:
+        trusted_roots = len(leaderboard_ssl_context().get_ca_certs())
+    except (OSError, ssl.SSLError):
+        trusted_roots = -1
+    lines = [
+        "=" * 72,
+        f"UTC time: {datetime.now(timezone.utc).isoformat()}",
+        f"Local time: {local_now.isoformat()}",
+        f"Version: {VERSION}",
+        f"Frozen EXE: {bool(getattr(sys, 'frozen', False))}",
+        f"Operating system: {platform.platform()}",
+        f"Python: {sys.version.split()[0]}",
+        f"OpenSSL: {ssl.OPENSSL_VERSION}",
+        f"Request: {method.upper()} {urllib.parse.urljoin(LEADERBOARD_API_URL, path)}",
+        f"Exception: {type(error).__name__}: {error}",
+        f"Reason: {type(reason).__name__}: {reason}",
+        f"SSL verify code: {getattr(reason, 'verify_code', 'unavailable')}",
+        f"SSL verify message: {getattr(reason, 'verify_message', 'unavailable')}",
+        f"Bundled CA available: {_certifi is not None}",
+        f"Trusted CA certificates loaded: {trusted_roots}",
+        "",
+    ]
+    candidates = (target, LOCAL_APP_DATA / "SoulboundMeter" / target.name)
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            if candidate.exists() and candidate.stat().st_size >= 512 * 1024:
+                previous = candidate.with_name("leaderboard-errors.previous.log")
+                os.replace(candidate, previous)
+            with candidate.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
+            return candidate
+        except OSError:
+            continue
+    return None
 SETTINGS_PATH = LOCAL_APP_DATA / "SoulboundMeter" / "settings.json"
 BRAND_ANIMATION_FRAME_COUNT = 30
 
@@ -1550,7 +1615,8 @@ class LeaderboardClient:
                 headers["Authorization"] = f"Bearer {self.token}"
             request = urllib.request.Request(LEADERBOARD_API_URL + path, data=encoded,
                                              headers=headers, method=method)
-            with urllib.request.urlopen(request, timeout=12) as response:
+            with urllib.request.urlopen(
+                    request, timeout=12, context=leaderboard_ssl_context()) as response:
                 decoded = json.loads(response.read().decode("utf-8"))
             if isinstance(decoded, dict):
                 data = decoded
@@ -1564,7 +1630,10 @@ class LeaderboardClient:
                 error_message = f"Leaderboard error {error.code}"
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             reason = getattr(error, "reason", error)
-            error_message = f"Cannot reach leaderboard: {reason}"
+            diagnostic_path = write_leaderboard_error_log(method, path, error)
+            diagnostic_note = (f" See {diagnostic_path.name} for details."
+                               if diagnostic_path is not None else "")
+            error_message = f"Cannot reach leaderboard: {reason}.{diagnostic_note}"
         except (RuntimeError, json.JSONDecodeError, UnicodeError) as error:
             error_message = str(error)
         return data, error_message
@@ -1704,7 +1773,11 @@ def historical_run_from_log(path: Path) -> dict[str, Any] | None:
 class LeaderboardRunTracker:
     """Builds live hash checkpoints and submits only completed extractions."""
 
-    CHECKPOINT_SECONDS = 15.0
+    # One minute still gives normal runs many integrity checkpoints without
+    # consuming the community Cloudflare allowance every fifteen seconds.
+    CHECKPOINT_SECONDS = 60.0
+    RETRY_INITIAL_SECONDS = 5.0
+    RETRY_MAX_SECONDS = 120.0
 
     def __init__(self, client: LeaderboardClient, enabled: Callable[[], bool],
                  status_callback: Callable[[str], None], submitted_callback: Callable[[], None]) -> None:
@@ -1728,6 +1801,7 @@ class LeaderboardRunTracker:
         self.last_checkpoint_hash = ""
         self.next_checkpoint_at = 0.0
         self.retry_at = 0.0
+        self.retry_delay = self.RETRY_INITIAL_SECONDS
         self.last_sequence = 0
         self.last_run_elapsed_ms = 0
         self.dungeon = "Unknown Dungeon"
@@ -1742,6 +1816,14 @@ class LeaderboardRunTracker:
         self.best_damage_30 = 0.0
         self.pending_finish: dict[str, Any] | None = None
         self.invalidated = False
+
+    def _schedule_retry(self) -> None:
+        self.retry_at = time.monotonic() + self.retry_delay
+        self.retry_delay = min(self.RETRY_MAX_SECONDS, self.retry_delay * 2.0)
+
+    def _clear_retry(self) -> None:
+        self.retry_at = 0.0
+        self.retry_delay = self.RETRY_INITIAL_SECONDS
 
     @property
     def chain_hash(self) -> str:
@@ -1849,11 +1931,11 @@ class LeaderboardRunTracker:
                 return
             self.starting = False
             if error_message or not data or not data.get("sessionId"):
-                self.retry_at = time.monotonic() + 5.0
+                self._schedule_retry()
                 self.status_callback(error_message or "Could not open leaderboard session.")
                 return
             self.session_id = str(data["sessionId"])
-            self.retry_at = 0.0
+            self._clear_retry()
             self.status_callback("Live run connected")
             self._send_checkpoint()
 
@@ -1891,13 +1973,13 @@ class LeaderboardRunTracker:
                 return
             self.checkpoint_inflight = False
             if error_message:
-                self.retry_at = time.monotonic() + 5.0
+                self._schedule_retry()
                 self.next_checkpoint_at = self.retry_at
                 self.status_callback(error_message)
                 return
             self.checkpoints_sent = ordinal
             self.last_checkpoint_hash = str(body["chainHash"])
-            self.retry_at = 0.0
+            self._clear_retry()
             self.next_checkpoint_at = time.monotonic() + self.CHECKPOINT_SECONDS
             if self.pending_finish is not None:
                 self._ensure_finish()
@@ -1930,11 +2012,11 @@ class LeaderboardRunTracker:
                 return
             self.finish_inflight = False
             if error_message:
-                self.retry_at = time.monotonic() + 5.0
+                self._schedule_retry()
                 self.status_callback(error_message)
                 return
             self.pending_finish = None
-            self.retry_at = 0.0
+            self._clear_retry()
             if data and data.get("leaderboardEligible"):
                 self.status_callback("Run submitted to leaderboard")
                 self.submitted_callback()
@@ -2369,6 +2451,7 @@ class MeterApp:
             unprotect_secret(self.settings.get("LeaderboardTokenProtected")))
         self.leaderboard_status = "Join to submit completed runs"
         self.leaderboard_entries: list[dict[str, Any]] = []
+        self.leaderboard_personal_entries: list[dict[str, Any]] = []
         self.leaderboard_loading = False
         self.leaderboard_refresh_pending = False
         self.leaderboard_auto_refresh_job: str | None = None
@@ -2547,6 +2630,26 @@ class MeterApp:
 
     def role(self, widget: tk.Widget, background: str | None = None, foreground: str | None = None) -> tk.Widget:
         self.theme_roles.append((widget, background, foreground))
+        colors = getattr(self, "colors", None)
+        if colors:
+            try:
+                options: dict[str, Any] = {}
+                if background:
+                    options["background"] = colors[background]
+                    if isinstance(widget, (tk.Button, tk.Checkbutton, tk.Scale)):
+                        options["activebackground"] = colors[background]
+                    if isinstance(widget, tk.Checkbutton):
+                        options["selectcolor"] = colors["panel"]
+                    if (isinstance(widget, tk.Frame)
+                            and int(widget.cget("highlightthickness") or 0) > 0):
+                        options["highlightbackground"] = colors["border"]
+                if foreground and not isinstance(widget, tk.Frame):
+                    options["foreground"] = colors[foreground]
+                    if isinstance(widget, (tk.Button, tk.Checkbutton, tk.Scale)):
+                        options["activeforeground"] = colors[foreground]
+                widget.configure(**options)
+            except (tk.TclError, TypeError, KeyError):
+                pass
         return widget
 
     def label(self, parent: tk.Misc, text: str = "", size: int = 10, weight: str = "normal",
@@ -2887,6 +2990,7 @@ class MeterApp:
         self.label(filter_body, "DIFFICULTY", 6, "bold", "muted").grid(row=0, column=1, sticky="w", padx=(7, 0))
         self.leaderboard_catalog: list[tuple[str, str]] = []
         self.leaderboard_catalog_loading = False
+        self.leaderboard_catalog_refreshed_at: dict[str, float] = {}
         self.leaderboard_dungeon_var = tk.StringVar(
             value=str(self.settings.get("LeaderboardDungeon") or ALL_DUNGEONS))
         self.leaderboard_difficulty_var = tk.StringVar(
@@ -2967,32 +3071,52 @@ class MeterApp:
         table = self.panel(self.leaderboard_view)
         table.pack(fill="both", expand=True)
         table_header = self.role(tk.Frame(table), "panel", None)
-        table_header.pack(fill="x", padx=7, pady=(6, 3))
-        self.label(table_header, "#", 6, "bold", "muted", width=3, anchor="w").pack(side="left")
+        table_header.pack(fill="x", padx=(7, 15), pady=(6, 3))
+        for column, weight, minimum in ((0, 0, 18), (1, 3, 95), (2, 2, 72),
+                                        (3, 0, 62), (4, 0, 65), (5, 0, 65)):
+            table_header.grid_columnconfigure(column, weight=weight, minsize=minimum)
+        self.label(table_header, "#", 6, "bold", "red", anchor="w").grid(
+            row=0, column=0, sticky="ew")
+        self.leaderboard_dungeon_heading = self.label(
+            table_header, "DUNGEON", 6, "bold", "green", anchor="w")
+        self.leaderboard_dungeon_heading.grid(row=0, column=1, sticky="ew")
         self.leaderboard_name_heading = self.label(
-            table_header, "PLAYER", 6, "bold", "muted", anchor="w")
-        self.leaderboard_name_heading.pack(side="left", fill="x", expand=True)
+            table_header, "PLAYER", 6, "bold", "text", anchor="w")
+        self.leaderboard_name_heading.grid(row=0, column=2, sticky="ew", padx=(4, 0))
         self.leaderboard_party_heading = self.label(
-            table_header, "PARTY", 6, "bold", "muted", width=9, anchor="center")
-        self.leaderboard_party_heading.pack(side="left")
-        self.leaderboard_score_heading = self.label(table_header, "TIME", 6, "bold", "muted", width=12, anchor="e")
-        self.leaderboard_score_heading.pack(side="right")
+            table_header, "PARTY", 6, "bold", "purple", anchor="w")
+        self.leaderboard_party_heading.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        self.leaderboard_personal_heading = self.label(
+            table_header, "YOUR BEST", 6, "bold", "blue", anchor="e")
+        self.leaderboard_personal_heading.grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        self.leaderboard_score_heading = self.label(
+            table_header, "TIME", 6, "bold", "orange", anchor="e")
+        self.leaderboard_score_heading.grid(row=0, column=5, sticky="ew", padx=(4, 0))
+
+        leaderboard_scroll_host = self.role(tk.Frame(table), "panel", None)
+        leaderboard_scroll_host.pack(fill="both", expand=True)
+        self.leaderboard_canvas = self.role(
+            tk.Canvas(leaderboard_scroll_host, borderwidth=0, highlightthickness=0),
+            "panel", None)
+        self.leaderboard_scrollbar = self.role(
+            tk.Scrollbar(leaderboard_scroll_host, orient="vertical", width=8,
+                         command=self.leaderboard_canvas.yview),
+            "panel", None)
+        self.leaderboard_canvas.configure(yscrollcommand=self.leaderboard_scrollbar.set)
+        self.leaderboard_scrollbar.pack(side="right", fill="y")
+        self.leaderboard_canvas.pack(side="left", fill="both", expand=True)
+        self.leaderboard_body = self.role(tk.Frame(self.leaderboard_canvas), "panel", None)
+        self.leaderboard_body_window = self.leaderboard_canvas.create_window(
+            (0, 0), window=self.leaderboard_body, anchor="nw")
+        self.leaderboard_body.bind("<Configure>", self._sync_leaderboard_scroll_region)
+        self.leaderboard_canvas.bind("<Configure>", self._size_leaderboard_body)
+        self.leaderboard_canvas.bind("<MouseWheel>", self._scroll_leaderboard, add="+")
+        self.leaderboard_body.bind("<MouseWheel>", self._scroll_leaderboard, add="+")
         self.leaderboard_rows: list[dict[str, tk.Widget]] = []
-        for index in range(10):
-            row = self.role(tk.Frame(table), "panel", None)
-            row.pack(fill="x", padx=7, pady=1)
-            rank = self.label(row, str(index + 1), 8, "bold", "muted", width=3, anchor="w")
-            rank.pack(side="left")
-            player = self.label(row, "—", 8, foreground="text", anchor="w")
-            player.pack(side="left", fill="x", expand=True)
-            party = self.label(row, "—", 7, foreground="muted", width=9, anchor="center")
-            party.pack(side="left")
-            score = self.label(row, "—", 8, "bold", "accent", width=12, anchor="e")
-            score.pack(side="right")
-            self.leaderboard_rows.append({"frame": row, "rank": rank, "player": player,
-                                          "party": party, "score": score})
-        self.leaderboard_empty_label = self.label(table, "No scores found for these filters.", 8,
-                                                   foreground="muted")
+        self._ensure_leaderboard_row_capacity(10)
+        self.leaderboard_empty_label = self.label(
+            self.leaderboard_body, "No scores found for these filters.", 8,
+            foreground="muted")
         self.leaderboard_empty_label.pack(pady=12)
         self.leaderboard_note = self.label(
             self.leaderboard_view,
@@ -3681,7 +3805,7 @@ class MeterApp:
                 f"History scan: {imported} imported · {duplicate} already added")
             self.leaderboard_source_var.set("Imported History")
             self.settings.set("LeaderboardSource", "imported")
-            self.refresh_leaderboard_catalog()
+            self.refresh_leaderboard_catalog(force=True)
             self.refresh_leaderboard()
 
         threading.Thread(target=worker, name="SoulboundHistoryImport", daemon=True).start()
@@ -3754,28 +3878,35 @@ class MeterApp:
     def _leaderboard_dungeon_changed(self, _value: str | None = None) -> None:
         self.leaderboard_difficulty_var.set(ALL_DIFFICULTIES)
         self._update_leaderboard_filter_menus()
+        self.leaderboard_canvas.yview_moveto(0)
         self.refresh_leaderboard()
 
     def _leaderboard_filter_changed(self, _value: str | None = None) -> None:
+        self.leaderboard_canvas.yview_moveto(0)
         self.refresh_leaderboard()
 
     def _leaderboard_source_changed(self, _value: str | None = None) -> None:
+        self.leaderboard_canvas.yview_moveto(0)
         self.refresh_leaderboard_catalog()
         self.refresh_leaderboard()
 
-    def refresh_leaderboard_catalog(self) -> None:
+    def refresh_leaderboard_catalog(self, force: bool = False) -> None:
         if not hasattr(self, "leaderboard_dungeon_menu"):
             return
         self._update_leaderboard_filter_menus()
         if self.leaderboard_catalog_loading:
             return
-        self.leaderboard_catalog_loading = True
         source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+        refreshed_at = self.leaderboard_catalog_refreshed_at.get(source, 0.0)
+        if not force and time.monotonic() - refreshed_at < LEADERBOARD_CATALOG_CACHE_SECONDS:
+            return
+        self.leaderboard_catalog_loading = True
 
         def complete(data: dict[str, Any] | None, _error_message: str | None) -> None:
             self.leaderboard_catalog_loading = False
             entries = data.get("entries") if isinstance(data, dict) else None
             if isinstance(entries, list):
+                self.leaderboard_catalog_refreshed_at[source] = time.monotonic()
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
@@ -3795,15 +3926,60 @@ class MeterApp:
         self.leaderboard_client.request("GET", path, None, complete)
 
     @staticmethod
-    def _leaderboard_score(entry: dict[str, Any], category: str) -> str:
-        if category == "time":
-            return format_duration_ms(entry.get("run_time_ms"))
+    def _leaderboard_value(entry: dict[str, Any], category: str) -> float:
         keys = {
-            "total_damage": "total_damage", "dps": "avg_dps", "best_30": "best_damage_30",
+            "time": "run_time_ms", "total_damage": "total_damage", "dps": "avg_dps",
+            "best_30": "best_damage_30",
             "largest_hit": "largest_hit", "healing": "total_healing", "shielding": "total_shielding",
         }
-        value = float(entry.get(keys.get(category, "total_damage"), 0) or 0)
+        return float(entry.get(keys.get(category, "total_damage"), 0) or 0)
+
+    @classmethod
+    def _leaderboard_score(cls, entry: dict[str, Any], category: str) -> str:
+        value = cls._leaderboard_value(entry, category)
+        if category == "time":
+            return format_duration_ms(value)
         return f"{format_number(value)} DPS" if category == "dps" else format_number(value)
+
+    def _ensure_leaderboard_row_capacity(self, count: int) -> None:
+        while len(self.leaderboard_rows) < count:
+            index = len(self.leaderboard_rows)
+            row = self.role(tk.Frame(self.leaderboard_body), "panel", None)
+            for column, weight, minimum in ((0, 0, 18), (1, 3, 95), (2, 2, 72),
+                                            (3, 0, 62), (4, 0, 65), (5, 0, 65)):
+                row.grid_columnconfigure(column, weight=weight, minsize=minimum)
+            rank = self.label(row, str(index + 1), 8, "bold", "red", anchor="w")
+            rank.grid(row=0, column=0, sticky="ew")
+            dungeon = self.label(row, "—", 8, "bold", "green", anchor="w")
+            dungeon.grid(row=0, column=1, sticky="ew")
+            player = self.label(row, "—", 8, foreground="text", anchor="w")
+            player.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+            party = self.label(row, "—", 7, "bold", "purple", anchor="w")
+            party.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+            personal = self.label(row, "—", 8, "bold", "blue", anchor="e")
+            personal.grid(row=0, column=4, sticky="ew", padx=(4, 0))
+            score = self.label(row, "—", 8, "bold", "orange", anchor="e")
+            score.grid(row=0, column=5, sticky="ew", padx=(4, 0))
+            widgets = (row, rank, dungeon, player, party, personal, score)
+            for widget in widgets:
+                widget.bind("<MouseWheel>", self._scroll_leaderboard, add="+")
+            self.leaderboard_rows.append({"frame": row, "rank": rank, "dungeon": dungeon,
+                                          "player": player, "party": party,
+                                          "personal": personal, "score": score})
+
+    def _sync_leaderboard_scroll_region(self, _event: tk.Event | None = None) -> None:
+        bounds = self.leaderboard_canvas.bbox("all")
+        if bounds is not None:
+            self.leaderboard_canvas.configure(scrollregion=bounds)
+
+    def _size_leaderboard_body(self, event: tk.Event) -> None:
+        self.leaderboard_canvas.itemconfigure(
+            self.leaderboard_body_window, width=max(1, event.width))
+
+    def _scroll_leaderboard(self, event: tk.Event) -> str:
+        direction = -1 if event.delta > 0 else 1
+        self.leaderboard_canvas.yview_scroll(direction * 3, "units")
+        return "break"
 
     def _render_leaderboard(self) -> None:
         category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
@@ -3817,25 +3993,71 @@ class MeterApp:
             "time": "TIME", "total_damage": "DAMAGE", "dps": "DPS", "best_30": "BEST 30S",
             "largest_hit": "HIGHEST HIT", "healing": "HEALING", "shielding": "SHIELDING",
         }
-        self.leaderboard_score_heading.configure(text=headings.get(category, "SCORE"))
-        self.leaderboard_name_heading.configure(text="DUNGEON · PLAYER" if overview else "PLAYER")
-        self.leaderboard_party_heading.configure(text="DIFFICULTY" if overview else "PARTY")
-        visible_limit = 6 if self.compact_mode else 10
+        self.leaderboard_score_heading.configure(
+            text=headings.get(category, "SCORE"), foreground=self.colors["orange"])
+        self.leaderboard_dungeon_heading.configure(
+            text="DUNGEON", foreground=self.colors["green"])
+        self.leaderboard_name_heading.configure(text="PLAYER", foreground=self.colors["text"])
+        self.leaderboard_party_heading.configure(
+            text="DIFFICULTY" if overview else "PARTY", foreground=self.colors["purple"])
+        self.leaderboard_personal_heading.configure(
+            text="YOUR BEST", foreground=self.colors["blue"])
+        personal_by_pair = {
+            (str(entry.get("dungeon") or "").casefold(),
+             str(entry.get("difficulty") or "").casefold()): entry
+            for entry in self.leaderboard_personal_entries
+        }
+        display_entries = list(self.leaderboard_entries)
+        if overview:
+            difficulty_order = {
+                name.casefold(): index for index, name in enumerate(
+                    ("Stable", "Unstable", "Fractured", "Collapsing",
+                     "Shattered", "Abyssal", "Raid"))
+            }
+            display_entries.sort(key=lambda entry: (
+                str(entry.get("dungeon") or "Unknown").casefold(),
+                difficulty_order.get(
+                    str(entry.get("difficulty") or "").casefold(), 99),
+                str(entry.get("difficulty") or "").casefold(),
+                int(entry.get("rank", 0) or 0),
+            ))
+        self._ensure_leaderboard_row_capacity(max(10, len(display_entries)))
         for index, row in enumerate(self.leaderboard_rows):
-            if index < len(self.leaderboard_entries) and index < visible_limit:
-                entry = self.leaderboard_entries[index]
+            if index < len(display_entries):
+                entry = display_entries[index]
                 if not row["frame"].winfo_manager():
                     row["frame"].pack(fill="x", padx=7, pady=1)
-                row["rank"].configure(text=str(entry.get("rank", index + 1)))
+                displayed_rank = (index + 1 if overview else
+                                  int(entry.get("rank", index + 1) or index + 1))
                 player = str(entry.get("display_name") or "Unknown")
+                dungeon = str(entry.get("dungeon") or "Unknown")
+                row["rank"].configure(
+                    text=str(displayed_rank), foreground=self.colors["red"])
+                row["dungeon"].configure(
+                    text=dungeon, foreground=self.colors["green"])
+                row["player"].configure(
+                    text=player, foreground=self.colors["text"])
                 if overview:
-                    dungeon = str(entry.get("dungeon") or "Unknown")
-                    row["player"].configure(text=f"{dungeon} · {player}")
-                    row["party"].configure(text=str(entry.get("difficulty") or "—"))
+                    difficulty = str(entry.get("difficulty") or "—")
+                    row["party"].configure(
+                        text=difficulty, foreground=self.colors["purple"])
                 else:
-                    row["player"].configure(text=player)
-                    row["party"].configure(text=str(entry.get("party_size") or "—"))
-                row["score"].configure(text=self._leaderboard_score(entry, category))
+                    row["party"].configure(
+                        text=str(entry.get("party_size") or "—"),
+                        foreground=self.colors["purple"])
+                pair = (str(entry.get("dungeon") or "").casefold(),
+                        str(entry.get("difficulty") or "").casefold())
+                personal_entry = personal_by_pair.get(pair)
+                if personal_entry is None:
+                    row["personal"].configure(
+                        text="—", foreground=self.colors["blue"])
+                else:
+                    personal_score = self._leaderboard_score(personal_entry, category)
+                    row["personal"].configure(
+                        text=personal_score, foreground=self.colors["blue"])
+                row["score"].configure(
+                    text=self._leaderboard_score(entry, category),
+                    foreground=self.colors["orange"])
             else:
                 row["frame"].pack_forget()
         if self.leaderboard_entries:
@@ -3876,6 +4098,10 @@ class MeterApp:
                 entries = data.get("entries")
                 self.leaderboard_entries = [entry for entry in entries if isinstance(entry, dict)] \
                     if isinstance(entries, list) else []
+                personal_entries = data.get("personalEntries")
+                self.leaderboard_personal_entries = [entry for entry in personal_entries
+                                                     if isinstance(entry, dict)] \
+                    if isinstance(personal_entries, list) else []
                 self._set_leaderboard_status(
                     f"{len(self.leaderboard_entries)} score{'s' if len(self.leaderboard_entries) != 1 else ''} found")
                 self._render_leaderboard()
@@ -3884,7 +4110,8 @@ class MeterApp:
                 self.root.after_idle(self.refresh_leaderboard)
 
         path = "/v1/leaderboards?" + urllib.parse.urlencode(query)
-        self.leaderboard_client.request("GET", path, None, complete)
+        self.leaderboard_client.request(
+            "GET", path, None, complete, authenticated=bool(self.leaderboard_client.token))
 
     def _schedule_leaderboard_auto_refresh(self) -> None:
         if self.leaderboard_auto_refresh_job is not None:
@@ -3901,7 +4128,6 @@ class MeterApp:
         self.leaderboard_auto_refresh_job = None
         if self.current_view != "leaderboard" or self.closed:
             return
-        self.refresh_leaderboard_catalog()
         self.refresh_leaderboard()
         self._schedule_leaderboard_auto_refresh()
 
@@ -4958,6 +5184,19 @@ def run_self_test(log_path: str | None = None) -> int:
         watcher.poll()
         assert watcher_session.snapshot()["damage"] == 30 and len(selected_logs) == 1
 
+    with tempfile.TemporaryDirectory(prefix="DpsMeterLeaderboardErrorTest-") as folder:
+        diagnostic_path = Path(folder) / "leaderboard-errors.log"
+        certificate_error = ssl.SSLCertVerificationError(
+            1, "certificate verify failed: unable to get local issuer certificate")
+        written_path = write_leaderboard_error_log(
+            "GET", "/v1/leaderboards?source=live",
+            urllib.error.URLError(certificate_error), diagnostic_path)
+        assert written_path == diagnostic_path
+        diagnostic = diagnostic_path.read_text(encoding="utf-8")
+        assert "SSLCertVerificationError" in diagnostic
+        assert f"Bundled CA available: {_certifi is not None}" in diagnostic
+        assert "Authorization" not in diagnostic and "Bearer" not in diagnostic
+
     print(f"PASS Python DPS Meter {VERSION}")
     if log_path:
         real = replay_log(Path(log_path))
@@ -4974,6 +5213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-ui", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
     parser.add_argument("--smoke-view", choices=("meter", "flex", "leaderboard"), help=argparse.SUPPRESS)
     parser.add_argument("--smoke-compact", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--leaderboard-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--apply-update", metavar="TARGET", help=argparse.SUPPRESS)
     parser.add_argument("--wait-pid", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--cleanup-update", metavar="PATH", help=argparse.SUPPRESS)
@@ -4993,6 +5233,10 @@ def main() -> int:
         cleanup_update_copy(args.cleanup_update)
     if args.self_test:
         return run_self_test(args.log)
+    if args.leaderboard_smoke:
+        data, error_message = LeaderboardClient().request_sync(
+            "GET", "/v1/leaderboards/catalog?source=live", None)
+        return 0 if data is not None and error_message is None else 1
     app = MeterApp(args.log, args.smoke_ui, args.smoke_view, args.smoke_compact)
     app.run()
     return 0
