@@ -158,6 +158,7 @@ Do not include your personal `records.txt` when sharing the meter with somebody 
 
 Open **Ranks**, choose a permanent display name, and select **Join** to submit qualifying runs. On first use, **Scan history** can import completed extractions from existing combat logs so older legitimate runs are not lost.
 
+- Rankings and player names are visible only after joining with a registered player name.
 - Only completed extractions are eligible. Abandoned, failed, ended-early, and incomplete runs are excluded.
 - Live runs use periodic sequence/hash checkpoints to detect rewritten or recalculated logs.
 - Historical imports submit the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
@@ -205,7 +206,8 @@ The optional cleanup setting:
 ## Privacy and Safety
 
 - The meter contacts GitHub to check for updates. Downloads only begin after approval.
-- It contacts the community leaderboard service to retrieve public rankings. Run submission requires joining with a display name and can be disabled in Settings.
+- It contacts the community leaderboard service to retrieve member-only rankings. Viewing names or scores and submitting runs requires joining with a display name; submissions can be disabled in Settings.
+- Every registered member can hover over **Player list** to see the registered display-name roster and which names currently have at least one qualifying score. This summary does not include authentication tokens or combat-log contents.
 - Leaderboard submissions contain run statistics, timing/checkpoint metadata, and cryptographic log fingerprints—not the combat-log contents.
 - It does not inject code into Soulbound.
 - It does not read or modify Soulbound's memory.

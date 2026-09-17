@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -2449,9 +2449,10 @@ class MeterApp:
         self.records = FlexRecordStore()
         self.leaderboard_client = LeaderboardClient(
             unprotect_secret(self.settings.get("LeaderboardTokenProtected")))
-        self.leaderboard_status = "Join to submit completed runs"
+        self.leaderboard_status = "Join to view rankings and submit completed runs"
         self.leaderboard_entries: list[dict[str, Any]] = []
         self.leaderboard_personal_entries: list[dict[str, Any]] = []
+        self.leaderboard_player_list: dict[str, Any] | None = None
         self.leaderboard_loading = False
         self.leaderboard_refresh_pending = False
         self.leaderboard_auto_refresh_job: str | None = None
@@ -2507,6 +2508,8 @@ class MeterApp:
         self._ability_tooltip_hide_job: str | None = None
         self._dungeon_tooltip: tk.Toplevel | None = None
         self._dungeon_tooltip_hide_job: str | None = None
+        self._player_list_tooltip: tk.Toplevel | None = None
+        self._player_list_tooltip_hide_job: str | None = None
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
@@ -2960,8 +2963,21 @@ class MeterApp:
         self.label(left, "COMMUNITY LEADERBOARD", 10, "bold", "text").pack(anchor="w")
         self.leaderboard_status_label = self.label(left, self.leaderboard_status, 7, foreground="muted", anchor="w")
         self.leaderboard_status_label.pack(fill="x")
-        self.leaderboard_mode_badge = self.label(top, "LIVE CAPTURED", 7, "bold", "accent")
-        self.leaderboard_mode_badge.pack(side="right", anchor="n")
+        leaderboard_top_right = self.role(tk.Frame(top), "bg", None)
+        leaderboard_top_right.pack(side="right", anchor="n")
+        self.leaderboard_mode_badge = self.label(
+            leaderboard_top_right, "LIVE CAPTURED", 7, "bold", "accent")
+        self.leaderboard_mode_badge.pack(anchor="e")
+        self.leaderboard_player_list_tab = self.role(
+            tk.Label(leaderboard_top_right, text="Player list",
+                     font=(self.FONT, self._scaled_font_size(7), "bold"),
+                     borderwidth=0, relief="flat", padx=7, pady=2, cursor="hand2"),
+            "button", "neon")
+        self._register_font(self.leaderboard_player_list_tab, 7, "bold")
+        self.leaderboard_player_list_tab.bind(
+            "<Enter>", self._show_player_list_tooltip, add="+")
+        self.leaderboard_player_list_tab.bind(
+            "<Leave>", self._schedule_hide_player_list_tooltip, add="+")
 
         self.leaderboard_identity = self.panel(self.leaderboard_view)
         self.leaderboard_identity.pack(fill="x", pady=(0, 7))
@@ -3649,7 +3665,9 @@ class MeterApp:
             self.leaderboard_join_button.configure(text="Join")
             self.leaderboard_identity_label.configure(text="PLAYER NAME")
             self.leaderboard_scan_button.configure(state="disabled")
-            self._set_leaderboard_status("Join to submit completed runs")
+            self.leaderboard_player_list = None
+            self._render_leaderboard_player_list()
+            self._set_leaderboard_status("Join to view rankings and submit completed runs")
 
     def register_leaderboard_player(self) -> None:
         if self.leaderboard_client.token:
@@ -3667,6 +3685,8 @@ class MeterApp:
             self.settings.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
             self.settings.save()
             self.leaderboard_name_var.set("")
+            self.leaderboard_player_list = None
+            self._render_leaderboard_player_list()
             self._update_leaderboard_identity()
             return
         display_name = self.leaderboard_name_var.get().strip()
@@ -3981,6 +4001,18 @@ class MeterApp:
         self.leaderboard_canvas.yview_scroll(direction * 3, "units")
         return "break"
 
+    def _render_leaderboard_player_list(self) -> None:
+        if not hasattr(self, "leaderboard_player_list_tab"):
+            return
+        summary = self.leaderboard_player_list
+        players = summary.get("players") if isinstance(summary, dict) else None
+        if not isinstance(players, list):
+            self.leaderboard_player_list_tab.pack_forget()
+            self._hide_player_list_tooltip()
+            return
+        if not self.leaderboard_player_list_tab.winfo_manager():
+            self.leaderboard_player_list_tab.pack(anchor="e", pady=(4, 0))
+
     def _render_leaderboard(self) -> None:
         category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
         source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
@@ -4080,6 +4112,14 @@ class MeterApp:
         self.settings.data["LeaderboardPartySize"] = party
         self.settings.data["LeaderboardSource"] = source
         self.settings.save()
+        if not self.leaderboard_client.token:
+            self.leaderboard_entries = []
+            self.leaderboard_personal_entries = []
+            self.leaderboard_player_list = None
+            self._render_leaderboard_player_list()
+            self._render_leaderboard()
+            self._set_leaderboard_status("Join the leaderboard to view rankings.")
+            return
         query = {"category": category, "source": source, "limit": "100"}
         if dungeon and dungeon != ALL_DUNGEONS:
             query["dungeon"] = dungeon
@@ -4102,6 +4142,12 @@ class MeterApp:
                 self.leaderboard_personal_entries = [entry for entry in personal_entries
                                                      if isinstance(entry, dict)] \
                     if isinstance(personal_entries, list) else []
+                player_list = data.get("playerList")
+                # Retain the roster for the session if a later response is
+                # briefly served during a deployment transition without it.
+                if isinstance(player_list, dict):
+                    self.leaderboard_player_list = dict(player_list)
+                self._render_leaderboard_player_list()
                 self._set_leaderboard_status(
                     f"{len(self.leaderboard_entries)} score{'s' if len(self.leaderboard_entries) != 1 else ''} found")
                 self._render_leaderboard()
@@ -4111,7 +4157,7 @@ class MeterApp:
 
         path = "/v1/leaderboards?" + urllib.parse.urlencode(query)
         self.leaderboard_client.request(
-            "GET", path, None, complete, authenticated=bool(self.leaderboard_client.token))
+            "GET", path, None, complete, authenticated=True)
 
     def _schedule_leaderboard_auto_refresh(self) -> None:
         if self.leaderboard_auto_refresh_job is not None:
@@ -4185,6 +4231,7 @@ class MeterApp:
             self.refresh_leaderboard()
 
     def _show_main_view(self, view: str) -> None:
+        self._hide_player_list_tooltip()
         for widget in (self.meter_view, self.flex_view, self.leaderboard_view):
             widget.pack_forget()
         self.current_view = view
@@ -4725,6 +4772,100 @@ class MeterApp:
             self._dungeon_tooltip.destroy()
         self._dungeon_tooltip = None
 
+    def _show_player_list_tooltip(self, _event: tk.Event | None = None) -> None:
+        self._cancel_hide_player_list_tooltip()
+        summary = self.leaderboard_player_list
+        players = summary.get("players") if isinstance(summary, dict) else None
+        if not isinstance(players, list):
+            return
+        if self._player_list_tooltip is not None:
+            self._position_player_list_tooltip()
+            return
+        valid_players = [player for player in players
+                         if isinstance(player, dict)
+                         and str(player.get("displayName") or "").strip()]
+        valid_players.sort(
+            key=lambda player: str(player.get("displayName") or "").casefold())
+        total_users = int(summary.get("totalUsers", len(valid_players)) or 0)
+        ranked_users = int(summary.get(
+            "rankedUsers", sum(bool(player.get("onLeaderboard"))
+                               for player in valid_players)) or 0)
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        outer = tk.Frame(
+            tip, background="#171C27", highlightbackground="#3A4352",
+            highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        tk.Label(
+            outer, text="PLAYER LIST", background="#171C27", foreground="#F4F7FB",
+            font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(8, 1))
+        tk.Label(
+            outer, text=f"{total_users} registered  ·  {ranked_users} on leaderboard",
+            background="#171C27", foreground=self.colors["muted"],
+            font=(self.FONT, self._scaled_font_size(7)), anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 6))
+        for player in valid_players:
+            on_leaderboard = bool(player.get("onLeaderboard"))
+            line = tk.Frame(outer, background="#171C27")
+            line.pack(fill="x", padx=10, pady=1)
+            color = self.colors["green"] if on_leaderboard else self.colors["muted"]
+            tk.Label(
+                line, text="●", width=2, background="#171C27", foreground=color,
+                font=(self.FONT, self._scaled_font_size(8)), anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                line, text=str(player.get("displayName") or ""), width=18,
+                background="#171C27", foreground="#F4F7FB",
+                font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                line, text="ON LEADERBOARD" if on_leaderboard else "SIGNED UP",
+                background="#171C27", foreground=color,
+                font=(self.FONT, self._scaled_font_size(7)), anchor="e",
+            ).pack(side="right")
+        tk.Frame(outer, height=7, background="#171C27").pack()
+        self._player_list_tooltip = tip
+        tip.bind("<Enter>", self._cancel_hide_player_list_tooltip, add="+")
+        tip.bind("<Leave>", self._schedule_hide_player_list_tooltip, add="+")
+        self._position_player_list_tooltip()
+
+    def _position_player_list_tooltip(self) -> None:
+        if self._player_list_tooltip is None:
+            return
+        self._player_list_tooltip.update_idletasks()
+        trigger = self.leaderboard_player_list_tab
+        tip_width = self._player_list_tooltip.winfo_width()
+        tip_height = self._player_list_tooltip.winfo_height()
+        x = trigger.winfo_rootx() + trigger.winfo_width() - tip_width
+        y = trigger.winfo_rooty() + trigger.winfo_height() + 2
+        if y + tip_height > self.root.winfo_screenheight() - 8:
+            y = trigger.winfo_rooty() - tip_height - 2
+        self._player_list_tooltip.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cancel_hide_player_list_tooltip(self, _event: tk.Event | None = None) -> None:
+        if self._player_list_tooltip_hide_job is not None:
+            self.root.after_cancel(self._player_list_tooltip_hide_job)
+            self._player_list_tooltip_hide_job = None
+
+    def _schedule_hide_player_list_tooltip(self, _event: tk.Event | None = None) -> None:
+        if self._player_list_tooltip_hide_job is not None:
+            self.root.after_cancel(self._player_list_tooltip_hide_job)
+        self._player_list_tooltip_hide_job = self.root.after(
+            300, self._hide_player_list_tooltip)
+
+    def _hide_player_list_tooltip(self) -> None:
+        if self._player_list_tooltip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._player_list_tooltip_hide_job)
+            except tk.TclError:
+                pass
+            self._player_list_tooltip_hide_job = None
+        if self._player_list_tooltip is not None:
+            self._player_list_tooltip.destroy()
+        self._player_list_tooltip = None
+
     def find_and_follow(self, force: bool = False) -> None:
         found = self.win.find_soulbound() if hasattr(self, "win") else None
         if found is None:
@@ -4798,6 +4939,7 @@ class MeterApp:
             return
         self._hide_ability_tooltip()
         self._hide_dungeon_tooltip()
+        self._hide_player_list_tooltip()
         self._minimized = True
         # A borderless Tk window cannot be safely iconified directly. Temporarily
         # give it standard Windows chrome so it has a real taskbar entry and can
@@ -4854,6 +4996,7 @@ class MeterApp:
             self.leaderboard_auto_refresh_job = None
         self._hide_ability_tooltip()
         self._hide_dungeon_tooltip()
+        self._hide_player_list_tooltip()
         if self._brand_animation_job is not None:
             try:
                 self.root.after_cancel(self._brand_animation_job)
@@ -5234,8 +5377,12 @@ def main() -> int:
     if args.self_test:
         return run_self_test(args.log)
     if args.leaderboard_smoke:
-        data, error_message = LeaderboardClient().request_sync(
-            "GET", "/v1/leaderboards/catalog?source=live", None)
+        saved_token = unprotect_secret(AppSettings().get("LeaderboardTokenProtected"))
+        client = LeaderboardClient(saved_token)
+        path = ("/v1/leaderboards?source=live&category=time&limit=10"
+                if saved_token else "/v1/leaderboards/catalog?source=live")
+        data, error_message = client.request_sync(
+            "GET", path, None, authenticated=bool(saved_token))
         return 0 if data is not None and error_message is None else 1
     app = MeterApp(args.log, args.smoke_ui, args.smoke_view, args.smoke_compact)
     app.run()
