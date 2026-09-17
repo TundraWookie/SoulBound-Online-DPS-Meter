@@ -162,6 +162,7 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - Rankings and player names are visible only after joining with a registered player name.
 - Only completed extractions are eligible. Abandoned, failed, ended-early, and incomplete runs are excluded.
 - Boss raids such as Spectra Lair are recognized from a successful `bossraid` completion event even when the game omits normal extraction events. Events marked abandoned, failed, defeated, wiped, or death-related are rejected, and raid rankings use the active combat clock so pauses and the post-clear exit do not inflate the clear time.
+- Automatic history migrations preserve previously scanned non-Spectra files and throttle any required archive parsing so the live meter and timer stay responsive.
 - Live runs use periodic sequence/hash checkpoints to detect rewritten or recalculated logs.
 - Historical imports submit the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
 - Each player appears once per dungeon, difficulty, party-size, source, and ranking category using their best qualifying score.

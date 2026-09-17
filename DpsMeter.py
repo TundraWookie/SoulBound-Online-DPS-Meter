@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -468,6 +468,12 @@ def default_difficulty_for_dungeon(dungeon: str) -> str:
     if "raid" in folded:
         return "Raid"
     return "Stable"
+
+
+def is_spectra_history_signature(value: Any) -> bool:
+    """Identify persisted file signatures affected by the Spectra qualification fix."""
+    normalized = str(value or "").strip().casefold().replace(" ", "_")
+    return "spectra_lair" in normalized
 
 
 def is_boss_raid_completion(event: "CombatEvent") -> bool:
@@ -1688,8 +1694,13 @@ class LeaderboardClient:
             callback(data, error_message)
 
 
-def historical_run_from_log(path: Path) -> dict[str, Any] | None:
-    """Read one completed extraction into the server's imported-run format."""
+def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, Any] | None:
+    """Read one completed extraction into the server's imported-run format.
+
+    History imports run beside Tk's UI thread. Large archives can contain
+    millions of JSON events, so cooperative scans periodically yield the GIL
+    and leave the live meter/timer responsive.
+    """
     source_hasher = hashlib.sha256()
     start: CombatEvent | None = None
     end: CombatEvent | None = None
@@ -1715,7 +1726,9 @@ def historical_run_from_log(path: Path) -> dict[str, Any] | None:
     }
     try:
         with path.open("rb") as handle:
-            for raw in handle:
+            for line_number, raw in enumerate(handle, 1):
+                if cooperative and line_number % 256 == 0:
+                    time.sleep(0.075)
                 source_hasher.update(raw)
                 try:
                     root = json.loads(raw.decode("utf-8-sig"))
@@ -2122,7 +2135,17 @@ class AppSettings:
                 except (TypeError, ValueError):
                     history_version = 0
                 if history_version < LEADERBOARD_HISTORY_VERSION:
-                    self.data["LeaderboardHistoryFiles"] = []
+                    # The v4 qualification change only affected Spectra Raid.
+                    # Preserve every other processed signature so upgrading does
+                    # not reparse and re-upload a user's entire combat-log archive.
+                    history_files = self.data.get("LeaderboardHistoryFiles")
+                    if isinstance(history_files, list):
+                        self.data["LeaderboardHistoryFiles"] = [
+                            item for item in history_files
+                            if isinstance(item, str) and not is_spectra_history_signature(item)
+                        ]
+                    else:
+                        self.data["LeaderboardHistoryFiles"] = []
                     self.data["LeaderboardHistoryScanned"] = False
                     self.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
         except (OSError, json.JSONDecodeError):
@@ -3834,6 +3857,14 @@ class MeterApp:
         self._set_leaderboard_status("Scanning completed dungeon logs…")
 
         def worker() -> None:
+            if os.name == "nt":
+                try:
+                    # Keep archive work below the Tk/live-log thread so a large
+                    # first-time scan cannot make the visible meter stutter.
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -1)
+                except (AttributeError, OSError):
+                    pass
             active_path = self.watcher.active_path
             try:
                 active_path = active_path.resolve() if active_path is not None else None
@@ -3855,7 +3886,7 @@ class MeterApp:
                     candidates.append((path, signature))
             imported = duplicate = eligible = errors = 0
             for index, (path, signature) in enumerate(candidates, 1):
-                payload = historical_run_from_log(path)
+                payload = historical_run_from_log(path, cooperative=True)
                 if payload is None:
                     try:
                         is_active = active_path is not None and path.resolve() == active_path
@@ -5160,6 +5191,10 @@ def run_self_test(log_path: str | None = None) -> int:
         r"C:\logs\dungeon__Virelda_Outskirts__1__2026-08-20_17-03-17Z.log"
     ) == "Virelda Outskirts"
     assert split_dungeon_difficulty("Spectra Lair") == ("Spectra Lair", "Raid")
+    assert is_spectra_history_signature(
+        "dungeon__Spectra_Lair__1__2026-09-17_16-03-28Z.log|2497908|123")
+    assert not is_spectra_history_signature(
+        "dungeon__Eastern_Reach__1__2026-09-17_16-03-28Z.log|2497908|123")
     event = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
         "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
