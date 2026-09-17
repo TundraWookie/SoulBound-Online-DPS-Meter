@@ -35,7 +35,7 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -962,6 +962,13 @@ def default_record_data() -> dict[str, Any]:
     }
 
 
+ABILITY_RECORD_KEYS = (
+    "HighestDamage", "HighestHealing",
+    "HighestNormalHit", "HighestCriticalHit",
+    "HighestHeavyHit", "HighestDevastatingHit",
+)
+
+
 def merge_defaults(loaded: Any, defaults: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         return defaults
@@ -1006,6 +1013,7 @@ class FlexRecordStore:
         if records_path is None:
             self._migrate_legacy()
         self.data = self._load()
+        self._remove_unidentified_ability_records()
         self._normalize_legacy_difficulties()
         for dungeon in sorted(self.data["DungeonRuns"], key=str.casefold):
             self._ensure_dungeon_color(dungeon)
@@ -1036,6 +1044,24 @@ class FlexRecordStore:
             except OSError:
                 pass
             return defaults
+
+    def _remove_unidentified_ability_records(self) -> None:
+        """Discard legacy personal-best cards that cannot name their source."""
+        for key in ABILITY_RECORD_KEYS:
+            record = self.data.get(key)
+            if isinstance(record, dict) and is_unknown_ability(record.get("AbilityName")):
+                self.data[key] = None
+                self.dirty = True
+        if self.data.get("HighestDamage") is None:
+            candidates = (
+                self.data.get(key) for key in
+                ("HighestNormalHit", "HighestCriticalHit", "HighestHeavyHit", "HighestDevastatingHit")
+            )
+            verified = [record for record in candidates if isinstance(record, dict)]
+            if verified:
+                self.data["HighestDamage"] = dict(max(
+                    verified, key=lambda record: float(record.get("Value", 0))))
+                self.dirty = True
 
     def _normalize_legacy_difficulties(self) -> None:
         runs = self.data.get("DungeonRuns")
@@ -1373,10 +1399,11 @@ class FlexRecordStore:
 
         if event.type == "damage":
             self.data["LifetimeDamage"] = float(self.data.get("LifetimeDamage", 0)) + event.amount
-            self._update_record("HighestDamage", event)
             hit_key = self._hit_key(event)
-            record_key = {"Normal": "HighestNormalHit", "Critical": "HighestCriticalHit", "Heavy": "HighestHeavyHit", "Devastating": "HighestDevastatingHit"}[hit_key]
-            self._update_record(record_key, event)
+            if not is_unknown_ability(event.ability_name):
+                self._update_record("HighestDamage", event)
+                record_key = {"Normal": "HighestNormalHit", "Critical": "HighestCriticalHit", "Heavy": "HighestHeavyHit", "Devastating": "HighestDevastatingHit"}[hit_key]
+                self._update_record(record_key, event)
             run_total = self._add_total("LogDamageTotals", event.amount)
             run_hits = self._run_hit_damage()
             run_hits[hit_key] = float(run_hits.get(hit_key, 0)) + event.amount
@@ -1387,7 +1414,8 @@ class FlexRecordStore:
                 self.data["BestRunDamageAt"] = timestamp_text(event.timestamp)
         else:
             self.data["LifetimeHealing"] = float(self.data.get("LifetimeHealing", 0)) + event.amount
-            self._update_record("HighestHealing", event)
+            if not is_unknown_ability(event.ability_name):
+                self._update_record("HighestHealing", event)
             run_total = self._add_total("LogHealingTotals", event.amount)
             if run_total > float(self.data.get("BestRunHealing", 0)):
                 self.data["BestRunHealing"] = run_total
@@ -1626,7 +1654,8 @@ def historical_run_from_log(path: Path) -> dict[str, Any] | None:
                 if event.type == "damage":
                     amount = event.applied_amount
                     total_damage += amount
-                    largest_hit = max(largest_hit, amount)
+                    if not is_unknown_ability(event.ability_name):
+                        largest_hit = max(largest_hit, amount)
                     damage_window.append((event.timestamp, amount))
                     while damage_window and event.timestamp - damage_window[0][0] > 30:
                         damage_window.popleft()
@@ -1759,7 +1788,8 @@ class LeaderboardRunTracker:
             if event.type == "damage":
                 amount = event.applied_amount
                 self.total_damage += amount
-                self.largest_hit = max(self.largest_hit, amount)
+                if not is_unknown_ability(event.ability_name):
+                    self.largest_hit = max(self.largest_hit, amount)
                 self.damage_window.append((event.timestamp, amount))
                 while self.damage_window and event.timestamp - self.damage_window[0][0] > 30:
                     self.damage_window.popleft()
@@ -4732,10 +4762,14 @@ def run_self_test(log_path: str | None = None) -> int:
            "timestamp_utc": "2026-09-16T15:00:10Z",
            "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
                     "post_target_mitigation_amount": 300, "applied_amount": 100}})
-    track({"event": "ROOM_END", "sequence": 4, "run_elapsed_ms": 75_000,
+    track({"event": "DAMAGE_DEALT", "sequence": 4, "run_elapsed_ms": 11_000,
+           "timestamp_utc": "2026-09-16T15:00:11Z",
+           "data": {"source": {"type": "self"}, "ability_display_name": "Unknown Ability",
+                    "post_target_mitigation_amount": 89_207, "applied_amount": 89_207}})
+    track({"event": "ROOM_END", "sequence": 5, "run_elapsed_ms": 75_000,
            "timestamp_utc": "2026-09-16T15:01:15Z",
            "data": {"reason": "extraction", "duration_ms": 40_000}})
-    track({"event": "RUN_END", "sequence": 5, "run_elapsed_ms": 76_000,
+    track({"event": "RUN_END", "sequence": 6, "run_elapsed_ms": 76_000,
            "timestamp_utc": "2026-09-16T15:01:16Z",
            "data": {"reason": "extracted", "duration_ms": 41_000}}, duration=35.0)
     assert len(stub_client.calls) == 1 and stub_client.calls[0][1].endswith("/checkpoint")
@@ -4744,7 +4778,7 @@ def run_self_test(log_path: str | None = None) -> int:
     finish_request = stub_client.calls.pop(0)
     assert finish_request[2] and finish_request[2]["extracted"] is True
     assert finish_request[2]["runTimeMs"] == 76_000 and finish_request[2]["combatTimeMs"] == 35_000
-    assert finish_request[2]["totalDamage"] == 100 and finish_request[2]["largestHit"] == 100
+    assert finish_request[2]["totalDamage"] == 89_307 and finish_request[2]["largestHit"] == 100
     finish_request[3]({"leaderboardEligible": True}, None)
     assert tracker_submitted and tracker_status[-1] == "Run submitted to leaderboard"
 
@@ -4795,6 +4829,7 @@ def run_self_test(log_path: str | None = None) -> int:
         imported_history = historical_run_from_log(history_log)
         assert imported_history and imported_history["dungeon"] == "Lunar Plateau"
         assert imported_history["difficulty"] == "Abyssal" and imported_history["totalDamage"] == 125
+        assert imported_history["largestHit"] == 0
         assert imported_history["runTimeMs"] == 43_000 and len(imported_history["sourceHash"]) == 64
 
         abandoned_log = Path(folder) / "dungeon__Lunar_Plateau_-_Abyssal__2__2026-09-16_16-00-00Z.log"
@@ -4877,9 +4912,25 @@ def run_self_test(log_path: str | None = None) -> int:
         store = FlexRecordStore(Path(folder) / "records.txt")
         store.begin_log(str(Path(folder) / "run.log"))
         store.apply(event)
+        unidentified = replace(event, event_id="unidentified-record", sequence=2,
+                               ability_name="Unknown Ability", amount=89_207,
+                               critical=False, heavy_hit=False)
+        store.apply(unidentified)
         store.save(force=True)
         loaded = json.loads((Path(folder) / "records.txt").read_text(encoding="utf-8"))
-        assert loaded["LifetimeDamage"] == 300 and loaded["RunsTracked"] == 1
+        assert loaded["LifetimeDamage"] == 89_507 and loaded["RunsTracked"] == 1
+        assert loaded["HighestDamage"]["Value"] == 300
+        assert loaded["HighestDamage"]["AbilityName"] == "Bomb"
+        assert loaded["HighestNormalHit"] is None
+
+        loaded["HighestDamage"] = {
+            "Value": 89_207, "AbilityName": "Unknown Ability", "TargetName": "Cactaro King",
+            "Timestamp": timestamp_text(utc_now()), "Critical": False, "HeavyHit": False,
+        }
+        (Path(folder) / "records.txt").write_text(json.dumps(loaded), encoding="utf-8")
+        migrated_store = FlexRecordStore(Path(folder) / "records.txt")
+        migrated_record = migrated_store.snapshot()["HighestDamage"]
+        assert migrated_record["Value"] == 300 and migrated_record["AbilityName"] == "Bomb"
 
     with tempfile.TemporaryDirectory(prefix="DpsMeterLogPinTest-") as folder:
         test_folder = Path(folder)

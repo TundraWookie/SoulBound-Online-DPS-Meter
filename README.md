@@ -19,6 +19,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Shows per-ability hit counts, damage, percentages, and averages when you hover over an ability.
 - Resolves Healing Pulse and Fortify events when the log reports them as unknown.
 - Hides unresolved `Unknown Ability` rows while retaining their amounts in the totals.
+- Excludes unresolved abilities from ability-attributed Flex records so an unidentified hit or heal is never presented as a personal best.
 - Includes a permanent **Flex** tab for personal records and lifetime statistics.
 - Tracks dungeon runs by dungeon and difficulty, including extracted and abandoned runs.
 - Imports existing combat logs once and keeps a permanent duplicate-prevention ledger in `records.txt`.
