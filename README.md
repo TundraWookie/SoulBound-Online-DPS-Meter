@@ -22,6 +22,10 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Includes a permanent **Flex** tab for personal records and lifetime statistics.
 - Tracks dungeon runs by dungeon and difficulty, including extracted and abandoned runs.
 - Imports existing combat logs once and keeps a permanent duplicate-prevention ledger in `records.txt`.
+- Shows a room timeline below the ability list with readable combat-only checkpoint times in both normal and compact layouts.
+- Includes a community **Ranks** tab for fastest completed runs, damage, DPS, healing, shielding, and other categories.
+- Excludes abandoned, failed, incomplete, and edited live runs from leaderboard rankings.
+- Checks GitHub Releases on startup and asks before downloading and installing a newer version.
 - Supports custom menu colors.
 - Supports adjustable overlay opacity and optional AFK fading between dungeon runs.
 - Supports adjustable font size and remembers the resized window dimensions.
@@ -34,7 +38,11 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 
 ## Download
 
-Download the latest version from the repository's **Releases** page.
+Download from the files on this front page or use the repository's **Releases** page for versioned downloads:
+
+- [Download the Windows EXE](DpsMeter.exe)
+- [Download the readable Python version](DpsMeter.py)
+- [Open versioned releases](https://github.com/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest)
 
 Two versions are available:
 
@@ -109,6 +117,8 @@ For example, if 2 of your 10 damage hits are heavy, the displayed Heavy Chance i
 
 When the combat log provides encounter start and end events, the timer counts active combat time. It pauses between encounters, including upgrade periods, and resumes when the next encounter begins.
 
+The room timeline below the ability list uses the log's run clock to display combat-only checkpoints. Long pauses, relic selection, treasure rooms, shops, and other non-combat sections do not inflate these checkpoint times.
+
 ### Top Abilities
 
 The ability list shows the combined amount attributed to each ability during the current run. Damage, healing, and shielding abilities can appear in this list. Unresolved `Unknown Ability` entries are hidden from the list but remain included in the appropriate overall total.
@@ -142,9 +152,21 @@ It is never removed by the combat-log cleanup option. Keep this file when updati
 
 Do not include your personal `records.txt` when sharing the meter with somebody else unless you intentionally want to share your records.
 
+## Community Leaderboard
+
+Open **Ranks**, choose a permanent display name, and select **Join** to submit qualifying runs. On first use, **Scan history** can import completed extractions from existing combat logs so older legitimate runs are not lost.
+
+- Only completed extractions are eligible. Abandoned, failed, ended-early, and incomplete runs are excluded.
+- Live runs use periodic sequence/hash checkpoints to detect rewritten or recalculated logs.
+- Historical imports submit the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
+- Each player appears once per dungeon, difficulty, party-size, source, and ranking category using their best qualifying score.
+- Leaderboard results refresh every 30 seconds while the Ranks tab is open, or immediately when **Refresh** is selected.
+- Difficulty order is Stable, Unstable, Fractured, Collapsing, Shattered, Abyssal, then Raid.
+
 ## Controls
 
 - **Flex / Meter:** Switch between the live meter and permanent records.
+- **Ranks:** Browse community records and manage your leaderboard name/history scan.
 - **Compact / Normal:** Switch between the full vertical meter and compact horizontal layout.
 - **Settings button:** Change the menu color, opacity, font size, AFK fading, overkill handling, and log-cleanup preference.
 - **Follow game window:** Keep the overlay positioned relative to Soulbound.
@@ -162,6 +184,12 @@ The meter stores its appearance and window preferences here:
 
 The saved preferences include the window position, resized width and height, font size, theme color, and overlay options.
 
+### Automatic Updates
+
+Automatic update checks are enabled by default and can be disabled under **Settings → Updates**. When a newer GitHub Release is available, the meter displays a Yes/No prompt. It downloads nothing until you approve.
+
+After approval, the meter downloads the matching EXE or Python asset beside the currently running file, verifies its GitHub-published size and SHA-256 digest, closes the old copy, atomically replaces it, and opens the new copy. A failed or altered download never replaces the installed version.
+
 Permanent records are stored beside the program in `records.txt`.
 
 The optional cleanup setting:
@@ -173,7 +201,9 @@ The optional cleanup setting:
 
 ## Privacy and Safety
 
-- The meter makes no network connections.
+- The meter contacts GitHub to check for updates. Downloads only begin after approval.
+- It contacts the community leaderboard service to retrieve public rankings. Run submission requires joining with a display name and can be disabled in Settings.
+- Leaderboard submissions contain run statistics, timing/checkpoint metadata, and cryptographic log fingerprints—not the combat-log contents.
 - It does not inject code into Soulbound.
 - It does not read or modify Soulbound's memory.
 - It only reads the selected combat-log folder and writes its own settings and records files.

@@ -2,7 +2,8 @@
 """Soulbound DPS Meter — readable, dependency-free Python edition.
 
 Requires Python 3.10+ with Tkinter (included with the normal Windows installer).
-Combat logs are read only from the selected folder. No network access is used.
+Combat logs are read only from the selected folder. The optional community
+leaderboard communicates with the Soulbound leaderboard API.
 """
 
 from __future__ import annotations
@@ -11,14 +12,21 @@ import argparse
 import base64
 import colorsys
 import ctypes
+import hashlib
 import json
 import os
+import queue
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -27,13 +35,289 @@ from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 
-VERSION = "0.8.18-py.1"
+VERSION = "0.9.0"
+GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
+UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
+UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
+LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev"
+LEADERBOARD_AUTO_REFRESH_MS = 30_000
+LEADERBOARD_HISTORY_VERSION = 3
+LEADERBOARD_CATEGORY_LABELS = {
+    "Fastest Time": "time", "Total Damage": "total_damage", "DPS": "dps",
+    "Best Damage · 30S": "best_30", "Highest Hit": "largest_hit",
+    "Total Healing": "healing", "Total Shielding": "shielding",
+}
+LEADERBOARD_PARTY_LABELS = {
+    "All Parties": "All", "Solo": "1", "2 Players": "2", "3 Players": "3",
+    "4 Players": "4", "5 Players": "5", "6 Players": "6", "7 Players": "7", "8 Players": "8",
+}
+LEADERBOARD_SOURCE_LABELS = {"Live Captured": "live", "Imported History": "imported"}
+ALL_DUNGEONS = "All Dungeons"
+ALL_DIFFICULTIES = "All Difficulties"
+KNOWN_DUNGEON_DIFFICULTIES = {
+    "Abyssal Raid": ("Raid",),
+    "Virelda Arena": ("Stable",),
+    "Train Defence": ("Stable",),
+    "Eastern Reach": ("Stable", "Fractured", "Collapsing", "Shattered", "Abyssal"),
+    "Virelda Outskirts": ("Stable",),
+    "Arcadia Defence": ("Unstable",),
+    "Arcadia Arena": ("Unstable",),
+    "Operational Continuity": ("Fractured",),
+    "Everdune Arena": ("Fractured",),
+    "Farpoint": ("Fractured", "Collapsing", "Abyssal"),
+    "Everdune": ("Fractured", "Collapsing", "Shattered", "Abyssal"),
+    "Lunar Plateau": ("Collapsing", "Shattered", "Abyssal"),
+}
+UNSUFFIXED_DUNGEON_DIFFICULTIES = {
+    "virelda arena": "Stable", "train defence": "Stable",
+    "virelda outskirts": "Stable", "arcadia defence": "Unstable",
+    "arcadia defense": "Unstable", "arcadia arena": "Unstable",
+    "operational continuity": "Fractured", "everdune arena": "Fractured",
+}
 SUPPORTED_EXTENSIONS = {".jsonl", ".log", ".json", ".txt"}
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = (Path(sys.executable).resolve().parent
+              if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", SCRIPT_DIR))
 SETTINGS_PATH = LOCAL_APP_DATA / "SoulboundMeter" / "settings.json"
 BRAND_ANIMATION_FRAME_COUNT = 30
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    version: str
+    asset_name: str
+    download_url: str
+    size: int
+    sha256: str
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    """Return the numeric release portion of tags such as v0.9.1 or 0.9.1-test1."""
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)", str(value))
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def is_newer_version(candidate: str, current: str = VERSION) -> bool:
+    candidate_parts = version_tuple(candidate)
+    current_parts = version_tuple(current)
+    if not candidate_parts or not current_parts:
+        return False
+    width = max(len(candidate_parts), len(current_parts))
+    return candidate_parts + (0,) * (width - len(candidate_parts)) > current_parts + (0,) * (width - len(current_parts))
+
+
+def update_asset_from_release(release: dict[str, Any], frozen: bool) -> UpdateInfo | None:
+    """Select and validate the matching Python or Windows asset from a GitHub release."""
+    tag = str(release.get("tag_name") or "").strip()
+    if not tag or bool(release.get("draft")) or bool(release.get("prerelease")):
+        return None
+    suffix = ".exe" if frozen else ".py"
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return None
+    candidates = [asset for asset in assets if isinstance(asset, dict)
+                  and str(asset.get("name") or "").casefold().endswith(suffix)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda asset: (
+        "dpsmeter" not in str(asset.get("name") or "").casefold(),
+        frozen and "win-x64" not in str(asset.get("name") or "").casefold(),
+        len(str(asset.get("name") or "")),
+    ))
+    asset = candidates[0]
+    digest = str(asset.get("digest") or "").strip().casefold()
+    if not digest.startswith("sha256:"):
+        return None
+    sha256 = digest.split(":", 1)[1]
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        return None
+    url = str(asset.get("browser_download_url") or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}:
+        return None
+    try:
+        size = int(asset.get("size") or 0)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0 or size > UPDATE_MAX_DOWNLOAD_BYTES:
+        return None
+    return UpdateInfo(tag.lstrip("vV"), str(asset.get("name") or "update"), url, size, sha256)
+
+
+def fetch_latest_update(frozen: bool) -> UpdateInfo | None:
+    request = urllib.request.Request(
+        GITHUB_RELEASE_API_URL,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": UPDATE_USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        raw = response.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError("GitHub release response was unexpectedly large")
+    release = json.loads(raw.decode("utf-8"))
+    if not isinstance(release, dict):
+        raise ValueError("GitHub returned an invalid release response")
+    return update_asset_from_release(release, frozen)
+
+
+def download_update_asset(info: UpdateInfo, target: Path) -> Path:
+    safe_version = re.sub(r"[^0-9A-Za-z._-]+", "-", info.version).strip(".-") or "latest"
+    staged = target.with_name(f".{target.stem}-update-{safe_version}{target.suffix}")
+    partial = staged.with_name(staged.name + ".download")
+    hasher = hashlib.sha256()
+    downloaded = 0
+    request = urllib.request.Request(info.download_url, headers={"User-Agent": UPDATE_USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response, partial.open("wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if downloaded > UPDATE_MAX_DOWNLOAD_BYTES:
+                    raise ValueError("The update exceeded the maximum allowed size")
+                hasher.update(chunk)
+                handle.write(chunk)
+        if downloaded != info.size:
+            raise ValueError(f"The update size did not match ({downloaded:,} of {info.size:,} bytes)")
+        if hasher.hexdigest().casefold() != info.sha256.casefold():
+            raise ValueError("The update failed its SHA-256 integrity check")
+        os.replace(partial, staged)
+        return staged
+    except Exception:
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def current_program_path() -> Path:
+    return (Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)).resolve()
+
+
+def program_command(path: Path, *arguments: str) -> list[str]:
+    if path.suffix.casefold() == ".exe":
+        return [str(path), *arguments]
+    interpreter = Path(sys.executable)
+    if os.name == "nt" and interpreter.name.casefold() == "python.exe":
+        pythonw = interpreter.with_name("pythonw.exe")
+        if pythonw.exists():
+            interpreter = pythonw
+    return [str(interpreter), str(path), *arguments]
+
+
+def spawn_detached(command: list[str], cwd: Path | None = None) -> None:
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(command, cwd=str(cwd) if cwd else None, close_fds=True, creationflags=flags)
+
+
+def wait_for_process_exit(pid: int, timeout_seconds: float = 45.0) -> bool:
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        synchronize = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return True
+        try:
+            result = ctypes.windll.kernel32.WaitForSingleObject(handle, max(0, round(timeout_seconds * 1000)))
+            return result == 0
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def replace_program_file(source: Path, target: Path) -> None:
+    """Copy through a sibling temporary file, then atomically replace the target."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    incoming = target.with_name(f".{target.name}.incoming")
+    try:
+        shutil.copy2(source, incoming)
+        last_error: OSError | None = None
+        for _attempt in range(80):
+            try:
+                os.replace(incoming, target)
+                return
+            except OSError as error:
+                last_error = error
+                time.sleep(0.125)
+        if last_error is not None:
+            raise last_error
+    finally:
+        try:
+            incoming.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def apply_downloaded_update(target_text: str, wait_pid: int, restart: bool = True) -> int:
+    """Run inside the downloaded copy after the old app has begun closing."""
+    source = current_program_path()
+    target = Path(target_text).resolve()
+    if (source.parent != target.parent or source == target
+            or source.suffix.casefold() != target.suffix.casefold()
+            or target.suffix.casefold() not in {".exe", ".py"}):
+        return 2
+    if not wait_for_process_exit(wait_pid):
+        return 3
+    try:
+        replace_program_file(source, target)
+    except OSError:
+        return 4
+    if restart:
+        try:
+            spawn_detached(program_command(target, "--cleanup-update", str(source)), target.parent)
+        except OSError:
+            return 5
+    return 0
+
+
+def show_update_helper_error(code: int) -> None:
+    messages = {
+        2: "The downloaded update did not match the installed file.",
+        3: "The old DPS Meter did not close in time.",
+        4: "Windows could not replace the installed DPS Meter file.",
+        5: "The update was installed, but DPS Meter could not reopen automatically. Please open it manually.",
+    }
+    text = messages.get(code, "The update could not be installed.")
+    if os.name == "nt":
+        try:
+            ctypes.windll.user32.MessageBoxW(None, text, "DPS Meter Update", 0x10)
+            return
+        except (AttributeError, OSError):
+            pass
+    print(f"DPS Meter update error: {text}", file=sys.stderr)
+
+
+def cleanup_update_copy(path_text: str) -> None:
+    path = Path(path_text).resolve()
+
+    def worker() -> None:
+        for _attempt in range(120):
+            try:
+                path.unlink(missing_ok=True)
+                return
+            except OSError:
+                time.sleep(0.25)
+
+    threading.Thread(target=worker, name="update-cleanup", daemon=True).start()
 
 
 def utc_now() -> float:
@@ -101,9 +385,22 @@ def split_dungeon_difficulty(display_name: str) -> tuple[str, str]:
     """Split names such as 'Eastern Reach - Abyssal' without breaking 'Abyssal Raid'."""
     cleaned = display_name.strip() or "Unknown Dungeon"
     if " - " not in cleaned:
-        return cleaned, "Normal"
+        return cleaned, default_difficulty_for_dungeon(cleaned)
     dungeon, difficulty = cleaned.rsplit(" - ", 1)
-    return (dungeon.strip() or cleaned), (difficulty.strip() or "Normal")
+    dungeon = dungeon.strip() or cleaned
+    difficulty = difficulty.strip()
+    if not difficulty or difficulty.casefold() == "normal":
+        difficulty = default_difficulty_for_dungeon(dungeon)
+    return dungeon, difficulty
+
+
+def default_difficulty_for_dungeon(dungeon: str) -> str:
+    folded = dungeon.strip().casefold()
+    if folded in UNSUFFIXED_DUNGEON_DIFFICULTIES:
+        return UNSUFFIXED_DUNGEON_DIFFICULTIES[folded]
+    if "raid" in folded:
+        return "Raid"
+    return "Stable"
 
 
 def is_unknown_ability(name: str | None) -> bool:
@@ -166,6 +463,16 @@ def format_duration_ms(value: Any) -> str:
     return f"{hours}:{minute:02d}:{second:02d}.{fraction:02d}" if hours else f"{minute:02d}:{second:02d}.{fraction:02d}"
 
 
+def format_combat_clock(value_ms: Any) -> str:
+    try:
+        total_seconds = max(0, round(float(value_ms) / 1000.0))
+    except (TypeError, ValueError):
+        total_seconds = 0
+    minutes, second = divmod(total_seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}:{minute:02d}:{second:02d}" if hours else f"{minute}:{second:02d}"
+
+
 @dataclass(slots=True)
 class CombatEvent:
     type: str
@@ -193,6 +500,10 @@ class CombatEvent:
     run_end_reason: str | None
     run_completed: bool
     run_duration_ms: float
+    run_elapsed_ms: float | None
+    room_index: int | None
+    room_name: str | None
+    room_subtype: str | None
 
 
 def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | None:
@@ -268,6 +579,10 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         str(first_value(payload, "reason", "end_reason") or "").strip().lower() or None,
         first_bool(payload, "completed", "is_completed"),
         max(0.0, first_number(payload, "duration_ms", "run_duration_ms")),
+        first_number(root, "run_elapsed_ms") if first_value(root, "run_elapsed_ms") is not None else None,
+        int(first_number(payload, "room_index")) if first_value(payload, "room_index") is not None else None,
+        str(first_value(payload, "room_name") or "").strip() or None,
+        str(first_value(payload, "encounter_subtype", "room_subtype") or "").strip().lower() or None,
     )
 
 
@@ -333,6 +648,9 @@ class CombatAbilityResolver:
 
 
 class CombatSession:
+    PAUSE_GAP_MS = 3000.0
+    NONCOMBAT_SUBTYPES = {"treasure", "relic", "gathering", "gather", "shop", "rest"}
+
     def __init__(self) -> None:
         self.reset()
 
@@ -355,6 +673,11 @@ class CombatSession:
         self.in_run = False
         self.run_controlled = False
         self.has_encounter_timing = False
+        self.combat_clock_ms = 0.0
+        self.last_run_elapsed_ms: float | None = None
+        self.timing_in_combat = False
+        self.has_run_elapsed_timing = False
+        self.stages: list[dict[str, Any]] = []
         self.abilities: dict[str, list[Any]] = {}
         self.seen_event_ids: set[str] = set()
         self.seen_sequences: set[float] = set()
@@ -377,6 +700,7 @@ class CombatSession:
                 or (event.sequence is not None and event.sequence in self.seen_sequences)):
             return
         self._remember(event)
+        self._advance_combat_clock(event)
         if event.type == "combat_start":
             # Selecting a new log is the only automatic run reset. A repeated
             # RUN_START inside the active file must never clear visible totals.
@@ -387,22 +711,48 @@ class CombatSession:
                 self.run_controlled = True
             return
 
+        if event.type == "room_start":
+            self._start_stage(event)
+            self.in_run = True
+            return
+
         if event.type == "encounter_start":
             self.has_encounter_timing = True
-            if self.encounter_started_at is not None:
+            self._update_stage_subtype(event)
+            noncombat = self._is_noncombat(event.room_subtype)
+            if noncombat:
                 self._close_encounter(event.timestamp)
-            self.encounter_started_at = self.last_event_at = event.timestamp
-            self.is_active = True
+                self.timing_in_combat = False
+                self.is_active = False
+            else:
+                if self.encounter_started_at is not None:
+                    self._close_encounter(event.timestamp)
+                self.encounter_started_at = event.timestamp
+                self.timing_in_combat = True
+                self.is_active = True
+            self.last_event_at = event.timestamp
             self.in_run = True
             return
         if event.type == "encounter_end":
             self.has_encounter_timing = True
+            self._update_stage_subtype(event)
+            if not self._is_noncombat(event.room_subtype):
+                self._close_encounter(event.timestamp)
+            self.timing_in_combat = False
+            self.last_event_at = event.timestamp
+            self.is_active = False
+            return
+        if event.type == "room_end":
+            self._update_stage_subtype(event)
+            self._finish_stage(event)
             self._close_encounter(event.timestamp)
+            self.timing_in_combat = False
             self.last_event_at = event.timestamp
             self.is_active = False
             return
         if event.type == "combat_end":
             self._close_encounter(event.timestamp)
+            self.timing_in_combat = False
             self.last_event_at = event.timestamp
             self.is_active = False
             self.in_run = False
@@ -468,7 +818,9 @@ class CombatSession:
         if self.is_active and not self.run_controlled and self.last_event_at is not None and now - self.last_event_at > 12:
             self.is_active = False
         if self.has_encounter_timing:
-            duration = self.completed_combat_time + (max(0.0, now - self.encounter_started_at) if self.encounter_started_at is not None else 0.0)
+            duration = (self.combat_clock_ms / 1000.0 if self.has_run_elapsed_timing else
+                        self.completed_combat_time + (max(0.0, now - self.encounter_started_at)
+                                                      if self.encounter_started_at is not None else 0.0))
         elif self.started_at is None:
             duration = 0.0
         else:
@@ -508,12 +860,71 @@ class CombatSession:
             "damage": self.total_damage, "healing": self.total_healing, "shielding": self.total_shielding,
             "dps": self._rolling(self.recent_damage, now), "hps": self._rolling(self.recent_healing, now),
             "duration": duration, "active": self.is_active, "in_run": self.in_run, "abilities": top,
+            "stages": self._stage_snapshot(),
             "highest_crit": self.highest_critical_hit, "highest_heavy": self.highest_heavy_hit,
             "highest_dev": self.highest_devastating_hit,
             "crit_rate": self.critical_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
             "heavy_rate": self.heavy_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
             "dev_rate": self.devastating_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
         }
+
+    def _advance_combat_clock(self, event: CombatEvent) -> None:
+        if event.run_elapsed_ms is None:
+            return
+        elapsed = max(0.0, event.run_elapsed_ms)
+        self.has_run_elapsed_timing = True
+        if self.timing_in_combat and self.last_run_elapsed_ms is not None:
+            delta = max(0.0, elapsed - self.last_run_elapsed_ms)
+            self.combat_clock_ms += min(delta, self.PAUSE_GAP_MS)
+        self.last_run_elapsed_ms = elapsed if self.last_run_elapsed_ms is None else max(self.last_run_elapsed_ms, elapsed)
+
+    @classmethod
+    def _is_noncombat(cls, subtype: str | None) -> bool:
+        return (subtype or "").strip().lower() in cls.NONCOMBAT_SUBTYPES
+
+    def _start_stage(self, event: CombatEvent) -> None:
+        if self.stages and event.room_index is not None and self.stages[-1]["index"] == event.room_index:
+            return
+        self.stages.append({
+            "index": event.room_index,
+            "name": event.room_name or "Room",
+            "subtype": event.room_subtype or "",
+            "checkpoint_ms": None,
+        })
+
+    def _stage_for(self, event: CombatEvent) -> dict[str, Any] | None:
+        if event.room_index is not None:
+            for stage in reversed(self.stages):
+                if stage["index"] == event.room_index:
+                    return stage
+        return self.stages[-1] if self.stages else None
+
+    def _update_stage_subtype(self, event: CombatEvent) -> None:
+        stage = self._stage_for(event)
+        if stage is not None:
+            if event.room_subtype:
+                stage["subtype"] = event.room_subtype
+            if event.room_name:
+                stage["name"] = event.room_name
+
+    def _finish_stage(self, event: CombatEvent) -> None:
+        stage = self._stage_for(event)
+        if stage is not None and stage["checkpoint_ms"] is None:
+            stage["checkpoint_ms"] = self.combat_clock_ms
+
+    def _stage_snapshot(self) -> list[dict[str, Any]]:
+        result = []
+        for position, stage in enumerate(self.stages, start=1):
+            checkpoint = stage["checkpoint_ms"]
+            result.append({
+                "number": position,
+                "name": stage["name"],
+                "subtype": stage["subtype"] or "combat",
+                "time_ms": self.combat_clock_ms if checkpoint is None else checkpoint,
+                "current": checkpoint is None and self.in_run,
+                "complete": checkpoint is not None,
+            })
+        return result
 
 
 ICON_DATA: dict[str, str] = {
@@ -595,6 +1006,7 @@ class FlexRecordStore:
         if records_path is None:
             self._migrate_legacy()
         self.data = self._load()
+        self._normalize_legacy_difficulties()
         for dungeon in sorted(self.data["DungeonRuns"], key=str.casefold):
             self._ensure_dungeon_color(dungeon)
         self.save(force=True)
@@ -624,6 +1036,48 @@ class FlexRecordStore:
             except OSError:
                 pass
             return defaults
+
+    def _normalize_legacy_difficulties(self) -> None:
+        runs = self.data.get("DungeonRuns")
+        if isinstance(runs, dict):
+            for dungeon, difficulties in runs.items():
+                if not isinstance(difficulties, dict):
+                    continue
+                normal_key = dict_key_casefold(difficulties, "Normal")
+                if normal_key is None:
+                    continue
+                target_name = default_difficulty_for_dungeon(str(dungeon))
+                target_key = dict_key_casefold(difficulties, target_name) or target_name
+                legacy = difficulties.get(normal_key)
+                if not isinstance(legacy, dict):
+                    del difficulties[normal_key]
+                    self.dirty = True
+                    continue
+                target = difficulties.get(target_key)
+                if not isinstance(target, dict) or target_key == normal_key:
+                    difficulties[target_name] = legacy
+                else:
+                    for key in ("Attempts", "Extracted", "Abandoned"):
+                        target[key] = int(target.get(key, 0)) + int(legacy.get(key, 0))
+                    target["LastRunAt"] = max(
+                        str(target.get("LastRunAt") or ""), str(legacy.get("LastRunAt") or "")) or None
+                    legacy_fastest = legacy.get("FastestMs")
+                    target_fastest = target.get("FastestMs")
+                    if legacy_fastest is not None and (
+                            target_fastest is None or float(legacy_fastest) < float(target_fastest)):
+                        target["FastestMs"] = legacy_fastest
+                        target["FastestAt"] = legacy.get("FastestAt")
+                if normal_key in difficulties and normal_key != target_name:
+                    del difficulties[normal_key]
+                self.dirty = True
+        ledger = self.data.get("DungeonRunLedger")
+        if isinstance(ledger, dict):
+            for entry in ledger.values():
+                if (isinstance(entry, dict)
+                        and str(entry.get("Difficulty") or "").casefold() == "normal"):
+                    entry["Difficulty"] = default_difficulty_for_dungeon(
+                        str(entry.get("Dungeon") or "Unknown Dungeon"))
+                    self.dirty = True
 
     def begin_log(self, path: str) -> None:
         try:
@@ -731,9 +1185,9 @@ class FlexRecordStore:
         elif event.type == "combat_end" and self.active_run_id:
             ledger = self.data["DungeonRunLedger"]
             existing = ledger.get(self.active_run_id, {})
-            display = " - ".join(filter(None, (existing.get("Dungeon"),
-                                                  None if existing.get("Difficulty") == "Normal" else existing.get("Difficulty"))))
-            status = "extracted" if self.active_run_completed else (
+            display = " - ".join(filter(None, (existing.get("Dungeon"), existing.get("Difficulty"))))
+            status = "extracted" if (
+                self.active_run_completed and event.run_end_reason in {"extraction", "extracted"}) else (
                 "abandoned" if event.run_end_reason == "abandoned" else "ended")
             started_at = parse_timestamp(existing.get("StartedAt"))
             duration_ms = max(0.0, (event.timestamp - started_at) * 1000.0)
@@ -759,7 +1213,9 @@ class FlexRecordStore:
             if duration_ms <= 0:
                 continue
             bucket = self._run_bucket(str(entry.get("Dungeon") or "Unknown Dungeon"),
-                                      str(entry.get("Difficulty") or "Normal"))
+                                      str(entry.get("Difficulty") or
+                                          default_difficulty_for_dungeon(
+                                              str(entry.get("Dungeon") or "Unknown Dungeon"))))
             fastest = bucket.get("FastestMs")
             if fastest is None or duration_ms < float(fastest):
                 bucket["FastestMs"] = duration_ms
@@ -808,7 +1264,8 @@ class FlexRecordStore:
             run_id = self._run_id(start.timestamp, display)
             status = "started"
             if end is not None:
-                status = "extracted" if completed_extraction else (
+                status = "extracted" if (
+                    completed_extraction and end.run_end_reason in {"extraction", "extracted"}) else (
                     "abandoned" if end.run_end_reason == "abandoned" else "ended")
             duration_ms = max(0.0, (end.timestamp - start.timestamp) * 1000.0) if end else 0.0
             self._upsert_run(run_id, display, start.timestamp, status, str(path), duration_ms,
@@ -969,15 +1426,512 @@ class FlexRecordStore:
             pass
 
 
+class _SecretBlob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def protect_secret(value: str) -> str:
+    """Protect a token for the current Windows user without extra packages."""
+    raw = value.encode("utf-8")
+    if not raw:
+        return ""
+    if os.name != "nt":
+        return "plain:" + base64.b64encode(raw).decode("ascii")
+    try:
+        source = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+        source_blob = _SecretBlob(len(raw), ctypes.cast(source, ctypes.POINTER(ctypes.c_ubyte)))
+        result_blob = _SecretBlob()
+        crypt32 = ctypes.windll.crypt32
+        crypt32.CryptProtectData.argtypes = [
+            ctypes.POINTER(_SecretBlob), ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_SecretBlob),
+        ]
+        crypt32.CryptProtectData.restype = ctypes.c_bool
+        if not crypt32.CryptProtectData(ctypes.byref(source_blob), "Soulbound DPS Meter", None, None,
+                                        None, 0x01, ctypes.byref(result_blob)):
+            return ""
+        try:
+            protected = ctypes.string_at(result_blob.pbData, result_blob.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(result_blob.pbData)
+        return "dpapi:" + base64.b64encode(protected).decode("ascii")
+    except (AttributeError, OSError, ValueError):
+        return ""
+
+
+def unprotect_secret(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    if value.startswith("plain:"):
+        try:
+            return base64.b64decode(value[6:]).decode("utf-8")
+        except (ValueError, UnicodeError):
+            return ""
+    if not value.startswith("dpapi:") or os.name != "nt":
+        return ""
+    try:
+        raw = base64.b64decode(value[6:])
+        source = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+        source_blob = _SecretBlob(len(raw), ctypes.cast(source, ctypes.POINTER(ctypes.c_ubyte)))
+        result_blob = _SecretBlob()
+        crypt32 = ctypes.windll.crypt32
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(_SecretBlob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_SecretBlob),
+        ]
+        crypt32.CryptUnprotectData.restype = ctypes.c_bool
+        if not crypt32.CryptUnprotectData(ctypes.byref(source_blob), None, None, None, None,
+                                          0x01, ctypes.byref(result_blob)):
+            return ""
+        try:
+            return ctypes.string_at(result_blob.pbData, result_blob.cbData).decode("utf-8")
+        finally:
+            ctypes.windll.kernel32.LocalFree(result_blob.pbData)
+    except (AttributeError, OSError, ValueError, UnicodeError):
+        return ""
+
+
+LeaderboardCallback = Callable[[dict[str, Any] | None, str | None], None]
+
+
+class LeaderboardClient:
+    def __init__(self, token: str = "") -> None:
+        self.token = token
+        self.results: queue.Queue[tuple[LeaderboardCallback, dict[str, Any] | None, str | None]] = queue.Queue()
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None,
+                callback: LeaderboardCallback, authenticated: bool = False) -> None:
+        def worker() -> None:
+            data, error_message = self.request_sync(method, path, body, authenticated)
+            self.results.put((callback, data, error_message))
+
+        threading.Thread(target=worker, name="SoulboundLeaderboard", daemon=True).start()
+
+    def request_sync(self, method: str, path: str, body: dict[str, Any] | None,
+                     authenticated: bool = False) -> tuple[dict[str, Any] | None, str | None]:
+        data: dict[str, Any] | None = None
+        error_message: str | None = None
+        try:
+            encoded = json.dumps(body).encode("utf-8") if body is not None else None
+            headers = {"Accept": "application/json", "User-Agent": f"SoulboundDpsMeter/{VERSION}"}
+            if encoded is not None:
+                headers["Content-Type"] = "application/json"
+            if authenticated:
+                if not self.token:
+                    raise RuntimeError("Join the leaderboard first.")
+                headers["Authorization"] = f"Bearer {self.token}"
+            request = urllib.request.Request(LEADERBOARD_API_URL + path, data=encoded,
+                                             headers=headers, method=method)
+            with urllib.request.urlopen(request, timeout=12) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+            if isinstance(decoded, dict):
+                data = decoded
+            else:
+                error_message = "Leaderboard returned an unexpected response."
+        except urllib.error.HTTPError as error:
+            try:
+                payload = json.loads(error.read().decode("utf-8"))
+                error_message = str(payload.get("error") or f"Leaderboard error {error.code}")
+            except (json.JSONDecodeError, UnicodeError, AttributeError):
+                error_message = f"Leaderboard error {error.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            error_message = f"Cannot reach leaderboard: {reason}"
+        except (RuntimeError, json.JSONDecodeError, UnicodeError) as error:
+            error_message = str(error)
+        return data, error_message
+
+    def pump(self) -> None:
+        while True:
+            try:
+                callback, data, error_message = self.results.get_nowait()
+            except queue.Empty:
+                return
+            callback(data, error_message)
+
+
+def historical_run_from_log(path: Path) -> dict[str, Any] | None:
+    """Read one completed extraction into the server's imported-run format."""
+    source_hasher = hashlib.sha256()
+    start: CombatEvent | None = None
+    end: CombatEvent | None = None
+    extracted = False
+    party_size = 1
+    game_version = "unknown"
+    total_damage = 0.0
+    total_healing = 0.0
+    total_shielding = 0.0
+    largest_hit = 0.0
+    best_damage_30 = 0.0
+    damage_window: deque[tuple[float, float]] = deque()
+    combat_clock_ms = 0.0
+    last_run_elapsed_ms: float | None = None
+    timing_in_combat = False
+    first_combat_at: float | None = None
+    last_combat_at: float | None = None
+    parsed_event_names = {
+        "run_start", "run_end", "room_end", "encounter_start", "encounter_end",
+        "damage", "damage_dealt", "damaged", "hit",
+        "heal", "healing_done", "healing_dealt", "heal_dealt", "heal_applied",
+        "healing", "healed", "shield", "shield_gained",
+    }
+    try:
+        with path.open("rb") as handle:
+            for raw in handle:
+                source_hasher.update(raw)
+                try:
+                    root = json.loads(raw.decode("utf-8-sig"))
+                except (json.JSONDecodeError, UnicodeError):
+                    continue
+                if not isinstance(root, dict):
+                    continue
+                raw_type = str(root.get("event", "")).strip().lower()
+                data = root.get("data") if isinstance(root.get("data"), dict) else {}
+                if raw_type == "log_header":
+                    game_version = str(data.get("client_version") or data.get("game_version") or "unknown")[:40]
+                elapsed_value = root.get("run_elapsed_ms")
+                if elapsed_value is not None:
+                    try:
+                        elapsed = max(0.0, float(elapsed_value))
+                        if timing_in_combat and last_run_elapsed_ms is not None:
+                            combat_clock_ms += min(max(0.0, elapsed - last_run_elapsed_ms),
+                                                   CombatSession.PAUSE_GAP_MS)
+                        last_run_elapsed_ms = elapsed if last_run_elapsed_ms is None else max(
+                            last_run_elapsed_ms, elapsed)
+                    except (TypeError, ValueError):
+                        pass
+                if raw_type == "encounter_start":
+                    subtype = str(data.get("encounter_subtype") or data.get("room_subtype") or "").lower()
+                    timing_in_combat = not CombatSession._is_noncombat(subtype)
+                elif raw_type in {"encounter_end", "room_end", "run_end"}:
+                    timing_in_combat = False
+                if raw_type not in parsed_event_names:
+                    continue
+                parsed = parse_combat_event(root)
+                if parsed is None:
+                    continue
+                event = parsed
+                if event.type == "combat_start" and start is None:
+                    start = event
+                    try:
+                        party_size = min(8, max(1, int(float(data.get("party_size", 1)))))
+                    except (TypeError, ValueError):
+                        party_size = 1
+                elif event.type == "room_end" and event.run_end_reason in {"extraction", "extracted"}:
+                    extracted = True
+                elif event.type == "combat_end":
+                    end = event
+                if start is None or not is_own_event(event) or event.amount <= 0:
+                    continue
+                if event.type == "damage":
+                    amount = event.applied_amount
+                    total_damage += amount
+                    largest_hit = max(largest_hit, amount)
+                    damage_window.append((event.timestamp, amount))
+                    while damage_window and event.timestamp - damage_window[0][0] > 30:
+                        damage_window.popleft()
+                    best_damage_30 = max(best_damage_30, sum(value for _, value in damage_window))
+                elif event.type == "heal":
+                    total_healing += event.amount
+                elif event.type == "shield":
+                    total_shielding += event.amount
+                if event.type in {"damage", "heal", "shield"}:
+                    first_combat_at = event.timestamp if first_combat_at is None else first_combat_at
+                    last_combat_at = event.timestamp
+    except OSError:
+        return None
+    if (start is None or end is None or not extracted
+            or end.run_end_reason not in {"extraction", "extracted"}):
+        return None
+    display = start.dungeon_name or map_name_from_log_path(str(path))
+    dungeon, difficulty = split_dungeon_difficulty(display)
+    run_time_ms = round(
+        end.run_elapsed_ms
+        if end.run_elapsed_ms is not None and end.run_elapsed_ms > 0
+        else max(0.0, (end.timestamp - start.timestamp) * 1000.0))
+    if run_time_ms < 30_000 or run_time_ms > 28_800_000:
+        return None
+    fallback_combat_ms = ((last_combat_at - first_combat_at) * 1000.0
+                          if first_combat_at is not None and last_combat_at is not None else 0.0)
+    combat_time_ms = round(combat_clock_ms or fallback_combat_ms)
+    combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
+    return {
+        "dungeon": dungeon,
+        "difficulty": difficulty,
+        "partySize": party_size,
+        "gameVersion": game_version,
+        "meterVersion": VERSION,
+        "runTimeMs": run_time_ms,
+        "combatTimeMs": combat_time_ms,
+        "totalDamage": round(total_damage),
+        "bestDamage30": round(best_damage_30),
+        "largestHit": round(largest_hit),
+        "totalHealing": round(total_healing),
+        "totalShielding": round(total_shielding),
+        "sourceHash": source_hasher.hexdigest(),
+    }
+
+
+class LeaderboardRunTracker:
+    """Builds live hash checkpoints and submits only completed extractions."""
+
+    CHECKPOINT_SECONDS = 15.0
+
+    def __init__(self, client: LeaderboardClient, enabled: Callable[[], bool],
+                 status_callback: Callable[[str], None], submitted_callback: Callable[[], None]) -> None:
+        self.client = client
+        self.enabled = enabled
+        self.status_callback = status_callback
+        self.submitted_callback = submitted_callback
+        self.game_version = "unknown"
+        self.reset_log()
+
+    def reset_log(self) -> None:
+        self.generation = getattr(self, "generation", 0) + 1
+        self.digest = bytes(32)
+        self.observed_bytes = 0
+        self.session_id: str | None = None
+        self.run_active = False
+        self.starting = False
+        self.checkpoint_inflight = False
+        self.finish_inflight = False
+        self.checkpoints_sent = 0
+        self.last_checkpoint_hash = ""
+        self.next_checkpoint_at = 0.0
+        self.retry_at = 0.0
+        self.last_sequence = 0
+        self.last_run_elapsed_ms = 0
+        self.dungeon = "Unknown Dungeon"
+        self.difficulty = "Stable"
+        self.party_size = 1
+        self.extracted = False
+        self.total_damage = 0.0
+        self.total_healing = 0.0
+        self.total_shielding = 0.0
+        self.largest_hit = 0.0
+        self.damage_window: deque[tuple[float, float]] = deque()
+        self.best_damage_30 = 0.0
+        self.pending_finish: dict[str, Any] | None = None
+        self.invalidated = False
+
+    @property
+    def chain_hash(self) -> str:
+        return self.digest.hex()
+
+    def observe(self, root: dict[str, Any], raw: bytes, event: CombatEvent | None,
+                session_snapshot: dict[str, Any]) -> None:
+        self.digest = hashlib.sha256(self.digest + raw).digest()
+        self.observed_bytes += len(raw) + 1
+        if event is not None:
+            if event.sequence is not None:
+                if self.run_active and self.last_sequence and int(event.sequence) < self.last_sequence:
+                    self.invalidate("Run excluded: combat log was recalculated")
+                    return
+                self.last_sequence = max(self.last_sequence, int(event.sequence))
+            if event.run_elapsed_ms is not None:
+                self.last_run_elapsed_ms = max(self.last_run_elapsed_ms, round(event.run_elapsed_ms))
+
+        raw_type = str(root.get("event", "")).strip().lower()
+        data = root.get("data") if isinstance(root.get("data"), dict) else {}
+        if raw_type == "log_header":
+            self.game_version = str(data.get("client_version") or data.get("game_version") or "unknown")[:40]
+
+        if event is None:
+            return
+        if self.invalidated:
+            return
+        if event.type == "combat_start":
+            self.run_active = True
+            display = event.dungeon_name or self.dungeon
+            self.dungeon, self.difficulty = split_dungeon_difficulty(display)
+            try:
+                self.party_size = min(8, max(1, int(float(data.get("party_size", 1)))))
+            except (TypeError, ValueError):
+                self.party_size = 1
+            if self.enabled() and self.client.token:
+                self._start_session()
+            return
+
+        if event.type == "room_end" and event.run_end_reason in {"extraction", "extracted"}:
+            self.extracted = True
+
+        if self.run_active and is_own_event(event) and event.amount > 0:
+            if event.type == "damage":
+                amount = event.applied_amount
+                self.total_damage += amount
+                self.largest_hit = max(self.largest_hit, amount)
+                self.damage_window.append((event.timestamp, amount))
+                while self.damage_window and event.timestamp - self.damage_window[0][0] > 30:
+                    self.damage_window.popleft()
+                self.best_damage_30 = max(self.best_damage_30,
+                                          sum(value for _, value in self.damage_window))
+            elif event.type == "heal":
+                self.total_healing += event.amount
+            elif event.type == "shield":
+                self.total_shielding += event.amount
+
+        if event.type == "combat_end":
+            self.run_active = False
+            extracted = (self.extracted
+                         and event.run_end_reason in {"extraction", "extracted"})
+            run_time_ms = round(self.last_run_elapsed_ms or event.run_elapsed_ms or 0)
+            run_time_ms = max(30_000, run_time_ms)
+            combat_time_ms = round(float(session_snapshot.get("duration", 0.0)) * 1000.0)
+            combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
+            self.pending_finish = {
+                "extracted": extracted,
+                "runTimeMs": run_time_ms,
+                "combatTimeMs": combat_time_ms,
+                "totalDamage": round(self.total_damage),
+                "bestDamage30": round(self.best_damage_30),
+                "largestHit": round(self.largest_hit),
+                "totalHealing": round(self.total_healing),
+                "totalShielding": round(self.total_shielding),
+                "finalSequence": self.last_sequence,
+                "finalChainHash": self.chain_hash,
+            }
+            self._ensure_finish()
+
+    def invalidate(self, message: str) -> None:
+        if not self.run_active and self.pending_finish is None:
+            return
+        self.invalidated = True
+        self.run_active = False
+        self.pending_finish = None
+        self.status_callback(message)
+
+    def _start_session(self) -> None:
+        if self.starting or self.session_id is not None:
+            return
+        self.starting = True
+        generation = self.generation
+        self.status_callback("Opening live leaderboard session…")
+        body = {
+            "dungeon": self.dungeon,
+            "difficulty": self.difficulty,
+            "partySize": self.party_size,
+            "gameVersion": self.game_version,
+            "meterVersion": VERSION,
+        }
+
+        def complete(data: dict[str, Any] | None, error_message: str | None) -> None:
+            if generation != self.generation:
+                return
+            self.starting = False
+            if error_message or not data or not data.get("sessionId"):
+                self.retry_at = time.monotonic() + 5.0
+                self.status_callback(error_message or "Could not open leaderboard session.")
+                return
+            self.session_id = str(data["sessionId"])
+            self.retry_at = 0.0
+            self.status_callback("Live run connected")
+            self._send_checkpoint()
+
+        self.client.request("POST", "/v1/runs/start", body, complete, authenticated=True)
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        if (self.run_active and not self.session_id and not self.starting and self.enabled()
+                and self.client.token and now >= self.retry_at):
+            self._start_session()
+        if self.pending_finish is not None and now >= self.retry_at:
+            self._ensure_finish()
+        if (self.run_active and self.session_id and not self.checkpoint_inflight
+                and self.chain_hash != self.last_checkpoint_hash
+                and now >= self.next_checkpoint_at):
+            self._send_checkpoint()
+
+    def _send_checkpoint(self) -> None:
+        if not self.session_id or self.checkpoint_inflight:
+            return
+        self.checkpoint_inflight = True
+        generation = self.generation
+        active_session = self.session_id
+        ordinal = self.checkpoints_sent + 1
+        body = {
+            "ordinal": ordinal,
+            "sequence": self.last_sequence,
+            "runElapsedMs": self.last_run_elapsed_ms,
+            "chainHash": self.chain_hash,
+            "observedBytes": self.observed_bytes,
+        }
+
+        def complete(_data: dict[str, Any] | None, error_message: str | None) -> None:
+            if generation != self.generation or active_session != self.session_id:
+                return
+            self.checkpoint_inflight = False
+            if error_message:
+                self.retry_at = time.monotonic() + 5.0
+                self.next_checkpoint_at = self.retry_at
+                self.status_callback(error_message)
+                return
+            self.checkpoints_sent = ordinal
+            self.last_checkpoint_hash = str(body["chainHash"])
+            self.retry_at = 0.0
+            self.next_checkpoint_at = time.monotonic() + self.CHECKPOINT_SECONDS
+            if self.pending_finish is not None:
+                self._ensure_finish()
+
+        self.client.request("POST", f"/v1/runs/{self.session_id}/checkpoint", body,
+                            complete, authenticated=True)
+
+    def _ensure_finish(self) -> None:
+        if self.pending_finish is None or self.finish_inflight:
+            return
+        if time.monotonic() < self.retry_at:
+            return
+        if not self.session_id:
+            if not self.starting:
+                self.pending_finish = None
+            return
+        if self.checkpoint_inflight:
+            return
+        if (self.checkpoints_sent < 2
+                or self.last_checkpoint_hash != str(self.pending_finish.get("finalChainHash") or "")):
+            self._send_checkpoint()
+            return
+        body = dict(self.pending_finish)
+        self.finish_inflight = True
+        generation = self.generation
+        active_session = self.session_id
+
+        def complete(data: dict[str, Any] | None, error_message: str | None) -> None:
+            if generation != self.generation or active_session != self.session_id:
+                return
+            self.finish_inflight = False
+            if error_message:
+                self.retry_at = time.monotonic() + 5.0
+                self.status_callback(error_message)
+                return
+            self.pending_finish = None
+            self.retry_at = 0.0
+            if data and data.get("leaderboardEligible"):
+                self.status_callback("Run submitted to leaderboard")
+                self.submitted_callback()
+            else:
+                self.status_callback("Abandoned run excluded from leaderboard")
+
+        self.client.request("POST", f"/v1/runs/{self.session_id}/finish", body,
+                            complete, authenticated=True)
+
+
 class AppSettings:
     DEFAULTS = {
         "CombatLogPath": None, "CombatLogFolder": None, "CleanupOldCombatLogs": False,
         "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
         "OverlayOpacity": 1.0, "FadeWhenAfk": False, "AfkFadeSeconds": 6.0,
+        "AutoUpdateEnabled": True,
         "IncludeOverkillDamage": False, "DamageEffects": False,
         "WindowWidth": None, "WindowHeight": None, "FontScale": 1.0,
         "CompactMode": False, "NormalWindowWidth": None, "NormalWindowHeight": None,
         "CompactWindowWidth": None, "CompactWindowHeight": None,
+        "LeaderboardEnabled": True, "LeaderboardDisplayName": "",
+        "LeaderboardPlayerId": "", "LeaderboardTokenProtected": "",
+        "LeaderboardCategory": "time", "LeaderboardDungeon": ALL_DUNGEONS,
+        "LeaderboardDifficulty": ALL_DIFFICULTIES,
+        "LeaderboardPartySize": "All", "LeaderboardSource": "live",
+        "LeaderboardHistoryScanned": False, "LeaderboardHistoryFiles": [],
+        "LeaderboardHistoryVersion": LEADERBOARD_HISTORY_VERSION,
     }
 
     def __init__(self) -> None:
@@ -986,6 +1940,22 @@ class AppSettings:
             loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 self.data.update({key: loaded[key] for key in self.DEFAULTS if key in loaded})
+                if "LeaderboardDungeon" not in loaded:
+                    self.data["LeaderboardDungeon"] = ALL_DUNGEONS
+                    self.data["LeaderboardDifficulty"] = ALL_DIFFICULTIES
+                elif str(self.data.get("LeaderboardDifficulty") or "").casefold() == "normal":
+                    selected_dungeon = str(self.data.get("LeaderboardDungeon") or ALL_DUNGEONS)
+                    self.data["LeaderboardDifficulty"] = (
+                        ALL_DIFFICULTIES if selected_dungeon == ALL_DUNGEONS
+                        else default_difficulty_for_dungeon(selected_dungeon))
+                try:
+                    history_version = int(loaded.get("LeaderboardHistoryVersion", 0))
+                except (TypeError, ValueError):
+                    history_version = 0
+                if history_version < LEADERBOARD_HISTORY_VERSION:
+                    self.data["LeaderboardHistoryFiles"] = []
+                    self.data["LeaderboardHistoryScanned"] = False
+                    self.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -1010,12 +1980,14 @@ class CombatLogWatcher:
 
     def __init__(self, configured_folder: str | None, cleanup_enabled: bool,
                  event_callback: Callable[[CombatEvent], None], log_callback: Callable[[str], None],
-                 status_callback: Callable[[bool, str], None]) -> None:
+                 status_callback: Callable[[bool, str], None],
+                 raw_callback: Callable[[dict[str, Any], bytes, CombatEvent | None], None] | None = None) -> None:
         self.folder = self._normalize_folder(configured_folder)
         self.cleanup_enabled = cleanup_enabled
         self.event_callback = event_callback
         self.log_callback = log_callback
         self.status_callback = status_callback
+        self.raw_callback = raw_callback
         self.resolver = CombatAbilityResolver()
         self.active_path: Path | None = None
         self.position = 0
@@ -1191,8 +2163,12 @@ class CombatLogWatcher:
             return
         self.resolver.observe(root)
         event = parse_combat_event(root)
+        resolved: CombatEvent | None = None
         if event is not None:
-            self.event_callback(self.resolver.resolve(event))
+            resolved = self.resolver.resolve(event)
+            self.event_callback(resolved)
+        if self.raw_callback is not None:
+            self.raw_callback(root, raw, resolved)
 
 
 class WindowsApi:
@@ -1348,15 +2324,33 @@ def mix_color(source: tuple[int, int, int], target: tuple[int, int, int], amount
 
 class MeterApp:
     FONT = "Segoe UI"
-    NORMAL_WINDOW_SIZE = (360, 650)
+    NORMAL_WINDOW_SIZE = (450, 650)
     COMPACT_WINDOW_SIZE = (520, 325)
-    NORMAL_MIN_SIZE = (320, 560)
+    NORMAL_MIN_SIZE = (450, 560)
     COMPACT_MIN_SIZE = (420, 300)
 
-    def __init__(self, log_override: str | None = None, smoke_seconds: float | None = None) -> None:
+    def __init__(self, log_override: str | None = None, smoke_seconds: float | None = None,
+                 smoke_view: str | None = None, smoke_compact: bool = False) -> None:
+        self._smoke_compact_override = smoke_compact
         self.settings = AppSettings()
         self.session = CombatSession()
         self.records = FlexRecordStore()
+        self.leaderboard_client = LeaderboardClient(
+            unprotect_secret(self.settings.get("LeaderboardTokenProtected")))
+        self.leaderboard_status = "Join to submit completed runs"
+        self.leaderboard_entries: list[dict[str, Any]] = []
+        self.leaderboard_loading = False
+        self.leaderboard_refresh_pending = False
+        self.leaderboard_auto_refresh_job: str | None = None
+        self.leaderboard_history_scanning = False
+        self.update_check_running = False
+        self.update_download_running = False
+        self.leaderboard_tracker = LeaderboardRunTracker(
+            self.leaderboard_client,
+            lambda: bool(self.settings.get("LeaderboardEnabled")),
+            self._set_leaderboard_status,
+            self._leaderboard_run_submitted,
+        )
         configured = log_override or self.settings.get("CombatLogFolder") or self.settings.get("CombatLogPath")
         self.process_status = "Looking for Soulbound…"
         self.process_connected = False
@@ -1381,6 +2375,8 @@ class MeterApp:
         self.settings.data["FontScale"] = self.font_scale
         self.current_view = "meter"
         self.compact_mode = bool(self.settings.get("CompactMode"))
+        if smoke_compact:
+            self.compact_mode = True
         self.closed = False
         self.theme_roles: list[tuple[tk.Widget, str | None, str | None]] = []
         self._font_targets: list[tuple[tk.Widget, int, str]] = []
@@ -1390,6 +2386,8 @@ class MeterApp:
         self.chance_boxes: list[tk.Frame] = []
         self.run_high_boxes: list[tk.Frame] = []
         self.ability_rows: list[dict[str, Any]] = []
+        self.stage_rows: list[dict[str, Any]] = []
+        self._last_stage_count = 0
         self.damage_effects: dict[str, tuple[str, float]] = {}
         self._ability_tooltip: tk.Toplevel | None = None
         self._ability_tooltip_row: dict[str, Any] | None = None
@@ -1435,6 +2433,7 @@ class MeterApp:
         self.view_host.pack(fill="both", expand=True)
         self._build_meter_view()
         self._build_flex_view()
+        self._build_leaderboard_view()
         self._build_settings_view()
         self._build_credit_and_grip()
         self._load_icons()
@@ -1443,7 +2442,7 @@ class MeterApp:
 
         self.watcher = CombatLogWatcher(
             configured, bool(self.settings.get("CleanupOldCombatLogs")), self._on_combat_event,
-            self._on_active_log, self._on_log_status,
+            self._on_active_log, self._on_log_status, self._on_raw_log_line,
         )
         if self.watcher.folder is None:
             self.watcher.folder = self.watcher.default_folder()
@@ -1453,6 +2452,15 @@ class MeterApp:
         self.win = WindowsApi(self.root)
         self.find_and_follow(force=True)
         self.root.after(20, self.tick)
+        if self.leaderboard_client.token and bool(self.settings.get("LeaderboardEnabled")):
+            self.root.after(1000, self.scan_leaderboard_history)
+        self.root.after(180, self.refresh_leaderboard_catalog)
+        if smoke_seconds is None and bool(self.settings.get("AutoUpdateEnabled")):
+            self.root.after(3500, self.check_for_updates)
+        if smoke_view in {"meter", "flex", "leaderboard"}:
+            self.root.after(60, lambda: self._show_main_view(smoke_view))
+            if smoke_view == "leaderboard":
+                self.root.after(120, self.refresh_leaderboard)
         if smoke_seconds:
             self.root.after(max(100, round(smoke_seconds * 1000)), self.close)
 
@@ -1536,6 +2544,8 @@ class MeterApp:
         controls.pack(side="right", anchor="n")
         self.view_button = self.button(controls, "Flex", self.toggle_view, width=4)
         self.view_button.pack(side="left", padx=(0, 4))
+        self.leaderboard_button = self.button(controls, "Ranks", self.toggle_leaderboard_view, width=5)
+        self.leaderboard_button.pack(side="left", padx=(0, 4))
         self.button(controls, "⚙", self.show_settings, width=2).pack(side="left", padx=(0, 4))
         self.compact_button = self.button(controls, "Compact", self.toggle_compact_mode, width=7)
         self.compact_button.pack(side="left", padx=(0, 4))
@@ -1701,8 +2711,16 @@ class MeterApp:
         self.follow_check.pack(anchor="w", pady=(4, 0))
         self.hotkey_hint = self.label(self.footer, "Alt+Shift+D toggles click-through lock", 6, foreground="dim")
         self.hotkey_hint.pack(anchor="w")
+
+        self.stage_timeline = self.panel(self.meter_view)
+        self.stage_timeline.pack(fill="x", side="bottom", pady=(6, 0))
+        self.stage_canvas = self.role(tk.Canvas(self.stage_timeline, height=44, borderwidth=0,
+                                                highlightthickness=0, xscrollincrement=32), "panel", None)
+        self.stage_canvas.pack(fill="x", padx=4, pady=3)
+        self.stage_canvas.bind("<Configure>", lambda _event: self._draw_stage_timeline())
+        self.stage_canvas.bind("<Shift-MouseWheel>", self._scroll_stage_timeline)
         # Repack the expandable list after the bottom-anchored footer so the
-        # footer always reserves its space and ability rows fill the gap.
+        # footer and room timeline reserve their space and ability rows fill the gap.
         self.abilities_frame.pack_forget()
         self.abilities_frame.pack(fill="both", expand=True)
 
@@ -1799,6 +2817,158 @@ class MeterApp:
             widget.bind("<Leave>", self._schedule_hide_dungeon_tooltip, add="+")
         self.records_path_label = self.label(self.flex_view, f"Records: {self.records.path}", 6, foreground="dim", anchor="w")
         self.records_path_label.pack(fill="x", pady=(7, 18))
+
+    def _build_leaderboard_view(self) -> None:
+        self.leaderboard_view = self.role(tk.Frame(self.view_host), "bg", None)
+        top = self.role(tk.Frame(self.leaderboard_view), "bg", None)
+        top.pack(fill="x", pady=(10, 7))
+        left = self.role(tk.Frame(top), "bg", None)
+        left.pack(side="left", fill="x", expand=True)
+        self.label(left, "COMMUNITY LEADERBOARD", 10, "bold", "text").pack(anchor="w")
+        self.leaderboard_status_label = self.label(left, self.leaderboard_status, 7, foreground="muted", anchor="w")
+        self.leaderboard_status_label.pack(fill="x")
+        self.leaderboard_mode_badge = self.label(top, "LIVE CAPTURED", 7, "bold", "accent")
+        self.leaderboard_mode_badge.pack(side="right", anchor="n")
+
+        self.leaderboard_identity = self.panel(self.leaderboard_view)
+        self.leaderboard_identity.pack(fill="x", pady=(0, 7))
+        identity_body = self.role(tk.Frame(self.leaderboard_identity), "panel", None)
+        identity_body.pack(fill="x", padx=8, pady=6)
+        self.leaderboard_identity_label = self.label(identity_body, "PLAYER NAME", 6, "bold", "muted")
+        self.leaderboard_identity_label.pack(side="left")
+        self.leaderboard_name_var = tk.StringVar(value=str(self.settings.get("LeaderboardDisplayName") or ""))
+        self.leaderboard_name_entry = tk.Entry(identity_body, textvariable=self.leaderboard_name_var,
+                                                font=(self.FONT, self._scaled_font_size(8)), relief="flat",
+                                                borderwidth=1, width=18)
+        self._register_font(self.leaderboard_name_entry, 8)
+        self.role(self.leaderboard_name_entry, "bg", "text")
+        self.leaderboard_name_entry.pack(side="left", fill="x", expand=True, padx=7, ipady=3)
+        self.leaderboard_join_button = self.button(identity_body, "Join", self.register_leaderboard_player, width=7)
+        self.leaderboard_join_button.pack(side="right")
+        self.leaderboard_scan_button = self.button(identity_body, "Scan history", self.scan_leaderboard_history, width=10)
+        self.leaderboard_scan_button.pack(side="right", padx=(0, 5))
+        self._update_leaderboard_identity()
+
+        filters = self.panel(self.leaderboard_view)
+        filters.pack(fill="x", pady=(0, 7))
+        filter_body = self.role(tk.Frame(filters), "panel", None)
+        filter_body.pack(fill="x", padx=8, pady=6)
+        self.label(filter_body, "DUNGEON", 6, "bold", "muted").grid(row=0, column=0, sticky="w")
+        self.label(filter_body, "DIFFICULTY", 6, "bold", "muted").grid(row=0, column=1, sticky="w", padx=(7, 0))
+        self.leaderboard_catalog: list[tuple[str, str]] = []
+        self.leaderboard_catalog_loading = False
+        self.leaderboard_dungeon_var = tk.StringVar(
+            value=str(self.settings.get("LeaderboardDungeon") or ALL_DUNGEONS))
+        self.leaderboard_difficulty_var = tk.StringVar(
+            value=str(self.settings.get("LeaderboardDifficulty") or ALL_DIFFICULTIES))
+        self.leaderboard_dungeon_menu = tk.OptionMenu(
+            filter_body, self.leaderboard_dungeon_var, ALL_DUNGEONS,
+            command=self._leaderboard_dungeon_changed)
+        self.leaderboard_dungeon_menu.configure(
+            font=(self.FONT, self._scaled_font_size(8)), relief="flat", borderwidth=0,
+            highlightthickness=0, padx=4, pady=3, anchor="w")
+        self._register_font(self.leaderboard_dungeon_menu, 8)
+        self.role(self.leaderboard_dungeon_menu, "button", "text")
+        self.leaderboard_dungeon_menu.grid(row=1, column=0, sticky="ew", pady=(2, 5))
+        self.leaderboard_difficulty_menu = tk.OptionMenu(
+            filter_body, self.leaderboard_difficulty_var, ALL_DIFFICULTIES,
+            command=self._leaderboard_filter_changed)
+        self.leaderboard_difficulty_menu.configure(
+            font=(self.FONT, self._scaled_font_size(8)), relief="flat", borderwidth=0,
+            highlightthickness=0, padx=4, pady=3, anchor="w")
+        self._register_font(self.leaderboard_difficulty_menu, 8)
+        self.role(self.leaderboard_difficulty_menu, "button", "text")
+        self.leaderboard_difficulty_menu.grid(row=1, column=1, sticky="ew", padx=(7, 0), pady=(2, 5))
+        filter_body.grid_columnconfigure((0, 1), weight=1, uniform="leaderboard_filters")
+
+        lower = self.role(tk.Frame(filter_body), "panel", None)
+        lower.grid(row=2, column=0, columnspan=2, sticky="ew")
+        stored_category = str(self.settings.get("LeaderboardCategory") or "time")
+        category_label = next((label for label, key in LEADERBOARD_CATEGORY_LABELS.items()
+                               if key == stored_category), "Fastest Time")
+        self.leaderboard_category_var = tk.StringVar(
+            value=category_label)
+        category_box = self.role(tk.Frame(lower), "panel", None)
+        category_box.pack(side="left", fill="x", expand=True)
+        self.label(category_box, "RANK BY", 6, "bold", "muted").pack(anchor="w")
+        self.leaderboard_category_menu = tk.OptionMenu(
+            category_box, self.leaderboard_category_var, *LEADERBOARD_CATEGORY_LABELS.keys(),
+            command=self._leaderboard_filter_changed)
+        self.leaderboard_category_menu.configure(
+            font=(self.FONT, self._scaled_font_size(7)), relief="flat", borderwidth=0,
+            highlightthickness=0, padx=4, pady=2, anchor="w")
+        self._register_font(self.leaderboard_category_menu, 7)
+        self.role(self.leaderboard_category_menu, "button", "text")
+        self.leaderboard_category_menu.pack(fill="x")
+        stored_party = str(self.settings.get("LeaderboardPartySize") or "All")
+        party_label = next((label for label, key in LEADERBOARD_PARTY_LABELS.items()
+                            if key == stored_party), "All Parties")
+        self.leaderboard_party_var = tk.StringVar(
+            value=party_label)
+        party_box = self.role(tk.Frame(lower), "panel", None)
+        party_box.pack(side="left", fill="x", expand=True, padx=5)
+        self.label(party_box, "PARTY", 6, "bold", "muted").pack(anchor="w")
+        self.leaderboard_party_menu = tk.OptionMenu(
+            party_box, self.leaderboard_party_var, *LEADERBOARD_PARTY_LABELS.keys(),
+            command=self._leaderboard_filter_changed)
+        self.leaderboard_party_menu.configure(
+            font=(self.FONT, self._scaled_font_size(7)), relief="flat", borderwidth=0,
+            highlightthickness=0, padx=4, pady=2, anchor="w")
+        self._register_font(self.leaderboard_party_menu, 7)
+        self.role(self.leaderboard_party_menu, "button", "text")
+        self.leaderboard_party_menu.pack(fill="x")
+        stored_source = str(self.settings.get("LeaderboardSource") or "live")
+        source_label = next((label for label, key in LEADERBOARD_SOURCE_LABELS.items()
+                             if key == stored_source), "Live Captured")
+        self.leaderboard_source_var = tk.StringVar(value=source_label)
+        source_box = self.role(tk.Frame(lower), "panel", None)
+        source_box.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.label(source_box, "SOURCE", 6, "bold", "muted").pack(anchor="w")
+        source_menu = tk.OptionMenu(
+            source_box, self.leaderboard_source_var, *LEADERBOARD_SOURCE_LABELS.keys(),
+            command=self._leaderboard_source_changed)
+        source_menu.configure(font=(self.FONT, self._scaled_font_size(7)), relief="flat", borderwidth=0,
+                              highlightthickness=0, padx=4, pady=2, anchor="w")
+        self._register_font(source_menu, 7)
+        self.role(source_menu, "button", "text")
+        source_menu.pack(fill="x")
+        self.button(lower, "Refresh", self.refresh_leaderboard, width=7).pack(side="right", anchor="s", pady=(12, 0))
+
+        table = self.panel(self.leaderboard_view)
+        table.pack(fill="both", expand=True)
+        table_header = self.role(tk.Frame(table), "panel", None)
+        table_header.pack(fill="x", padx=7, pady=(6, 3))
+        self.label(table_header, "#", 6, "bold", "muted", width=3, anchor="w").pack(side="left")
+        self.leaderboard_name_heading = self.label(
+            table_header, "PLAYER", 6, "bold", "muted", anchor="w")
+        self.leaderboard_name_heading.pack(side="left", fill="x", expand=True)
+        self.leaderboard_party_heading = self.label(
+            table_header, "PARTY", 6, "bold", "muted", width=9, anchor="center")
+        self.leaderboard_party_heading.pack(side="left")
+        self.leaderboard_score_heading = self.label(table_header, "TIME", 6, "bold", "muted", width=12, anchor="e")
+        self.leaderboard_score_heading.pack(side="right")
+        self.leaderboard_rows: list[dict[str, tk.Widget]] = []
+        for index in range(10):
+            row = self.role(tk.Frame(table), "panel", None)
+            row.pack(fill="x", padx=7, pady=1)
+            rank = self.label(row, str(index + 1), 8, "bold", "muted", width=3, anchor="w")
+            rank.pack(side="left")
+            player = self.label(row, "—", 8, foreground="text", anchor="w")
+            player.pack(side="left", fill="x", expand=True)
+            party = self.label(row, "—", 7, foreground="muted", width=9, anchor="center")
+            party.pack(side="left")
+            score = self.label(row, "—", 8, "bold", "accent", width=12, anchor="e")
+            score.pack(side="right")
+            self.leaderboard_rows.append({"frame": row, "rank": rank, "player": player,
+                                          "party": party, "score": score})
+        self.leaderboard_empty_label = self.label(table, "No scores found for these filters.", 8,
+                                                   foreground="muted")
+        self.leaderboard_empty_label.pack(pady=12)
+        self.leaderboard_note = self.label(
+            self.leaderboard_view,
+            "Live captured = the meter observed and checkpointed the run while it happened.",
+            6, foreground="dim", anchor="w")
+        self.leaderboard_note.pack(fill="x", pady=(5, 16))
 
     def _build_settings_view(self) -> None:
         self.settings_view = self.role(tk.Frame(self.outer, highlightthickness=1), "bg", None)
@@ -1937,6 +3107,36 @@ class MeterApp:
         self.label(self.settings_body,
                    "Briefly colors an ability bar and amount red for crit, orange for heavy, or purple for devastating.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        self.label(self.settings_body, "LEADERBOARD", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
+        self.leaderboard_enabled_var = tk.BooleanVar(value=bool(self.settings.get("LeaderboardEnabled")))
+        leaderboard_enabled = tk.Checkbutton(
+            self.settings_body, text="Submit completed runs to the community leaderboard",
+            variable=self.leaderboard_enabled_var, command=self.leaderboard_enabled_changed,
+            font=(self.FONT, self._scaled_font_size(8)), borderwidth=0,
+            highlightthickness=0, anchor="w", justify="left")
+        self._register_font(leaderboard_enabled, 8)
+        self.role(leaderboard_enabled, "bg", "text")
+        leaderboard_enabled.pack(anchor="w", padx=15)
+        self.label(self.settings_body,
+                   "Requires a player name in the Ranks tab. Only completed extractions are eligible; abandoned runs are excluded.",
+                   7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        self.label(self.settings_body, "UPDATES", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
+        self.auto_update_var = tk.BooleanVar(value=bool(self.settings.get("AutoUpdateEnabled")))
+        auto_update = tk.Checkbutton(
+            self.settings_body, text="Check for updates automatically",
+            variable=self.auto_update_var, command=self.auto_update_changed,
+            font=(self.FONT, self._scaled_font_size(8)), borderwidth=0,
+            highlightthickness=0, anchor="w", justify="left")
+        self._register_font(auto_update, 8)
+        self.role(auto_update, "bg", "text")
+        auto_update.pack(anchor="w", padx=15)
+        update_row = self.role(tk.Frame(self.settings_body), "bg", None)
+        update_row.pack(fill="x", padx=(34, 15), pady=(4, 0))
+        self.label(update_row, f"Installed: {VERSION}", 7, foreground="muted").pack(side="left")
+        self.button(update_row, "Check now", lambda: self.check_for_updates(show_current=True)).pack(side="right")
+        self.label(self.settings_body,
+                   "Updates are downloaded from this project's GitHub Releases, verified, installed beside this copy, and reopened only after you approve.",
+                   7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
         self.label(self.settings_body, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.cleanup_var = tk.BooleanVar(value=bool(self.settings.get("CleanupOldCombatLogs")))
         cleanup = tk.Checkbutton(self.settings_body, text="Delete verified old combat logs; keep newest 10",
@@ -2072,6 +3272,18 @@ class MeterApp:
     def _position_settings_entry(self) -> None:
         pass
 
+    def _set_leaderboard_status(self, message: str) -> None:
+        self.leaderboard_status = message
+        if hasattr(self, "leaderboard_status_label"):
+            self.leaderboard_status_label.configure(text=message)
+
+    def _leaderboard_run_submitted(self) -> None:
+        if self.current_view == "leaderboard":
+            self.refresh_leaderboard()
+
+    def _on_raw_log_line(self, root: dict[str, Any], raw: bytes, event: CombatEvent | None) -> None:
+        self.leaderboard_tracker.observe(root, raw, event, self.session.snapshot())
+
     def _on_combat_event(self, event: CombatEvent) -> None:
         if bool(self.settings.get("DamageEffects")):
             effect = damage_effect_kind(event)
@@ -2086,7 +3298,14 @@ class MeterApp:
         self.session.reset()
         self.damage_effects.clear()
         self.records.begin_log(path)
+        self.leaderboard_tracker.reset_log()
         self.current_map = map_name_from_log_path(path)
+        dungeon, difficulty = split_dungeon_difficulty(self.current_map)
+        self.leaderboard_tracker.dungeon = dungeon
+        self.leaderboard_tracker.difficulty = difficulty
+        if hasattr(self, "leaderboard_catalog") and (dungeon, difficulty) not in self.leaderboard_catalog:
+            self.leaderboard_catalog.append((dungeon, difficulty))
+            self._update_leaderboard_filter_menus()
 
     def _on_log_status(self, connected: bool, message: str) -> None:
         self.log_connected = connected
@@ -2121,6 +3340,7 @@ class MeterApp:
     def include_overkill_changed(self) -> None:
         enabled = bool(self.include_overkill_var.get())
         self.settings.set("IncludeOverkillDamage", enabled)
+        self.leaderboard_tracker.invalidate("Run excluded: damage totals were recalculated")
         self.session.reset()
         if self.watcher.active_path is not None:
             self.watcher.position = 0
@@ -2135,6 +3355,525 @@ class MeterApp:
         if not enabled:
             self.damage_effects.clear()
         self.refresh()
+
+    def auto_update_changed(self) -> None:
+        enabled = bool(self.auto_update_var.get())
+        self.settings.set("AutoUpdateEnabled", enabled)
+        if enabled:
+            self.check_for_updates()
+
+    def check_for_updates(self, show_current: bool = False) -> None:
+        if self.closed or self.update_check_running or self.update_download_running:
+            return
+        self.update_check_running = True
+
+        def worker() -> None:
+            info: UpdateInfo | None = None
+            error: Exception | None = None
+            try:
+                info = fetch_latest_update(bool(getattr(sys, "frozen", False)))
+            except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as caught:
+                error = caught
+            try:
+                self.root.after(0, lambda: self._finish_update_check(info, error, show_current))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+    def _finish_update_check(self, info: UpdateInfo | None, error: Exception | None,
+                             show_current: bool) -> None:
+        self.update_check_running = False
+        if self.closed:
+            return
+        if error is not None:
+            if show_current:
+                messagebox.showerror(
+                    "DPS Meter Update",
+                    f"The update check could not be completed.\n\n{error}",
+                    parent=self.root,
+                )
+            return
+        if info is None or not is_newer_version(info.version):
+            if show_current:
+                messagebox.showinfo(
+                    "DPS Meter Update",
+                    f"You already have the newest version.\n\nInstalled: {VERSION}",
+                    parent=self.root,
+                )
+            return
+        accepted = messagebox.askyesno(
+            "DPS Meter Update Available",
+            f"DPS Meter {info.version} is ready.\n\n"
+            f"Installed version: {VERSION}\n"
+            "Would you like to download, install, and reopen it now?",
+            parent=self.root,
+        )
+        if accepted:
+            self._start_update_download(info)
+
+    def _start_update_download(self, info: UpdateInfo) -> None:
+        if self.closed or self.update_download_running:
+            return
+        self.update_download_running = True
+        self.log_status = f"Downloading DPS Meter {info.version}..."
+
+        def worker() -> None:
+            staged: Path | None = None
+            error: Exception | None = None
+            try:
+                staged = download_update_asset(info, current_program_path())
+            except (OSError, ValueError, urllib.error.URLError) as caught:
+                error = caught
+            try:
+                self.root.after(0, lambda: self._finish_update_download(staged, error))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, name="update-download", daemon=True).start()
+
+    def _finish_update_download(self, staged: Path | None, error: Exception | None) -> None:
+        self.update_download_running = False
+        if self.closed:
+            return
+        if error is not None or staged is None:
+            self.log_status = "Update download failed"
+            messagebox.showerror(
+                "DPS Meter Update",
+                "The update was not installed. Your current copy is unchanged.\n\n"
+                f"{error or 'The downloaded update was unavailable.'}",
+                parent=self.root,
+            )
+            return
+        target = current_program_path()
+        try:
+            spawn_detached(
+                program_command(staged, "--apply-update", str(target), "--wait-pid", str(os.getpid())),
+                target.parent,
+            )
+        except OSError as error:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.log_status = "Update could not start"
+            messagebox.showerror(
+                "DPS Meter Update",
+                "The verified update was downloaded, but the installer could not start. "
+                "Your current copy is unchanged.\n\n"
+                f"{error}",
+                parent=self.root,
+            )
+            return
+        self.log_status = "Installing update..."
+        self.root.after(100, self.close)
+
+    def leaderboard_enabled_changed(self) -> None:
+        enabled = bool(self.leaderboard_enabled_var.get())
+        self.settings.set("LeaderboardEnabled", enabled)
+        self._update_leaderboard_identity()
+        self._set_leaderboard_status(
+            "Leaderboard submissions enabled" if enabled else "Leaderboard submissions disabled")
+        if enabled and self.leaderboard_client.token:
+            self.root.after(100, self.scan_leaderboard_history)
+
+    def _update_leaderboard_identity(self) -> None:
+        if not hasattr(self, "leaderboard_name_entry"):
+            return
+        display_name = str(self.settings.get("LeaderboardDisplayName") or "")
+        connected = bool(self.leaderboard_client.token and display_name)
+        if connected:
+            self.leaderboard_name_var.set(display_name)
+            self.leaderboard_name_entry.configure(state="disabled")
+            self.leaderboard_join_button.configure(text="Change")
+            self.leaderboard_identity_label.configure(text="SIGNED IN AS")
+            self.leaderboard_scan_button.configure(
+                state="normal" if bool(self.settings.get("LeaderboardEnabled")) else "disabled")
+            self._set_leaderboard_status(f"Connected as {display_name}")
+        else:
+            self.leaderboard_name_entry.configure(state="normal")
+            self.leaderboard_join_button.configure(text="Join")
+            self.leaderboard_identity_label.configure(text="PLAYER NAME")
+            self.leaderboard_scan_button.configure(state="disabled")
+            self._set_leaderboard_status("Join to submit completed runs")
+
+    def register_leaderboard_player(self) -> None:
+        if self.leaderboard_client.token:
+            if not messagebox.askyesno(
+                    "Change leaderboard player",
+                    "Use a different leaderboard name on this computer? Existing scores will remain under the old name.",
+                    parent=self.root):
+                return
+            self.leaderboard_client.token = ""
+            self.settings.data["LeaderboardTokenProtected"] = ""
+            self.settings.data["LeaderboardPlayerId"] = ""
+            self.settings.data["LeaderboardDisplayName"] = ""
+            self.settings.data["LeaderboardHistoryScanned"] = False
+            self.settings.data["LeaderboardHistoryFiles"] = []
+            self.settings.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
+            self.settings.save()
+            self.leaderboard_name_var.set("")
+            self._update_leaderboard_identity()
+            return
+        display_name = self.leaderboard_name_var.get().strip()
+        if (len(display_name) < 3 or len(display_name) > 24
+                or re.fullmatch(r"[A-Za-z0-9 _-]+", display_name) is None):
+            messagebox.showerror(
+                "Invalid player name",
+                "Use 3-24 characters: letters, numbers, spaces, underscores, or hyphens.",
+                parent=self.root)
+            return
+        self.leaderboard_join_button.configure(state="disabled", text="Joining…")
+        self._set_leaderboard_status("Registering player…")
+
+        def complete(data: dict[str, Any] | None, error_message: str | None) -> None:
+            self.leaderboard_join_button.configure(state="normal")
+            if error_message or not data or not data.get("token"):
+                self.leaderboard_join_button.configure(text="Join")
+                self._set_leaderboard_status(error_message or "Registration failed.")
+                return
+            player = data.get("player") if isinstance(data.get("player"), dict) else {}
+            token = str(data["token"])
+            protected = protect_secret(token)
+            if not protected:
+                self.leaderboard_join_button.configure(text="Join")
+                self._set_leaderboard_status("Windows could not securely save the player token.")
+                return
+            self.leaderboard_client.token = token
+            self.settings.data["LeaderboardTokenProtected"] = protected
+            self.settings.data["LeaderboardPlayerId"] = str(player.get("id") or "")
+            self.settings.data["LeaderboardDisplayName"] = str(player.get("displayName") or display_name)
+            self.settings.data["LeaderboardHistoryScanned"] = False
+            self.settings.data["LeaderboardHistoryFiles"] = []
+            self.settings.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
+            self.settings.save()
+            self._update_leaderboard_identity()
+            self.scan_leaderboard_history()
+
+        self.leaderboard_client.request("POST", "/v1/players/register",
+                                        {"displayName": display_name}, complete)
+
+    def scan_leaderboard_history(self) -> None:
+        if self.leaderboard_history_scanning:
+            return
+        if not bool(self.settings.get("LeaderboardEnabled")):
+            self._set_leaderboard_status("Enable leaderboard submissions in Settings first.")
+            return
+        if not self.leaderboard_client.token:
+            self._set_leaderboard_status("Join the leaderboard before scanning history.")
+            return
+        folder = self.watcher.folder
+        if folder is None or not folder.is_dir():
+            self._set_leaderboard_status("Combat-log folder was not found.")
+            return
+        self.leaderboard_history_scanning = True
+        self.leaderboard_scan_button.configure(state="disabled", text="Scanning…")
+        self._set_leaderboard_status("Scanning completed dungeon logs…")
+
+        def worker() -> None:
+            active_path = self.watcher.active_path
+            try:
+                active_path = active_path.resolve() if active_path is not None else None
+            except OSError:
+                active_path = None
+            processed = {str(item) for item in (self.settings.get("LeaderboardHistoryFiles") or [])
+                         if isinstance(item, str)}
+            all_candidates = sorted(
+                (path for path in CombatLogWatcher.files(folder) if CombatLogWatcher.verified(path)),
+                key=lambda path: path.name.casefold())
+            candidates: list[tuple[Path, str]] = []
+            for path in all_candidates:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                signature = f"{path.name}|{stat.st_size}|{stat.st_mtime_ns}"
+                if signature not in processed:
+                    candidates.append((path, signature))
+            imported = duplicate = eligible = errors = 0
+            for index, (path, signature) in enumerate(candidates, 1):
+                payload = historical_run_from_log(path)
+                if payload is None:
+                    try:
+                        is_active = active_path is not None and path.resolve() == active_path
+                    except OSError:
+                        is_active = False
+                    if not is_active:
+                        processed.add(signature)
+                    continue
+                eligible += 1
+                data, error_message = self.leaderboard_client.request_sync(
+                    "POST", "/v1/runs/import", payload, authenticated=True)
+                if error_message or not data:
+                    errors += 1
+                elif data.get("imported"):
+                    imported += 1
+                    processed.add(signature)
+                else:
+                    duplicate += 1
+                    processed.add(signature)
+                if index % 5 == 0 or index == len(candidates):
+                    message = f"Scanning history… {index}/{len(candidates)} files"
+                    self.leaderboard_client.results.put(
+                        (lambda result, _error: self._set_leaderboard_status(str((result or {}).get("message", ""))),
+                         {"message": message}, None))
+
+            summary = {
+                "files": len(candidates), "eligible": eligible, "imported": imported,
+                "duplicate": duplicate, "errors": errors, "processedFiles": sorted(processed),
+            }
+            self.leaderboard_client.results.put((complete, summary, None))
+
+        def complete(data: dict[str, Any] | None, _error_message: str | None) -> None:
+            self.leaderboard_history_scanning = False
+            self.leaderboard_scan_button.configure(state="normal", text="Scan history")
+            summary = data or {}
+            imported = int(summary.get("imported", 0))
+            duplicate = int(summary.get("duplicate", 0))
+            eligible = int(summary.get("eligible", 0))
+            errors = int(summary.get("errors", 0))
+            processed_files = summary.get("processedFiles")
+            if isinstance(processed_files, list):
+                self.settings.data["LeaderboardHistoryFiles"] = processed_files
+            self.settings.data["LeaderboardHistoryScanned"] = errors == 0
+            self.settings.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
+            self.settings.save()
+            if errors:
+                self._set_leaderboard_status(
+                    f"History scan: {imported} imported, {duplicate} already added, {errors} failed")
+                return
+            if eligible == 0:
+                self._set_leaderboard_status(
+                    "Imported history is up to date." if int(summary.get("files", 0)) == 0
+                    else "No new completed extraction logs were found.")
+                return
+            self._set_leaderboard_status(
+                f"History scan: {imported} imported · {duplicate} already added")
+            self.leaderboard_source_var.set("Imported History")
+            self.settings.set("LeaderboardSource", "imported")
+            self.refresh_leaderboard_catalog()
+            self.refresh_leaderboard()
+
+        threading.Thread(target=worker, name="SoulboundHistoryImport", daemon=True).start()
+
+    @staticmethod
+    def _normalized_catalog_pair(dungeon: str, difficulty: str) -> tuple[str, str]:
+        clean_dungeon = dungeon.strip()
+        clean_difficulty = difficulty.strip()
+        if clean_difficulty.casefold() == "normal":
+            clean_difficulty = default_difficulty_for_dungeon(clean_dungeon)
+        elif not clean_difficulty:
+            clean_difficulty = default_difficulty_for_dungeon(clean_dungeon)
+        return clean_dungeon, clean_difficulty
+
+    @staticmethod
+    def _replace_option_values(menu: tk.OptionMenu, variable: tk.StringVar,
+                               values: list[str], command: Callable[[str], None] | None = None) -> None:
+        popup = menu["menu"]
+        popup.delete(0, "end")
+        for value in values:
+            popup.add_command(label=value, command=tk._setit(variable, value, command))
+
+    def _local_leaderboard_catalog(self) -> list[tuple[str, str]]:
+        pairs = {(dungeon, difficulty)
+                 for dungeon, difficulties in KNOWN_DUNGEON_DIFFICULTIES.items()
+                 for difficulty in difficulties}
+        runs = self.records.snapshot().get("DungeonRuns", {})
+        if isinstance(runs, dict):
+            for dungeon, difficulties in runs.items():
+                if not isinstance(difficulties, dict):
+                    continue
+                for difficulty in difficulties:
+                    pairs.add(self._normalized_catalog_pair(str(dungeon), str(difficulty)))
+        dungeon, difficulty = split_dungeon_difficulty(self.current_map)
+        if dungeon not in {"Waiting for dungeon", "Unknown Dungeon", "Unknown map"}:
+            pairs.add((dungeon, difficulty))
+        return sorted(pairs, key=lambda item: (item[0].casefold(), item[1].casefold()))
+
+    def _update_leaderboard_filter_menus(self) -> None:
+        pairs = set(self._local_leaderboard_catalog())
+        pairs.update(self.leaderboard_catalog)
+        self.leaderboard_catalog = sorted(
+            {self._normalized_catalog_pair(dungeon, difficulty)
+             for dungeon, difficulty in pairs if dungeon and difficulty},
+            key=lambda item: (item[0].casefold(), item[1].casefold()))
+        dungeons = [ALL_DUNGEONS] + sorted(
+            {dungeon for dungeon, _difficulty in self.leaderboard_catalog}, key=str.casefold)
+        selected_dungeon = self.leaderboard_dungeon_var.get()
+        if selected_dungeon not in dungeons:
+            selected_dungeon = ALL_DUNGEONS
+            self.leaderboard_dungeon_var.set(selected_dungeon)
+        self._replace_option_values(
+            self.leaderboard_dungeon_menu, self.leaderboard_dungeon_var,
+            dungeons, self._leaderboard_dungeon_changed)
+        available = sorted(
+            {difficulty for _dungeon, difficulty in self.leaderboard_catalog},
+            key=lambda value: (
+                ("Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid")
+                .index(value) if value in
+                ("Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid")
+                else 99,
+                value.casefold()))
+        difficulties = [ALL_DIFFICULTIES] + available
+        if self.leaderboard_difficulty_var.get() not in difficulties:
+            self.leaderboard_difficulty_var.set(ALL_DIFFICULTIES)
+        self._replace_option_values(
+            self.leaderboard_difficulty_menu, self.leaderboard_difficulty_var,
+            difficulties, self._leaderboard_filter_changed)
+
+    def _leaderboard_dungeon_changed(self, _value: str | None = None) -> None:
+        self.leaderboard_difficulty_var.set(ALL_DIFFICULTIES)
+        self._update_leaderboard_filter_menus()
+        self.refresh_leaderboard()
+
+    def _leaderboard_filter_changed(self, _value: str | None = None) -> None:
+        self.refresh_leaderboard()
+
+    def _leaderboard_source_changed(self, _value: str | None = None) -> None:
+        self.refresh_leaderboard_catalog()
+        self.refresh_leaderboard()
+
+    def refresh_leaderboard_catalog(self) -> None:
+        if not hasattr(self, "leaderboard_dungeon_menu"):
+            return
+        self._update_leaderboard_filter_menus()
+        if self.leaderboard_catalog_loading:
+            return
+        self.leaderboard_catalog_loading = True
+        source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+
+        def complete(data: dict[str, Any] | None, _error_message: str | None) -> None:
+            self.leaderboard_catalog_loading = False
+            entries = data.get("entries") if isinstance(data, dict) else None
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    dungeon = str(entry.get("dungeon") or "").strip()
+                    difficulty = str(entry.get("difficulty") or "").strip()
+                    if dungeon and difficulty:
+                        pair = self._normalized_catalog_pair(dungeon, difficulty)
+                        if pair not in self.leaderboard_catalog:
+                            self.leaderboard_catalog.append(pair)
+            self._update_leaderboard_filter_menus()
+            current_source = LEADERBOARD_SOURCE_LABELS.get(
+                self.leaderboard_source_var.get(), "live")
+            if current_source != source:
+                self.refresh_leaderboard_catalog()
+
+        path = "/v1/leaderboards/catalog?" + urllib.parse.urlencode({"source": source})
+        self.leaderboard_client.request("GET", path, None, complete)
+
+    @staticmethod
+    def _leaderboard_score(entry: dict[str, Any], category: str) -> str:
+        if category == "time":
+            return format_duration_ms(entry.get("run_time_ms"))
+        keys = {
+            "total_damage": "total_damage", "dps": "avg_dps", "best_30": "best_damage_30",
+            "largest_hit": "largest_hit", "healing": "total_healing", "shielding": "total_shielding",
+        }
+        value = float(entry.get(keys.get(category, "total_damage"), 0) or 0)
+        return f"{format_number(value)} DPS" if category == "dps" else format_number(value)
+
+    def _render_leaderboard(self) -> None:
+        category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
+        source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+        overview = (self.leaderboard_dungeon_var.get() == ALL_DUNGEONS
+                    or self.leaderboard_difficulty_var.get() == ALL_DIFFICULTIES)
+        self.leaderboard_mode_badge.configure(
+            text="IMPORTED HISTORY" if source == "imported" else "LIVE CAPTURED",
+            foreground=self.colors["orange"] if source == "imported" else self.colors["accent"])
+        headings = {
+            "time": "TIME", "total_damage": "DAMAGE", "dps": "DPS", "best_30": "BEST 30S",
+            "largest_hit": "HIGHEST HIT", "healing": "HEALING", "shielding": "SHIELDING",
+        }
+        self.leaderboard_score_heading.configure(text=headings.get(category, "SCORE"))
+        self.leaderboard_name_heading.configure(text="DUNGEON · PLAYER" if overview else "PLAYER")
+        self.leaderboard_party_heading.configure(text="DIFFICULTY" if overview else "PARTY")
+        visible_limit = 6 if self.compact_mode else 10
+        for index, row in enumerate(self.leaderboard_rows):
+            if index < len(self.leaderboard_entries) and index < visible_limit:
+                entry = self.leaderboard_entries[index]
+                if not row["frame"].winfo_manager():
+                    row["frame"].pack(fill="x", padx=7, pady=1)
+                row["rank"].configure(text=str(entry.get("rank", index + 1)))
+                player = str(entry.get("display_name") or "Unknown")
+                if overview:
+                    dungeon = str(entry.get("dungeon") or "Unknown")
+                    row["player"].configure(text=f"{dungeon} · {player}")
+                    row["party"].configure(text=str(entry.get("difficulty") or "—"))
+                else:
+                    row["player"].configure(text=player)
+                    row["party"].configure(text=str(entry.get("party_size") or "—"))
+                row["score"].configure(text=self._leaderboard_score(entry, category))
+            else:
+                row["frame"].pack_forget()
+        if self.leaderboard_entries:
+            self.leaderboard_empty_label.pack_forget()
+        elif not self.leaderboard_empty_label.winfo_manager():
+            self.leaderboard_empty_label.pack(pady=12)
+
+    def refresh_leaderboard(self) -> None:
+        if self.leaderboard_loading:
+            self.leaderboard_refresh_pending = True
+            return
+        dungeon = self.leaderboard_dungeon_var.get().strip()
+        difficulty = self.leaderboard_difficulty_var.get().strip()
+        category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
+        party = LEADERBOARD_PARTY_LABELS.get(self.leaderboard_party_var.get(), "All")
+        source = LEADERBOARD_SOURCE_LABELS.get(self.leaderboard_source_var.get(), "live")
+        self.settings.data["LeaderboardCategory"] = category
+        self.settings.data["LeaderboardDungeon"] = dungeon
+        self.settings.data["LeaderboardDifficulty"] = difficulty
+        self.settings.data["LeaderboardPartySize"] = party
+        self.settings.data["LeaderboardSource"] = source
+        self.settings.save()
+        query = {"category": category, "source": source, "limit": "100"}
+        if dungeon and dungeon != ALL_DUNGEONS:
+            query["dungeon"] = dungeon
+        if difficulty and difficulty != ALL_DIFFICULTIES:
+            query["difficulty"] = difficulty
+        if party != "All":
+            query["partySize"] = party
+        self.leaderboard_loading = True
+        self._set_leaderboard_status("Loading leaderboard…")
+
+        def complete(data: dict[str, Any] | None, error_message: str | None) -> None:
+            self.leaderboard_loading = False
+            if error_message or not data:
+                self._set_leaderboard_status(error_message or "Leaderboard could not be loaded.")
+            else:
+                entries = data.get("entries")
+                self.leaderboard_entries = [entry for entry in entries if isinstance(entry, dict)] \
+                    if isinstance(entries, list) else []
+                self._set_leaderboard_status(
+                    f"{len(self.leaderboard_entries)} score{'s' if len(self.leaderboard_entries) != 1 else ''} found")
+                self._render_leaderboard()
+            if self.leaderboard_refresh_pending:
+                self.leaderboard_refresh_pending = False
+                self.root.after_idle(self.refresh_leaderboard)
+
+        path = "/v1/leaderboards?" + urllib.parse.urlencode(query)
+        self.leaderboard_client.request("GET", path, None, complete)
+
+    def _schedule_leaderboard_auto_refresh(self) -> None:
+        if self.leaderboard_auto_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.leaderboard_auto_refresh_job)
+            except tk.TclError:
+                pass
+            self.leaderboard_auto_refresh_job = None
+        if self.current_view == "leaderboard" and not self.closed:
+            self.leaderboard_auto_refresh_job = self.root.after(
+                LEADERBOARD_AUTO_REFRESH_MS, self._auto_refresh_leaderboard)
+
+    def _auto_refresh_leaderboard(self) -> None:
+        self.leaderboard_auto_refresh_job = None
+        if self.current_view != "leaderboard" or self.closed:
+            return
+        self.refresh_leaderboard_catalog()
+        self.refresh_leaderboard()
+        self._schedule_leaderboard_auto_refresh()
 
     def opacity_changed(self, value: str) -> None:
         try:
@@ -2180,20 +3919,37 @@ class MeterApp:
             self.find_and_follow(force=True)
 
     def toggle_view(self) -> None:
-        if self.current_view == "meter":
-            self.meter_view.pack_forget()
+        self._show_main_view("meter" if self.current_view == "flex" else "flex")
+
+    def toggle_leaderboard_view(self) -> None:
+        target = "meter" if self.current_view == "leaderboard" else "leaderboard"
+        self._show_main_view(target)
+        if target == "leaderboard":
+            self.refresh_leaderboard_catalog()
+            self.refresh_leaderboard()
+
+    def _show_main_view(self, view: str) -> None:
+        for widget in (self.meter_view, self.flex_view, self.leaderboard_view):
+            widget.pack_forget()
+        self.current_view = view
+        if view == "meter":
+            self.meter_view.pack(fill="both", expand=True,
+                                 pady=(4, 6) if self.compact_mode else (10, 21))
+        elif view == "flex":
             self.flex_view.pack(fill="both", expand=True)
-            self.current_view = "flex"
-            self.view_button.configure(text="Meter")
         else:
-            self.flex_view.pack_forget()
-            self.meter_view.pack(fill="both", expand=True, pady=(4, 6) if self.compact_mode else (10, 21))
-            self.current_view = "meter"
-            self.view_button.configure(text="Flex")
+            self.leaderboard_view.pack(fill="both", expand=True)
+        self._schedule_leaderboard_auto_refresh()
+        self._sync_compact_button_text()
         self.refresh()
 
     def _sync_compact_button_text(self) -> None:
-        self.compact_button.configure(text="Normal" if self.compact_mode else "Compact")
+        self.compact_button.configure(text="Full" if self.compact_mode else "Compact",
+                                      width=4 if self.compact_mode else 7)
+        self.view_button.configure(text="DPS" if self.current_view == "flex" else "Flex",
+                                   width=3 if self.compact_mode else 4)
+        self.leaderboard_button.configure(text="DPS" if self.current_view == "leaderboard" else "Ranks",
+                                          width=4 if self.compact_mode else 5)
 
     @staticmethod
     def _set_packed(widget: tk.Widget, visible: bool, **pack_options: Any) -> None:
@@ -2216,8 +3972,8 @@ class MeterApp:
         if self.compact_mode:
             self._set_packed(self.map_caption, False)
             self._set_packed(self.footer, False)
-            self._set_packed(self.header_credit, True, side="right", padx=(0, 8))
-            self.credit.place_forget()
+            self._set_packed(self.header_credit, False)
+            self.credit.place(relx=1.0, rely=1.0, x=-18, y=-8, anchor="se")
         else:
             self._set_packed(self.map_caption, True, side="left")
             self._set_packed(self.footer, True, fill="x", side="bottom", pady=(5, 0))
@@ -2271,6 +4027,8 @@ class MeterApp:
         for box in self.run_high_boxes:
             box.pack_configure(pady=3 if self.compact_mode else 5)
         self.abilities_header.pack_configure(pady=(4, 1) if self.compact_mode else (8, 2))
+        self.stage_timeline.pack_configure(pady=(3, 0) if self.compact_mode else (6, 0))
+        self.stage_canvas.configure(height=38 if self.compact_mode else 50)
 
         if self.compact_mode:
             self.flex_top.pack_configure(pady=(3, 4))
@@ -2324,6 +4082,9 @@ class MeterApp:
             row["bar"].pack_configure(padx=(0, 6) if self.compact_mode else (0, 10),
                                       pady=(2, 0) if self.compact_mode else (3, 0))
 
+        self._set_packed(self.leaderboard_note, not self.compact_mode, fill="x", pady=(5, 16))
+        self._render_leaderboard()
+
         self.root.minsize(*self._active_min_size())
         self.root.update_idletasks()
         min_width, min_height = self._active_min_size()
@@ -2333,11 +4094,13 @@ class MeterApp:
                                f"{self.root.winfo_x()}+{self.root.winfo_y()}")
         self._sync_compact_button_text()
         self._redraw_bars()
+        self._draw_stage_timeline()
 
     def toggle_compact_mode(self) -> None:
         self._store_window_size()
         self.compact_mode = not self.compact_mode
-        self.settings.data["CompactMode"] = self.compact_mode
+        if not self._smoke_compact_override:
+            self.settings.data["CompactMode"] = self.compact_mode
         width, height = self._configured_size(self.compact_mode)
         self.root.geometry(f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}")
         self.settings.save()
@@ -2351,11 +4114,78 @@ class MeterApp:
         flags = " · DEV" if record.get("Critical") and record.get("HeavyHit") else " · CRIT" if record.get("Critical") else " · HEAVY" if record.get("HeavyHit") else ""
         return f"{record.get('AbilityName') or 'Unknown'}{flags}"
 
+    def _scroll_stage_timeline(self, event: tk.Event) -> str:
+        self.stage_canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    @staticmethod
+    def _stage_kind(subtype: str) -> str:
+        lowered = subtype.strip().lower()
+        if lowered in {"relic", "treasure", "gathering", "gather", "shop", "rest"}:
+            return lowered
+        if "boss" in lowered:
+            return "boss"
+        if lowered.startswith("random_event"):
+            return "event"
+        return "combat"
+
+    def _draw_stage_timeline(self) -> None:
+        if not hasattr(self, "stage_canvas") or not hasattr(self, "colors"):
+            return
+        canvas = self.stage_canvas
+        canvas.delete("all")
+        height = int(float(canvas.cget("height")))
+        viewport_width = max(1, canvas.winfo_width())
+        if not self.stage_rows:
+            self._last_stage_count = 0
+            canvas.configure(scrollregion=(0, 0, viewport_width, height))
+            canvas.create_text(7, height / 2, anchor="w", text="ROOM TIMES · waiting for stage data",
+                               fill=self.colors["dim"], font=(self.FONT, self._scaled_font_size(6), "bold"))
+            return
+
+        spacing = 33
+        pad = 16
+        virtual_width = max(viewport_width, pad * 2 + spacing * max(0, len(self.stage_rows) - 1))
+        canvas.configure(scrollregion=(0, 0, virtual_width, height))
+        node_y = 11 if self.compact_mode else 14
+        radius = 8 if self.compact_mode else 9
+        text_y = 27 if self.compact_mode else 34
+        type_colors = {
+            "combat": self.colors["neutral"], "event": self.colors["accent"],
+            "boss": self.colors["red"], "treasure": self.colors["orange"],
+            "relic": self.colors["blue"], "gathering": self.colors["green"],
+            "gather": self.colors["green"], "shop": self.colors["blue"], "rest": self.colors["blue"],
+        }
+        points = [pad + index * ((virtual_width - pad * 2) / max(1, len(self.stage_rows) - 1))
+                  for index in range(len(self.stage_rows))]
+        for index in range(1, len(points)):
+            canvas.create_line(points[index - 1] + radius + 2, node_y, points[index] - radius - 2, node_y,
+                               fill=self.colors["dim"] if self.stage_rows[index - 1].get("complete")
+                               else self.colors["border"], width=2)
+        for x, stage in zip(points, self.stage_rows):
+            kind = self._stage_kind(str(stage.get("subtype", "combat")))
+            fill = type_colors.get(kind, self.colors["accent"])
+            outline = self.colors["orange"] if stage.get("current") else fill
+            outline_width = 2 if stage.get("current") else 1
+            if kind in {"relic", "treasure", "shop", "rest"}:
+                canvas.create_rectangle(x - radius, node_y - radius, x + radius, node_y + radius,
+                                        fill=fill, outline=outline, width=outline_width)
+            else:
+                canvas.create_oval(x - radius, node_y - radius, x + radius, node_y + radius,
+                                   fill=fill, outline=outline, width=outline_width)
+            canvas.create_text(x, node_y, text=str(stage.get("number", "")), fill=self.colors["bg"],
+                               font=(self.FONT, self._scaled_font_size(7), "bold"))
+            canvas.create_text(x, text_y, text=format_combat_clock(stage.get("time_ms", 0)),
+                               fill=self.colors["text"] if stage.get("current") else self.colors["dim"],
+                               font=(self.FONT, self._scaled_font_size(7), "bold"))
+        if len(self.stage_rows) > self._last_stage_count:
+            canvas.xview_moveto(1.0)
+        self._last_stage_count = len(self.stage_rows)
+
     def refresh(self) -> None:
         snapshot = self.session.snapshot()
         self._update_overlay_opacity(bool(snapshot["in_run"]))
-        total_seconds = max(0, round(snapshot["duration"]))
-        self.duration_label.configure(text=f"{(total_seconds // 60) % 60:02d}:{total_seconds % 60:02d}")
+        self.duration_label.configure(text=format_combat_clock(snapshot["duration"] * 1000.0))
         self.state_label.configure(text="ACTIVE" if snapshot["active"] else "IDLE")
         self.damage_value.configure(text=format_number(snapshot["damage"]))
         self.healing_value.configure(text=format_number(snapshot["healing"]))
@@ -2403,6 +4233,8 @@ class MeterApp:
             icon = self.icons.get(normalize_ability(ability["name"]))
             row["icon"].configure(image=icon or "")
         self._redraw_bars()
+        self.stage_rows = snapshot.get("stages", [])
+        self._draw_stage_timeline()
 
         flex = self.records.snapshot()
         cards = {
@@ -2739,7 +4571,9 @@ class MeterApp:
         if self.closed:
             return
         try:
+            self.leaderboard_client.pump()
             self.watcher.poll()
+            self.leaderboard_tracker.tick()
             now = time.monotonic()
             if now - self.last_process_poll >= 0.75:
                 self.find_and_follow()
@@ -2756,6 +4590,12 @@ class MeterApp:
         if self.closed:
             return
         self.closed = True
+        if self.leaderboard_auto_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.leaderboard_auto_refresh_job)
+            except tk.TclError:
+                pass
+            self.leaderboard_auto_refresh_job = None
         self._hide_ability_tooltip()
         self._hide_dungeon_tooltip()
         if self._brand_animation_job is not None:
@@ -2765,7 +4605,8 @@ class MeterApp:
                 pass
             self._brand_animation_job = None
         self.settings.data["FollowGameWindow"] = bool(self.follow_var.get())
-        self.settings.data["CompactMode"] = self.compact_mode
+        if not self._smoke_compact_override:
+            self.settings.data["CompactMode"] = self.compact_mode
         self.settings.data["WindowLeft"] = self.root.winfo_x()
         self.settings.data["WindowTop"] = self.root.winfo_y()
         self._store_window_size()
@@ -2798,6 +4639,32 @@ def replay_log(path: Path, include_overkill: bool = False) -> dict[str, Any]:
 
 
 def run_self_test(log_path: str | None = None) -> int:
+    assert version_tuple("v0.9.12") == (0, 9, 12)
+    assert is_newer_version("v0.9.1", "0.9.0-py.test1")
+    assert not is_newer_version("v0.9.0", "0.9.0-py.test1")
+    fake_digest = "a" * 64
+    fake_release = {
+        "tag_name": "v9.8.7", "draft": False, "prerelease": False,
+        "assets": [
+            {"name": "DpsMeter-9.8.7.py", "size": 123, "digest": f"sha256:{fake_digest}",
+             "browser_download_url": "https://github.com/example/update.py"},
+            {"name": "DpsMeter-9.8.7-win-x64.exe", "size": 456, "digest": f"sha256:{fake_digest}",
+             "browser_download_url": "https://github.com/example/update.exe"},
+        ],
+    }
+    assert update_asset_from_release(fake_release, False).asset_name.endswith(".py")  # type: ignore[union-attr]
+    assert update_asset_from_release(fake_release, True).asset_name.endswith(".exe")  # type: ignore[union-attr]
+    with tempfile.TemporaryDirectory() as update_test_dir:
+        update_dir = Path(update_test_dir)
+        update_source = update_dir / "download.py"
+        update_target = update_dir / "installed.py"
+        update_source.write_bytes(b"new-version")
+        update_target.write_bytes(b"old-version")
+        replace_program_file(update_source, update_target)
+        assert update_target.read_bytes() == b"new-version"
+
+    protected_test_token = protect_secret("local-test-token")
+    assert protected_test_token and unprotect_secret(protected_test_token) == "local-test-token"
     assert map_name_from_log_path(
         r"C:\logs\dungeon__Virelda_Outskirts__1__2026-08-20_17-03-17Z.log"
     ) == "Virelda Outskirts"
@@ -2832,6 +4699,113 @@ def run_self_test(log_path: str | None = None) -> int:
     session.apply(ended)
     assert not session.snapshot()["in_run"]
 
+    class StubLeaderboardClient:
+        def __init__(self) -> None:
+            self.token = "stub-token"
+            self.calls: list[tuple[str, str, dict[str, Any] | None, LeaderboardCallback, bool]] = []
+
+        def request(self, method: str, path: str, body: dict[str, Any] | None,
+                    callback: LeaderboardCallback, authenticated: bool = False) -> None:
+            self.calls.append((method, path, body, callback, authenticated))
+
+    stub_client = StubLeaderboardClient()
+    tracker_status: list[str] = []
+    tracker_submitted: list[bool] = []
+    tracker = LeaderboardRunTracker(stub_client, lambda: True, tracker_status.append,
+                                    lambda: tracker_submitted.append(True))  # type: ignore[arg-type]
+
+    def track(root: dict[str, Any], duration: float = 0.0) -> None:
+        raw = json.dumps(root, separators=(",", ":")).encode("utf-8")
+        parsed = parse_combat_event(root)
+        tracker.observe(root, raw, parsed, {"duration": duration})
+
+    track({"event": "LOG_HEADER", "sequence": 1,
+           "data": {"client_version": "5.43.48", "format": "soulbound_combat_log"}})
+    track({"event": "RUN_START", "sequence": 2, "run_elapsed_ms": 0,
+           "timestamp_utc": "2026-09-16T15:00:00Z",
+           "data": {"dungeon_display_name": "Lunar Plateau - Abyssal", "party_size": 1}})
+    assert len(stub_client.calls) == 1 and stub_client.calls[0][1] == "/v1/runs/start"
+    stub_client.calls.pop(0)[3]({"sessionId": "test-session"}, None)
+    assert len(stub_client.calls) == 1 and stub_client.calls[0][1].endswith("/checkpoint")
+    stub_client.calls.pop(0)[3]({"accepted": True}, None)
+    track({"event": "DAMAGE_DEALT", "sequence": 3, "run_elapsed_ms": 10_000,
+           "timestamp_utc": "2026-09-16T15:00:10Z",
+           "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
+                    "post_target_mitigation_amount": 300, "applied_amount": 100}})
+    track({"event": "ROOM_END", "sequence": 4, "run_elapsed_ms": 75_000,
+           "timestamp_utc": "2026-09-16T15:01:15Z",
+           "data": {"reason": "extraction", "duration_ms": 40_000}})
+    track({"event": "RUN_END", "sequence": 5, "run_elapsed_ms": 76_000,
+           "timestamp_utc": "2026-09-16T15:01:16Z",
+           "data": {"reason": "extracted", "duration_ms": 41_000}}, duration=35.0)
+    assert len(stub_client.calls) == 1 and stub_client.calls[0][1].endswith("/checkpoint")
+    stub_client.calls.pop(0)[3]({"accepted": True}, None)
+    assert len(stub_client.calls) == 1 and stub_client.calls[0][1].endswith("/finish")
+    finish_request = stub_client.calls.pop(0)
+    assert finish_request[2] and finish_request[2]["extracted"] is True
+    assert finish_request[2]["runTimeMs"] == 76_000 and finish_request[2]["combatTimeMs"] == 35_000
+    assert finish_request[2]["totalDamage"] == 100 and finish_request[2]["largestHit"] == 100
+    finish_request[3]({"leaderboardEligible": True}, None)
+    assert tracker_submitted and tracker_status[-1] == "Run submitted to leaderboard"
+
+    failed_client = StubLeaderboardClient()
+    failed_tracker = LeaderboardRunTracker(
+        failed_client, lambda: True, lambda _message: None, lambda: None)  # type: ignore[arg-type]
+
+    def track_failed(root: dict[str, Any]) -> None:
+        raw = json.dumps(root, separators=(",", ":")).encode("utf-8")
+        failed_tracker.observe(root, raw, parse_combat_event(root), {"duration": 20.0})
+
+    track_failed({"event": "RUN_START", "sequence": 1, "run_elapsed_ms": 0,
+                  "timestamp_utc": "2026-09-16T16:00:00Z",
+                  "data": {"dungeon_display_name": "Arcadia Defence", "party_size": 1}})
+    failed_client.calls.pop(0)[3]({"sessionId": "failed-session"}, None)
+    failed_client.calls.pop(0)[3]({"accepted": True}, None)
+    track_failed({"event": "ROOM_END", "sequence": 2, "run_elapsed_ms": 30_000,
+                  "timestamp_utc": "2026-09-16T16:00:30Z", "data": {"reason": "died"}})
+    track_failed({"event": "RUN_END", "sequence": 3, "run_elapsed_ms": 33_000,
+                  "timestamp_utc": "2026-09-16T16:00:33Z",
+                  "data": {"reason": "extracted", "completed": False, "duration_ms": 33_000}})
+    failed_client.calls.pop(0)[3]({"accepted": True}, None)
+    failed_finish = failed_client.calls.pop(0)
+    assert failed_finish[1].endswith("/finish")
+    assert failed_finish[2] and failed_finish[2]["extracted"] is False
+
+    with tempfile.TemporaryDirectory(prefix="DpsMeterHistoryImportTest-") as folder:
+        history_log = Path(folder) / "dungeon__Lunar_Plateau_-_Abyssal__1__2026-09-16_15-00-00Z.log"
+        history_roots = [
+            {"event": "LOG_HEADER", "sequence": 1,
+             "data": {"format": "soulbound_combat_log", "client_version": "5.43.48"}},
+            {"event": "RUN_START", "sequence": 2, "run_elapsed_ms": 0,
+             "timestamp_utc": "2026-09-16T15:00:00Z",
+             "data": {"dungeon_display_name": "Lunar Plateau - Abyssal", "party_size": 1}},
+            {"event": "ENCOUNTER_START", "sequence": 3, "run_elapsed_ms": 1000,
+             "timestamp_utc": "2026-09-16T15:00:01Z", "data": {"room_subtype": "combat"}},
+            {"event": "DAMAGE_DEALT", "sequence": 4, "run_elapsed_ms": 2000,
+             "timestamp_utc": "2026-09-16T15:00:02Z",
+             "data": {"source": {"type": "self"}, "post_target_mitigation_amount": 500,
+                      "applied_amount": 125}},
+            {"event": "ROOM_END", "sequence": 5, "run_elapsed_ms": 42_000,
+             "timestamp_utc": "2026-09-16T15:00:42Z", "data": {"reason": "extraction"}},
+            {"event": "RUN_END", "sequence": 6, "run_elapsed_ms": 43_000,
+             "timestamp_utc": "2026-09-16T15:00:43Z",
+             "data": {"reason": "extracted", "duration_ms": 41_000}},
+        ]
+        history_log.write_text("".join(json.dumps(root) + "\n" for root in history_roots), encoding="utf-8")
+        imported_history = historical_run_from_log(history_log)
+        assert imported_history and imported_history["dungeon"] == "Lunar Plateau"
+        assert imported_history["difficulty"] == "Abyssal" and imported_history["totalDamage"] == 125
+        assert imported_history["runTimeMs"] == 43_000 and len(imported_history["sourceHash"]) == 64
+
+        abandoned_log = Path(folder) / "dungeon__Lunar_Plateau_-_Abyssal__2__2026-09-16_16-00-00Z.log"
+        abandoned_roots = json.loads(json.dumps(history_roots))
+        abandoned_roots[-2]["data"]["reason"] = "died"
+        abandoned_roots[-1]["data"]["reason"] = "extracted"
+        abandoned_roots[-1]["data"]["completed"] = False
+        abandoned_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in abandoned_roots), encoding="utf-8")
+        assert historical_run_from_log(abandoned_log) is None
+
     rewrite_events = [
         parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "RUN_START", "sequence": 10}),
         parse_combat_event({"timestamp_utc": timestamp_text(utc_now()), "event": "ENCOUNTER_START", "sequence": 11}),
@@ -2854,6 +4828,43 @@ def run_self_test(log_path: str | None = None) -> int:
         rewrite_session.apply(rewrite_event)
     rewrite_snapshot = rewrite_session.snapshot()
     assert rewrite_snapshot["damage"] == 123 and rewrite_session.damage_hit_count == 1 and rewrite_snapshot["in_run"]
+
+    # Room checkpoints use cumulative combat-only time. A ten-second silent
+    # gap contributes at most three seconds, and relic rooms add no time.
+    stage_session = CombatSession()
+    stage_roots = [
+        {"timestamp_utc": "2026-08-30T22:00:00Z", "event": "RUN_START", "run_elapsed_ms": 0, "sequence": 20},
+        {"timestamp_utc": "2026-08-30T22:00:00Z", "event": "ROOM_START", "run_elapsed_ms": 0, "sequence": 21,
+         "data": {"room_index": 0, "room_name": "DCCombat1_Test"}},
+        {"timestamp_utc": "2026-08-30T22:00:01Z", "event": "ENCOUNTER_START", "run_elapsed_ms": 1000, "sequence": 22,
+         "data": {"room_index": 0, "room_subtype": "combat"}},
+        {"timestamp_utc": "2026-08-30T22:00:01.500Z", "event": "DAMAGE_DEALT", "run_elapsed_ms": 1500, "sequence": 23,
+         "data": {"source": {"type": "self"}, "ability_display_name": "Bomb", "applied_amount": 10}},
+        {"timestamp_utc": "2026-08-30T22:00:11.500Z", "event": "DAMAGE_DEALT", "run_elapsed_ms": 11500, "sequence": 24,
+         "data": {"source": {"type": "self"}, "ability_display_name": "Bomb", "applied_amount": 10}},
+        {"timestamp_utc": "2026-08-30T22:00:12Z", "event": "ENCOUNTER_END", "run_elapsed_ms": 12000, "sequence": 25,
+         "data": {"room_index": 0, "room_subtype": "combat"}},
+        {"timestamp_utc": "2026-08-30T22:00:13Z", "event": "ROOM_END", "run_elapsed_ms": 13000, "sequence": 26,
+         "data": {"room_index": 0, "room_subtype": "combat"}},
+        {"timestamp_utc": "2026-08-30T22:00:14Z", "event": "ROOM_START", "run_elapsed_ms": 14000, "sequence": 27,
+         "data": {"room_index": 1, "room_name": "DCUpgradeRelic_Test"}},
+        {"timestamp_utc": "2026-08-30T22:00:15Z", "event": "ENCOUNTER_START", "run_elapsed_ms": 15000, "sequence": 28,
+         "data": {"room_index": 1, "room_subtype": "relic"}},
+        {"timestamp_utc": "2026-08-30T22:01:15Z", "event": "ENCOUNTER_END", "run_elapsed_ms": 75000, "sequence": 29,
+         "data": {"room_index": 1, "room_subtype": "relic"}},
+        {"timestamp_utc": "2026-08-30T22:01:16Z", "event": "ROOM_END", "run_elapsed_ms": 76000, "sequence": 30,
+         "data": {"room_index": 1, "room_subtype": "relic"}},
+    ]
+    for stage_root in stage_roots:
+        stage_event = parse_combat_event(stage_root)
+        assert stage_event
+        stage_session.apply(stage_event)
+    stage_snapshot = stage_session.snapshot()
+    assert stage_snapshot["duration"] == 4.0
+    assert len(stage_snapshot["stages"]) == 2
+    assert stage_snapshot["stages"][0]["time_ms"] == 4000
+    assert stage_snapshot["stages"][1]["time_ms"] == 4000
+    assert stage_snapshot["stages"][1]["subtype"] == "relic"
 
     resolver = CombatAbilityResolver()
     resolver.observe({"event": "LOADOUT_SNAPSHOT", "data": {"abilities": [{"ability_display_name": "Fortify"}, {"ability_display_name": "Healing Pulse"}]}})
@@ -2910,15 +4921,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log", help="Combat-log file or folder to use")
     parser.add_argument("--self-test", action="store_true", help="Run parser and persistence tests without opening the UI")
     parser.add_argument("--smoke-ui", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-view", choices=("meter", "flex", "leaderboard"), help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-compact", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--apply-update", metavar="TARGET", help=argparse.SUPPRESS)
+    parser.add_argument("--wait-pid", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--cleanup-update", metavar="PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--no-restart", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=VERSION)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.apply_update:
+        result = apply_downloaded_update(args.apply_update, args.wait_pid, restart=not args.no_restart)
+        if result:
+            show_update_helper_error(result)
+        return result
+    if args.cleanup_update:
+        cleanup_update_copy(args.cleanup_update)
     if args.self_test:
         return run_self_test(args.log)
-    app = MeterApp(args.log, args.smoke_ui)
+    app = MeterApp(args.log, args.smoke_ui, args.smoke_view, args.smoke_compact)
     app.run()
     return 0
 
