@@ -42,14 +42,14 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.7"
+VERSION = "0.9.8"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
 LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev"
 LEADERBOARD_AUTO_REFRESH_MS = 120_000
 LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
-LEADERBOARD_HISTORY_VERSION = 4
+LEADERBOARD_HISTORY_VERSION = 5
 LEADERBOARD_CATEGORY_LABELS = {
     "Fastest Time": "time", "Total Damage": "total_damage", "DPS": "dps",
     "Best Damage · 30S": "best_30", "Highest Hit": "largest_hit",
@@ -820,6 +820,12 @@ class CombatSession:
             self.has_encounter_timing = True
             self._update_stage_subtype(event)
             if not self._is_noncombat(event.room_subtype):
+                # Raid logs provide one server-authored duration shared by the
+                # whole party.  Player event streams can have different gaps,
+                # so the shared value must replace the locally accumulated
+                # activity clock when the boss encounter finishes.
+                if is_boss_raid_completion(event) and event.run_duration_ms > 0:
+                    self.combat_clock_ms = event.run_duration_ms
                 self._close_encounter(event.timestamp)
             self.timing_in_combat = False
             self.last_event_at = event.timestamp
@@ -1714,6 +1720,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     best_damage_30 = 0.0
     damage_window: deque[tuple[float, float]] = deque()
     combat_clock_ms = 0.0
+    authoritative_boss_duration_ms = 0.0
     last_run_elapsed_ms: float | None = None
     timing_in_combat = False
     first_combat_at: float | None = None
@@ -1773,6 +1780,10 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                 elif is_boss_raid_completion(event):
                     extracted = True
                     end = event
+                    authoritative_boss_duration_ms = (
+                        event.run_duration_ms
+                        if event.run_duration_ms > 0
+                        else max(0.0, event.run_elapsed_ms or 0.0))
                 elif event.type == "combat_end":
                     if not (end is not None and is_boss_raid_completion(end)):
                         end = event
@@ -1808,10 +1819,14 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
         else max(0.0, (end.timestamp - start.timestamp) * 1000.0))
     fallback_combat_ms = ((last_combat_at - first_combat_at) * 1000.0
                           if first_combat_at is not None and last_combat_at is not None else 0.0)
-    combat_time_ms = round(combat_clock_ms or fallback_combat_ms)
-    combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
+    combat_time_ms = round(authoritative_boss_duration_ms or combat_clock_ms or fallback_combat_ms)
     if is_boss_raid_completion(end):
+        # The encounter's duration_ms is shared across every party member and
+        # can differ from a client's final run_elapsed_ms by a millisecond.
+        combat_time_ms = max(1_000, combat_time_ms)
         run_time_ms = combat_time_ms
+    else:
+        combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
     if run_time_ms < 30_000 or run_time_ms > 28_800_000:
         return None
     return {
@@ -1959,6 +1974,9 @@ class LeaderboardRunTracker:
             combat_time_ms = round(float(session_snapshot.get("duration", 0.0)) * 1000.0)
             combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
             if boss_raid_completed:
+                authoritative_duration_ms = round(event.run_duration_ms or event.run_elapsed_ms or 0)
+                if authoritative_duration_ms > 0:
+                    combat_time_ms = authoritative_duration_ms
                 run_time_ms = max(30_000, combat_time_ms)
             self.pending_finish = {
                 "extracted": extracted,
@@ -2135,7 +2153,8 @@ class AppSettings:
                 except (TypeError, ValueError):
                     history_version = 0
                 if history_version < LEADERBOARD_HISTORY_VERSION:
-                    # The v4 qualification change only affected Spectra Raid.
+                    # Qualification and authoritative-timing changes through
+                    # v5 only affected Spectra Raid.
                     # Preserve every other processed signature so upgrading does
                     # not reparse and re-upload a user's entire combat-log archive.
                     history_files = self.data.get("LeaderboardHistoryFiles")
@@ -5327,7 +5346,7 @@ def run_self_test(log_path: str | None = None) -> int:
     raid_client.calls.pop(0)[3]({"accepted": True}, None)
     raid_finish = raid_client.calls.pop(0)
     assert raid_finish[1].endswith("/finish") and raid_finish[2]
-    assert raid_finish[2]["extracted"] is True and raid_finish[2]["runTimeMs"] == 390_000
+    assert raid_finish[2]["extracted"] is True and raid_finish[2]["runTimeMs"] == 522_001
     assert raid_finish[2]["runTimeMs"] == raid_finish[2]["combatTimeMs"]
     raid_finish[3]({"leaderboardEligible": True}, None)
     track_raid({"event": "RUN_END", "sequence": 4, "run_elapsed_ms": 600_000,
@@ -5388,7 +5407,7 @@ def run_self_test(log_path: str | None = None) -> int:
                      "post_target_mitigation_amount": 10, "applied_amount": 10},
         } for second in range(2, 42))
         spectra_roots.append({
-            "event": "ENCOUNTER_END", "sequence": 44, "run_elapsed_ms": 43_000,
+            "event": "ENCOUNTER_END", "sequence": 44, "run_elapsed_ms": 41_998,
             "timestamp_utc": "2026-09-17T14:37:49Z",
             "data": {"encounter_subtype": "bossraid", "duration_ms": 42_000},
         })
