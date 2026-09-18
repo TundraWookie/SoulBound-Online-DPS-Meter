@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.9"
+VERSION = "0.9.10"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -2216,7 +2216,7 @@ class CombatLogWatcher:
                  event_callback: Callable[[CombatEvent], None], log_callback: Callable[[str], None],
                  status_callback: Callable[[bool, str], None],
                  raw_callback: Callable[[dict[str, Any], bytes, CombatEvent | None], None] | None = None) -> None:
-        self.folder = self._normalize_folder(configured_folder)
+        self.folder = self.prefer_nested_folder(self._normalize_folder(configured_folder))
         self.cleanup_enabled = cleanup_enabled
         self.event_callback = event_callback
         self.log_callback = log_callback
@@ -2240,11 +2240,28 @@ class CombatLogWatcher:
         except OSError:
             return None
 
-    @staticmethod
-    def default_folder() -> Path | None:
+    @classmethod
+    def prefer_nested_folder(cls, folder: Path | None, root: Path | None = None) -> Path | None:
+        """Replace the worldwidewebb fallback with its combat_logs folder."""
+        expected_root = (root or (LOCAL_APP_DATA / "worldwidewebb")).resolve()
+        if folder is None:
+            return None
+        try:
+            current = folder.resolve()
+        except OSError:
+            current = folder
+        if str(current).casefold() != str(expected_root).casefold():
+            return folder
+        combat_logs = expected_root / "combat_logs"
+        return combat_logs if combat_logs.is_dir() else folder
+
+    @classmethod
+    def default_folder(cls) -> Path | None:
         root = LOCAL_APP_DATA / "worldwidewebb"
-        candidates = [root / "combat_logs", root / "combat-logs", root / "logs" / "combat", root / "logs", root]
-        return next((folder for folder in candidates if folder.is_dir() and CombatLogWatcher.find_newest(folder)), None) or next((folder for folder in candidates if folder.is_dir()), None)
+        combat_logs = root / "combat_logs"
+        if combat_logs.is_dir():
+            return combat_logs
+        return root if root.is_dir() else None
 
     @staticmethod
     def verified(path: Path) -> bool:
@@ -2329,6 +2346,13 @@ class CombatLogWatcher:
     def poll(self) -> None:
         if self.folder is None:
             self.folder = self.default_folder()
+        else:
+            preferred = self.prefer_nested_folder(self.folder)
+            if preferred is not None and str(preferred).casefold() != str(self.folder).casefold():
+                self.folder = preferred
+                self.active_path = None
+                self.position = 0
+                self.partial = b""
         if self.folder is None or not self.folder.is_dir():
             self._status(False, "Waiting for combat-log folder")
             return
@@ -5179,6 +5203,10 @@ class MeterApp:
             if now - self.last_log_poll >= self.combat_log_poll_ms / 1000.0:
                 self.watcher.poll()
                 self.last_log_poll = now
+                detected_folder = str(self.watcher.folder) if self.watcher.folder else ""
+                saved_folder = str(self.settings.get("CombatLogFolder") or "")
+                if detected_folder and detected_folder.casefold() != saved_folder.casefold():
+                    self.settings.set("CombatLogFolder", detected_folder)
             if now - self.last_process_poll >= 0.75:
                 self.find_and_follow()
                 self.last_process_poll = now
@@ -5621,6 +5649,15 @@ def run_self_test(log_path: str | None = None) -> int:
         active_log.write_text(header + run_start + first_hit + next_hit, encoding="utf-8")
         watcher.poll()
         assert watcher_session.snapshot()["damage"] == 30 and len(selected_logs) == 1
+
+    with tempfile.TemporaryDirectory(prefix="DpsMeterFolderFallbackTest-") as folder:
+        fallback_root = Path(folder) / "worldwidewebb"
+        fallback_root.mkdir()
+        assert CombatLogWatcher.prefer_nested_folder(fallback_root, fallback_root) == fallback_root
+        nested_logs = fallback_root / "combat_logs"
+        nested_logs.mkdir()
+        assert CombatLogWatcher.prefer_nested_folder(
+            fallback_root.resolve(), fallback_root.resolve()) == nested_logs.resolve()
 
     with tempfile.TemporaryDirectory(prefix="DpsMeterLeaderboardErrorTest-") as folder:
         diagnostic_path = Path(folder) / "leaderboard-errors.log"
