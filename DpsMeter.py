@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.10"
+VERSION = "0.9.11"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -50,6 +50,27 @@ LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev
 LEADERBOARD_AUTO_REFRESH_MS = 120_000
 LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
 LEADERBOARD_HISTORY_VERSION = 5
+LEADERBOARD_TOP_PER_DUNGEON = 5
+LEADERBOARD_DIFFICULTY_ORDER = (
+    "Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid",
+)
+LEADERBOARD_DISPLAY_DIFFICULTY_ORDER = tuple(reversed(LEADERBOARD_DIFFICULTY_ORDER))
+LEADERBOARD_RANK_COLORS = {
+    1: "#FFD166",  # gold
+    2: "#DCE6F2",  # silver
+    3: "#E89B5A",  # bronze
+    4: "#58D5FF",  # cyan
+    5: "#C28CFF",  # violet
+}
+LEADERBOARD_DIFFICULTY_COLORS = {
+    "stable": "#4CC9F0",
+    "unstable": "#F9C74F",
+    "fractured": "#B388FF",
+    "collapsing": "#45E0C1",
+    "shattered": "#FF5D8F",
+    "abyssal": "#9EF01A",
+    "raid": "#FF7C75",
+}
 LEADERBOARD_CATEGORY_LABELS = {
     "Fastest Time": "time", "Total Damage": "total_damage", "DPS": "dps",
     "Best Damage · 30S": "best_30", "Highest Hit": "largest_hit",
@@ -2687,6 +2708,9 @@ class MeterApp:
         self._dungeon_tooltip_hide_job: str | None = None
         self._player_list_tooltip: tk.Toplevel | None = None
         self._player_list_tooltip_hide_job: str | None = None
+        self._leaderboard_rank_tooltip: tk.Toplevel | None = None
+        self._leaderboard_rank_tooltip_hide_job: str | None = None
+        self._leaderboard_rank_tooltip_row: dict[str, Any] | None = None
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
@@ -3298,7 +3322,7 @@ class MeterApp:
         self.leaderboard_canvas.bind("<Configure>", self._size_leaderboard_body)
         self.leaderboard_canvas.bind("<MouseWheel>", self._scroll_leaderboard, add="+")
         self.leaderboard_body.bind("<MouseWheel>", self._scroll_leaderboard, add="+")
-        self.leaderboard_rows: list[dict[str, tk.Widget]] = []
+        self.leaderboard_rows: list[dict[str, Any]] = []
         self._ensure_leaderboard_row_capacity(10)
         self.leaderboard_empty_label = self.label(
             self.leaderboard_body, "No scores found for these filters.", 8,
@@ -4115,9 +4139,8 @@ class MeterApp:
         available = sorted(
             {difficulty for _dungeon, difficulty in self.leaderboard_catalog},
             key=lambda value: (
-                ("Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid")
-                .index(value) if value in
-                ("Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid")
+                LEADERBOARD_DIFFICULTY_ORDER.index(value)
+                if value in LEADERBOARD_DIFFICULTY_ORDER
                 else 99,
                 value.casefold()))
         difficulties = [ALL_DIFFICULTIES] + available
@@ -4195,24 +4218,37 @@ class MeterApp:
             for column, weight, minimum in ((0, 0, 18), (1, 3, 95), (2, 2, 72),
                                             (3, 0, 62), (4, 0, 65), (5, 0, 65)):
                 row.grid_columnconfigure(column, weight=weight, minsize=minimum)
+            divider = self.role(tk.Frame(row, height=2), "border", None)
+            divider.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(4, 3))
+            divider.grid_remove()
             rank = self.label(row, str(index + 1), 8, "bold", "red", anchor="w")
-            rank.grid(row=0, column=0, sticky="ew")
+            rank.grid(row=1, column=0, sticky="ew")
             dungeon = self.label(row, "—", 8, "bold", "green", anchor="w")
-            dungeon.grid(row=0, column=1, sticky="ew")
+            dungeon.grid(row=1, column=1, sticky="ew")
             player = self.label(row, "—", 8, foreground="text", anchor="w")
-            player.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+            player.grid(row=1, column=2, sticky="ew", padx=(4, 0))
             party = self.label(row, "—", 7, "bold", "purple", anchor="w")
-            party.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+            party.grid(row=1, column=3, sticky="ew", padx=(4, 0))
             personal = self.label(row, "—", 8, "bold", "blue", anchor="e")
-            personal.grid(row=0, column=4, sticky="ew", padx=(4, 0))
+            personal.grid(row=1, column=4, sticky="ew", padx=(4, 0))
             score = self.label(row, "—", 8, "bold", "orange", anchor="e")
-            score.grid(row=0, column=5, sticky="ew", padx=(4, 0))
-            widgets = (row, rank, dungeon, player, party, personal, score)
+            score.grid(row=1, column=5, sticky="ew", padx=(4, 0))
+            row_info: dict[str, Any] = {
+                "frame": row, "divider": divider, "rank": rank, "dungeon": dungeon,
+                "player": player, "party": party, "personal": personal,
+                "score": score, "entry": None,
+            }
+            dungeon.configure(cursor="hand2")
+            dungeon.bind(
+                "<Enter>",
+                lambda event, info=row_info: self._show_leaderboard_rank_tooltip(info, event),
+                add="+",
+            )
+            dungeon.bind("<Leave>", self._schedule_hide_leaderboard_rank_tooltip, add="+")
+            widgets = (row, divider, rank, dungeon, player, party, personal, score)
             for widget in widgets:
                 widget.bind("<MouseWheel>", self._scroll_leaderboard, add="+")
-            self.leaderboard_rows.append({"frame": row, "rank": rank, "dungeon": dungeon,
-                                          "player": player, "party": party,
-                                          "personal": personal, "score": score})
+            self.leaderboard_rows.append(row_info)
 
     def _sync_leaderboard_scroll_region(self, _event: tk.Event | None = None) -> None:
         bounds = self.leaderboard_canvas.bbox("all")
@@ -4241,6 +4277,7 @@ class MeterApp:
             self.leaderboard_player_list_tab.pack(anchor="e", pady=(4, 0))
 
     def _render_leaderboard(self) -> None:
+        self._hide_leaderboard_rank_tooltip()
         category = LEADERBOARD_CATEGORY_LABELS.get(self.leaderboard_category_var.get(), "time")
         source = "imported"
         overview = (self.leaderboard_dungeon_var.get() == ALL_DUNGEONS
@@ -4265,38 +4302,50 @@ class MeterApp:
              str(entry.get("difficulty") or "").casefold()): entry
             for entry in self.leaderboard_personal_entries
         }
-        display_entries = list(self.leaderboard_entries)
+        display_entries = [
+            entry for entry in self.leaderboard_entries
+            if int(entry.get("rank", 0) or 0) == 1
+        ]
         if overview:
             difficulty_order = {
                 name.casefold(): index for index, name in enumerate(
-                    ("Stable", "Unstable", "Fractured", "Collapsing",
-                     "Shattered", "Abyssal", "Raid"))
+                    LEADERBOARD_DISPLAY_DIFFICULTY_ORDER)
             }
             display_entries.sort(key=lambda entry: (
-                str(entry.get("dungeon") or "Unknown").casefold(),
                 difficulty_order.get(
                     str(entry.get("difficulty") or "").casefold(), 99),
                 str(entry.get("difficulty") or "").casefold(),
+                str(entry.get("dungeon") or "Unknown").casefold(),
                 int(entry.get("rank", 0) or 0),
             ))
         self._ensure_leaderboard_row_capacity(max(10, len(display_entries)))
         for index, row in enumerate(self.leaderboard_rows):
             if index < len(display_entries):
                 entry = display_entries[index]
+                row["entry"] = entry
                 if not row["frame"].winfo_manager():
                     row["frame"].pack(fill="x", padx=7, pady=1)
-                displayed_rank = (index + 1 if overview else
-                                  int(entry.get("rank", index + 1) or index + 1))
+                displayed_rank = index + 1 if overview else 1
                 player = str(entry.get("display_name") or "Unknown")
                 dungeon = str(entry.get("dungeon") or "Unknown")
+                difficulty = str(entry.get("difficulty") or "—")
+                previous_difficulty = (
+                    str(display_entries[index - 1].get("difficulty") or "—")
+                    if index > 0 else difficulty)
+                if (overview and index > 0
+                        and difficulty.casefold() != previous_difficulty.casefold()):
+                    row["divider"].grid()
+                else:
+                    row["divider"].grid_remove()
                 row["rank"].configure(
                     text=str(displayed_rank), foreground=self.colors["red"])
                 row["dungeon"].configure(
-                    text=dungeon, foreground=self.colors["green"])
+                    text=dungeon,
+                    foreground=LEADERBOARD_DIFFICULTY_COLORS.get(
+                        difficulty.casefold(), self.colors["green"]))
                 row["player"].configure(
                     text=player, foreground=self.colors["text"])
                 if overview:
-                    difficulty = str(entry.get("difficulty") or "—")
                     row["party"].configure(
                         text=difficulty, foreground=self.colors["purple"])
                 else:
@@ -4317,6 +4366,8 @@ class MeterApp:
                     text=self._leaderboard_score(entry, category),
                     foreground=self.colors["orange"])
             else:
+                row["entry"] = None
+                row["divider"].grid_remove()
                 row["frame"].pack_forget()
         if self.leaderboard_entries:
             self.leaderboard_empty_label.pack_forget()
@@ -4346,7 +4397,12 @@ class MeterApp:
             self._render_leaderboard()
             self._set_leaderboard_status("Join the leaderboard to view rankings.")
             return
-        query = {"category": category, "source": source, "limit": "100"}
+        query = {
+            "category": category,
+            "source": source,
+            "top": str(LEADERBOARD_TOP_PER_DUNGEON),
+            "limit": "250",
+        }
         if dungeon and dungeon != ALL_DUNGEONS:
             query["dungeon"] = dungeon
         if difficulty and difficulty != ALL_DIFFICULTIES:
@@ -4458,6 +4514,7 @@ class MeterApp:
 
     def _show_main_view(self, view: str) -> None:
         self._hide_player_list_tooltip()
+        self._hide_leaderboard_rank_tooltip()
         for widget in (self.meter_view, self.flex_view, self.leaderboard_view):
             widget.pack_forget()
         self.current_view = view
@@ -4998,6 +5055,139 @@ class MeterApp:
             self._dungeon_tooltip.destroy()
         self._dungeon_tooltip = None
 
+    def _show_leaderboard_rank_tooltip(
+            self, row: dict[str, Any], _event: tk.Event | None = None) -> None:
+        entry = row.get("entry")
+        if not isinstance(entry, dict):
+            return
+        self._cancel_hide_leaderboard_rank_tooltip()
+        dungeon = str(entry.get("dungeon") or "Unknown")
+        difficulty = str(entry.get("difficulty") or "—")
+        category = LEADERBOARD_CATEGORY_LABELS.get(
+            self.leaderboard_category_var.get(), "time")
+        matching = [
+            candidate for candidate in self.leaderboard_entries
+            if str(candidate.get("dungeon") or "").casefold() == dungeon.casefold()
+            and str(candidate.get("difficulty") or "").casefold() == difficulty.casefold()
+        ]
+        matching.sort(key=lambda candidate: int(candidate.get("rank", 999) or 999))
+        matching = matching[:LEADERBOARD_TOP_PER_DUNGEON]
+        if not matching:
+            return
+        if self._leaderboard_rank_tooltip is not None:
+            if self._leaderboard_rank_tooltip_row is row:
+                self._position_leaderboard_rank_tooltip(row)
+                return
+            self._hide_leaderboard_rank_tooltip()
+
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        outer = tk.Frame(
+            tip, background="#171C27", highlightbackground="#3A4352",
+            highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        dungeon_color = LEADERBOARD_DIFFICULTY_COLORS.get(
+            difficulty.casefold(), self.colors["green"])
+        tk.Label(
+            outer, text=dungeon, background="#171C27", foreground=dungeon_color,
+            font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(8, 1))
+        tk.Label(
+            outer,
+            text=f"{difficulty}  ·  {self.leaderboard_category_var.get()}  ·  TOP 5",
+            background="#171C27", foreground=self.colors["purple"],
+            font=(self.FONT, self._scaled_font_size(7), "bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
+        score_heading = {
+            "time": "TIME", "total_damage": "DAMAGE", "dps": "DPS",
+            "best_30": "BEST 30S", "largest_hit": "HIGHEST HIT",
+            "healing": "HEALING", "shielding": "SHIELDING",
+        }.get(category, "SCORE")
+        ranking_table = tk.Frame(outer, background="#171C27")
+        ranking_table.pack(fill="x", padx=10, pady=(0, 2))
+        for column, minimum, weight in (
+                (0, 24, 0), (1, 132, 1), (2, 50, 0), (3, 88, 0)):
+            ranking_table.grid_columnconfigure(column, minsize=minimum, weight=weight)
+        for column, (text_value, anchor) in enumerate((
+                ("#", "w"), ("PLAYER", "w"), ("PARTY", "center"),
+                (score_heading, "e"))):
+            tk.Label(
+                ranking_table, text=text_value, background="#171C27",
+                foreground=self.colors["muted"],
+                font=(self.FONT, self._scaled_font_size(6), "bold"), anchor=anchor,
+            ).grid(row=0, column=column, sticky="ew")
+        for table_row, candidate in enumerate(matching, start=1):
+            rank = int(candidate.get("rank", 0) or 0)
+            rank_color = LEADERBOARD_RANK_COLORS.get(rank, self.colors["text"])
+            tk.Label(
+                ranking_table, text=str(rank), background="#171C27",
+                foreground=rank_color,
+                font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
+            ).grid(row=table_row, column=0, sticky="ew", pady=1)
+            tk.Label(
+                ranking_table, text=str(candidate.get("display_name") or "Unknown"),
+                background="#171C27", foreground=rank_color,
+                font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
+            ).grid(row=table_row, column=1, sticky="ew", pady=1)
+            tk.Label(
+                ranking_table, text=str(candidate.get("party_size") or "—"),
+                background="#171C27", foreground=self.colors["purple"],
+                font=(self.FONT, self._scaled_font_size(8)), anchor="center",
+            ).grid(row=table_row, column=2, sticky="ew", pady=1)
+            tk.Label(
+                ranking_table, text=self._leaderboard_score(candidate, category),
+                background="#171C27", foreground=self.colors["orange"],
+                font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="e",
+            ).grid(row=table_row, column=3, sticky="ew", pady=1)
+        tk.Frame(outer, height=7, background="#171C27").pack()
+        self._leaderboard_rank_tooltip = tip
+        self._leaderboard_rank_tooltip_row = row
+        tip.bind("<Enter>", self._cancel_hide_leaderboard_rank_tooltip, add="+")
+        tip.bind("<Leave>", self._schedule_hide_leaderboard_rank_tooltip, add="+")
+        self._position_leaderboard_rank_tooltip(row)
+
+    def _position_leaderboard_rank_tooltip(self, row: dict[str, Any]) -> None:
+        if self._leaderboard_rank_tooltip is None:
+            return
+        self._leaderboard_rank_tooltip.update_idletasks()
+        source: tk.Widget = row["dungeon"]
+        source_x = source.winfo_rootx()
+        source_y = source.winfo_rooty()
+        tip_width = self._leaderboard_rank_tooltip.winfo_width()
+        tip_height = self._leaderboard_rank_tooltip.winfo_height()
+        x = source_x + source.winfo_width() + 2
+        if x + tip_width > self.root.winfo_screenwidth() - 8:
+            x = source_x - tip_width - 2
+        y = min(source_y, self.root.winfo_screenheight() - tip_height - 8)
+        self._leaderboard_rank_tooltip.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cancel_hide_leaderboard_rank_tooltip(
+            self, _event: tk.Event | None = None) -> None:
+        if self._leaderboard_rank_tooltip_hide_job is not None:
+            self.root.after_cancel(self._leaderboard_rank_tooltip_hide_job)
+            self._leaderboard_rank_tooltip_hide_job = None
+
+    def _schedule_hide_leaderboard_rank_tooltip(
+            self, _event: tk.Event | None = None) -> None:
+        if self._leaderboard_rank_tooltip_hide_job is not None:
+            self.root.after_cancel(self._leaderboard_rank_tooltip_hide_job)
+        self._leaderboard_rank_tooltip_hide_job = self.root.after(
+            300, self._hide_leaderboard_rank_tooltip)
+
+    def _hide_leaderboard_rank_tooltip(self) -> None:
+        if self._leaderboard_rank_tooltip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._leaderboard_rank_tooltip_hide_job)
+            except tk.TclError:
+                pass
+            self._leaderboard_rank_tooltip_hide_job = None
+        if self._leaderboard_rank_tooltip is not None:
+            self._leaderboard_rank_tooltip.destroy()
+        self._leaderboard_rank_tooltip = None
+        self._leaderboard_rank_tooltip_row = None
+
     def _show_player_list_tooltip(self, _event: tk.Event | None = None) -> None:
         self._cancel_hide_player_list_tooltip()
         summary = self.leaderboard_player_list
@@ -5166,6 +5356,7 @@ class MeterApp:
         self._hide_ability_tooltip()
         self._hide_dungeon_tooltip()
         self._hide_player_list_tooltip()
+        self._hide_leaderboard_rank_tooltip()
         self._minimized = True
         # A borderless Tk window cannot be safely iconified directly. Temporarily
         # give it standard Windows chrome so it has a real taskbar entry and can
@@ -5237,6 +5428,7 @@ class MeterApp:
         self._hide_ability_tooltip()
         self._hide_dungeon_tooltip()
         self._hide_player_list_tooltip()
+        self._hide_leaderboard_rank_tooltip()
         if self._brand_animation_job is not None:
             try:
                 self.root.after_cancel(self._brand_animation_job)
@@ -5711,7 +5903,8 @@ def main() -> int:
     if args.leaderboard_smoke:
         saved_token = unprotect_secret(AppSettings().get("LeaderboardTokenProtected"))
         client = LeaderboardClient(saved_token)
-        path = ("/v1/leaderboards?source=imported&category=time&limit=10"
+        path = (f"/v1/leaderboards?source=imported&category=time"
+                f"&top={LEADERBOARD_TOP_PER_DUNGEON}&limit=250"
                 if saved_token else "/v1/leaderboards/catalog?source=imported")
         data, error_message = client.request_sync(
             "GET", path, None, authenticated=bool(saved_token))

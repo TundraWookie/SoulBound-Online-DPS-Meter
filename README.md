@@ -25,7 +25,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Imports existing combat logs once and keeps a permanent duplicate-prevention ledger in `records.txt`.
 - Shows a room timeline below the ability list with readable combat-only checkpoint times in both normal and compact layouts.
 - Includes a community **Ranks** tab for fastest completed runs, damage, DPS, healing, shielding, and other categories.
-- Shows every returned leaderboard result in a scrollable, color-coded table, grouped by dungeon and difficulty, with your personal best beside the leading score.
+- Shows one leading score per dungeon and difficulty with your personal best beside it; hover a dungeon name for that category's color-coded top five.
 - Excludes abandoned, failed, incomplete, and edited live runs from leaderboard rankings.
 - Checks GitHub Releases on startup and asks before downloading and installing a newer version.
 - Supports custom menu colors.
@@ -165,10 +165,10 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - Automatic history migrations preserve previously scanned non-Spectra files and throttle any required archive parsing so the live meter and timer stay responsive.
 - Completed runs are read from their recorded combat logs and added automatically after the run ends.
 - Leaderboard submissions send the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
-- Each player appears once per dungeon, difficulty, party size, and ranking category using their best qualifying score.
+- Each player can occupy only one top-five position per dungeon and difficulty, using their best qualifying score for the selected category and filters.
 - Leaderboard results refresh every 2 minutes while the Ranks tab is open, immediately after your completed run is accepted, or whenever **Refresh** is selected.
 - Dungeon catalog results are cached for six hours, and each unchanged combat log is processed only once to keep community Cloudflare usage within the free allowance.
-- Difficulty order is Stable, Unstable, Fractured, Collapsing, Shattered, Abyssal, then Raid.
+- The leaderboard groups difficulty sections hardest to easiest: Raid, Abyssal, Shattered, Collapsing, Fractured, Unstable, then Stable. The difficulty filter remains ordered easiest to hardest.
 
 ## Controls
 
