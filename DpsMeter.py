@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.11"
+VERSION = "0.9.12"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -3079,7 +3079,12 @@ class MeterApp:
             sub = self.label(card, "0 DPS" if "DAMAGE" in title else "0 HPS", 6, foreground="muted")
             sub.pack(anchor="w", padx=8, pady=(0, 5))
         else:
-            self.label(card, "", 6).pack(pady=(0, 5))
+            spacer = tk.Label(
+                card, text="", font=(self.FONT, self._scaled_font_size(6)),
+                borderwidth=0)
+            self._register_font(spacer, 6)
+            self.role(spacer, "panel", None)
+            spacer.pack(fill="x", pady=(0, 5))
         return value, sub, title_label
 
     def _build_flex_view(self) -> None:
