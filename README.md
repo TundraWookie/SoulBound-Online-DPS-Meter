@@ -290,6 +290,12 @@ Run its included self-test with:
 python DpsMeter.py --self-test
 ```
 
+To create the Windows EXE with its embedded file icon, install PyInstaller and run:
+
+```powershell
+.\build_windows.ps1
+```
+
 ## Credits
 
 - Created by **TundraWooK**.
