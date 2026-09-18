@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.8"
+VERSION = "0.9.9"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -157,6 +157,7 @@ class UpdateInfo:
     download_url: str
     size: int
     sha256: str
+    release_notes: str
 
 
 def version_tuple(value: str) -> tuple[int, ...]:
@@ -174,6 +175,22 @@ def is_newer_version(candidate: str, current: str = VERSION) -> bool:
         return False
     width = max(len(candidate_parts), len(current_parts))
     return candidate_parts + (0,) * (width - len(candidate_parts)) > current_parts + (0,) * (width - len(current_parts))
+
+
+def plain_release_notes(value: Any, limit: int = 1400) -> str:
+    """Turn a GitHub Markdown release body into compact message-box text."""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return "No patch notes were provided for this update."
+    text = re.sub(r"!\[[^]]*]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^]]+)]\([^)]*\)", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+    text = text.replace("**", "").replace("__", "").replace("`", "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0].rstrip() + "…"
+    return text
 
 
 def update_asset_from_release(release: dict[str, Any], frozen: bool) -> UpdateInfo | None:
@@ -211,7 +228,10 @@ def update_asset_from_release(release: dict[str, Any], frozen: bool) -> UpdateIn
         return None
     if size <= 0 or size > UPDATE_MAX_DOWNLOAD_BYTES:
         return None
-    return UpdateInfo(tag.lstrip("vV"), str(asset.get("name") or "update"), url, size, sha256)
+    return UpdateInfo(
+        tag.lstrip("vV"), str(asset.get("name") or "update"), url, size, sha256,
+        plain_release_notes(release.get("body")),
+    )
 
 
 def fetch_latest_update(frozen: bool) -> UpdateInfo | None:
@@ -2118,6 +2138,7 @@ class LeaderboardRunTracker:
 class AppSettings:
     DEFAULTS = {
         "CombatLogPath": None, "CombatLogFolder": None, "CleanupOldCombatLogs": False,
+        "CombatLogPollMs": 250,
         "FollowGameWindow": True, "ThemeColorHex": "#10151D", "WindowLeft": None, "WindowTop": None,
         "OverlayOpacity": 1.0, "FadeWhenAfk": False, "AfkFadeSeconds": 6.0,
         "AutoUpdateEnabled": True,
@@ -2599,6 +2620,13 @@ class MeterApp:
         self.game_window: int | None = None
         self.game_pid: int | None = None
         self.last_process_poll = 0.0
+        self.last_log_poll = 0.0
+        try:
+            configured_log_poll_ms = round(float(self.settings.get("CombatLogPollMs")) / 250.0) * 250
+        except (TypeError, ValueError):
+            configured_log_poll_ms = 250
+        self.combat_log_poll_ms = min(10_000, max(250, configured_log_poll_ms))
+        self.settings.data["CombatLogPollMs"] = self.combat_log_poll_ms
         self.locked = False
         try:
             configured_opacity = float(self.settings.get("OverlayOpacity"))
@@ -3426,6 +3454,28 @@ class MeterApp:
                    "Updates are downloaded from this project's GitHub Releases, verified, installed beside this copy, and reopened only after you approve.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
         self.label(self.settings_body, "COMBAT LOGS", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
+        poll_rate_row = self.role(tk.Frame(self.settings_body), "bg", None)
+        poll_rate_row.pack(fill="x", padx=15)
+        self.label(poll_rate_row, "Polling", 8, foreground="text", width=7, anchor="w").grid(
+            row=0, column=0, sticky="w")
+        self.combat_log_poll_var = tk.DoubleVar(value=self.combat_log_poll_ms)
+        poll_rate_scale = tk.Scale(
+            poll_rate_row, from_=250, to=10_000, resolution=250, orient="horizontal",
+            showvalue=False, variable=self.combat_log_poll_var,
+            command=self.combat_log_poll_changed, borderwidth=0,
+            highlightthickness=0, sliderlength=14)
+        self.role(poll_rate_scale, "bg", "text")
+        poll_rate_scale.grid(row=0, column=1, sticky="ew", padx=4)
+        self.combat_log_poll_label = self.label(
+            poll_rate_row, self.format_poll_interval(self.combat_log_poll_ms), 8,
+            foreground="muted", width=7, anchor="e")
+        self.combat_log_poll_label.grid(row=0, column=2, sticky="e")
+        poll_rate_row.grid_columnconfigure(1, weight=1)
+        self.label(
+            self.settings_body,
+            "How often the meter checks for new combat-log entries. Lower reacts sooner but checks the disk more often; higher delays updates. Soulbound usually writes every 500 ms. This does not change leaderboard timing.",
+            7, foreground="muted", justify="left", wraplength=290).pack(
+                anchor="w", padx=34, pady=(3, 8))
         self.cleanup_var = tk.BooleanVar(value=bool(self.settings.get("CleanupOldCombatLogs")))
         cleanup = tk.Checkbutton(self.settings_body, text="Delete verified old combat logs; keep newest 10",
                                  variable=self.cleanup_var, command=self.cleanup_changed, font=(self.FONT, self._scaled_font_size(8)),
@@ -3635,6 +3685,24 @@ class MeterApp:
             if removed:
                 self.log_status = f"Cleared {removed} old combat logs"
 
+    @staticmethod
+    def format_poll_interval(milliseconds: float) -> str:
+        rounded = min(10_000, max(250, round(milliseconds / 250.0) * 250))
+        if rounded < 1000:
+            return f"{rounded} ms"
+        seconds = rounded / 1000.0
+        return f"{seconds:.2f}".rstrip("0").rstrip(".") + " sec"
+
+    def combat_log_poll_changed(self, value: str) -> None:
+        try:
+            milliseconds = round(float(value) / 250.0) * 250
+        except (TypeError, ValueError):
+            return
+        self.combat_log_poll_ms = min(10_000, max(250, milliseconds))
+        self.combat_log_poll_label.configure(
+            text=self.format_poll_interval(self.combat_log_poll_ms))
+        self.settings.set("CombatLogPollMs", self.combat_log_poll_ms)
+
     def include_overkill_changed(self) -> None:
         enabled = bool(self.include_overkill_var.get())
         self.settings.set("IncludeOverkillDamage", enabled)
@@ -3703,6 +3771,7 @@ class MeterApp:
             "DPS Meter Update Available",
             f"DPS Meter {info.version} is ready.\n\n"
             f"Installed version: {VERSION}\n"
+            f"\nWHAT'S NEW\n{info.release_notes}\n\n"
             "Would you like to download, install, and reopen it now?",
             parent=self.root,
         )
@@ -5106,8 +5175,10 @@ class MeterApp:
             return
         try:
             self.leaderboard_client.pump()
-            self.watcher.poll()
             now = time.monotonic()
+            if now - self.last_log_poll >= self.combat_log_poll_ms / 1000.0:
+                self.watcher.poll()
+                self.last_log_poll = now
             if now - self.last_process_poll >= 0.75:
                 self.find_and_follow()
                 self.last_process_poll = now
@@ -5185,6 +5256,7 @@ def run_self_test(log_path: str | None = None) -> int:
     fake_digest = "a" * 64
     fake_release = {
         "tag_name": "v9.8.7", "draft": False, "prerelease": False,
+        "body": "### Fixed\n- Faster polling\n- Shows [release notes](https://example.com)",
         "assets": [
             {"name": "DpsMeter-9.8.7.py", "size": 123, "digest": f"sha256:{fake_digest}",
              "browser_download_url": "https://github.com/example/update.py"},
@@ -5194,6 +5266,8 @@ def run_self_test(log_path: str | None = None) -> int:
     }
     assert update_asset_from_release(fake_release, False).asset_name.endswith(".py")  # type: ignore[union-attr]
     assert update_asset_from_release(fake_release, True).asset_name.endswith(".exe")  # type: ignore[union-attr]
+    assert update_asset_from_release(fake_release, True).release_notes == (  # type: ignore[union-attr]
+        "Fixed\n• Faster polling\n• Shows release notes")
     with tempfile.TemporaryDirectory() as update_test_dir:
         update_dir = Path(update_test_dir)
         update_source = update_dir / "download.py"
