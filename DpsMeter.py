@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.13"
+VERSION = "0.9.14"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -517,6 +517,53 @@ def is_spectra_history_signature(value: Any) -> bool:
     return "spectra_lair" in normalized
 
 
+def reported_party_size(value: Any) -> int | None:
+    """Return a trustworthy declared party size without turning bad data into Solo."""
+    try:
+        size = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return size if 1 <= size <= 8 else None
+
+
+def observe_log_players(root: dict[str, Any], observed: set[str]) -> None:
+    """Collect stable player identities exposed by combat source/target records."""
+    data = root.get("data") if isinstance(root.get("data"), dict) else {}
+    for field in ("source", "target"):
+        entity = data.get(field)
+        if not isinstance(entity, dict):
+            continue
+        entity_type = str(entity.get("type") or "").strip().casefold()
+        if entity_type == "self":
+            observed.add("self")
+            continue
+        if entity_type != "player":
+            continue
+        identity = first_value(entity, "id", "entity_id", "user_id", "alias")
+        if identity is not None and str(identity).strip():
+            observed.add(f"id:{str(identity).strip().casefold()}")
+            continue
+        name = first_value(entity, "display_name", "name")
+        if name is not None and str(name).strip():
+            observed.add(f"name:{str(name).strip().casefold()}")
+
+
+def reconciled_party_size(declared: int | None, observed: set[str]) -> int | None:
+    """Correct an under-reported count and preserve unknown instead of assuming Solo."""
+    observed_size = min(8, len(observed))
+    if declared is None:
+        return observed_size if observed_size > 1 else None
+    return min(8, max(declared, observed_size))
+
+
+def possible_leaderboard_entry(entry: dict[str, Any]) -> bool:
+    """Hide legacy party categories that the game mode cannot produce."""
+    dungeon = str(entry.get("dungeon") or "").strip().casefold()
+    difficulty = str(entry.get("difficulty") or "").strip().casefold()
+    party_size = reported_party_size(entry.get("party_size"))
+    return not (dungeon == "spectra lair" and difficulty == "raid" and party_size == 1)
+
+
 def is_boss_raid_completion(event: "CombatEvent") -> bool:
     """Boss raids finish at ENCOUNTER_END and may omit ROOM_END/RUN_END."""
     failure_reasons = {
@@ -608,6 +655,7 @@ class CombatEvent:
     source_type: str | None
     target_id: str | None
     target_name: str | None
+    target_type: str | None
     ability_id: str | None
     ability_name: str
     impact_type: str | None
@@ -619,6 +667,7 @@ class CombatEvent:
     critical: bool
     heavy_hit: bool
     periodic: bool
+    lethal: bool
     sequence: float | None
     dungeon_name: str | None
     run_end_reason: str | None
@@ -687,6 +736,7 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         first_value(source, "type"),
         first_value(target, "id", "entity_id", "user_id", "alias") or first_value(payload, "target_id", "victim_id"),
         first_value(target, "display_name", "name", "alias") or first_value(payload, "target_name", "victim_name"),
+        first_value(target, "type"),
         first_value(payload, "ability_id", "skill_id", "action_id") or first_value(ability, "id"),
         str(ability_name),
         impact_type,
@@ -698,6 +748,7 @@ def parse_combat_event(line_or_object: str | dict[str, Any]) -> CombatEvent | No
         first_bool(payload, "is_crit", "critical", "crit", "is_critical"),
         first_bool(payload, "is_heavy_hit", "heavy_hit"),
         first_bool(payload, "periodic", "is_periodic", "dot", "hot"),
+        first_bool(payload, "is_lethal", "lethal"),
         sequence,
         str(first_value(payload, "dungeon_display_name", "dungeon_name") or "").strip() or None,
         str(first_value(payload, "reason", "end_reason") or "").strip().lower() or None,
@@ -921,7 +972,7 @@ class CombatSession:
             self.abilities[key] = [
                 event.ability_name, 0.0, set(),
                 {"normal": [0, 0.0], "crit": [0, 0.0], "heavy": [0, 0.0], "dev": [0, 0.0]},
-                0.0,
+                0.0, 0,
             ]
         ability = self.abilities[key]
         ability[1] += event.amount
@@ -929,6 +980,8 @@ class CombatSession:
             category = "dev" if event.critical and event.heavy_hit else "crit" if event.critical else "heavy" if event.heavy_hit else "normal"
             ability[3][category][0] += 1
             ability[3][category][1] += event.amount
+            if event.lethal and str(event.target_type or "").casefold() == "mob":
+                ability[5] += 1
             if event.impact_type:
                 ability[2].add(event.impact_type)
         else:
@@ -962,7 +1015,7 @@ class CombatSession:
         visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
         largest = visible[0][1] if visible else 1.0
         top = []
-        for name, amount, impact_types, buckets, non_damage in visible[:6]:
+        for name, amount, impact_types, buckets, non_damage, kills in visible[:6]:
             damage_amount = sum(float(bucket[1]) for bucket in buckets.values())
             breakdown = {}
             for category, bucket in buckets.items():
@@ -979,6 +1032,7 @@ class CombatSession:
                 "amount": amount,
                 "percent": amount / largest * 100.0,
                 "damage_type": " / ".join(sorted(impact_types, key=str.casefold)).upper(),
+                "kills": int(kills),
                 "breakdown": breakdown,
                 "non_damage": float(non_damage),
                 "segments": {
@@ -1752,7 +1806,8 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     start: CombatEvent | None = None
     end: CombatEvent | None = None
     extracted = False
-    party_size = 1
+    declared_party_size: int | None = None
+    observed_players: set[str] = set()
     game_version = "unknown"
     total_damage = 0.0
     total_healing = 0.0
@@ -1786,6 +1841,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                     continue
                 raw_type = str(root.get("event", "")).strip().lower()
                 data = root.get("data") if isinstance(root.get("data"), dict) else {}
+                observe_log_players(root, observed_players)
                 if raw_type == "log_header":
                     game_version = str(data.get("client_version") or data.get("game_version") or "unknown")[:40]
                 elapsed_value = root.get("run_elapsed_ms")
@@ -1812,10 +1868,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                 event = parsed
                 if event.type == "combat_start" and start is None:
                     start = event
-                    try:
-                        party_size = min(8, max(1, int(float(data.get("party_size", 1)))))
-                    except (TypeError, ValueError):
-                        party_size = 1
+                    declared_party_size = reported_party_size(data.get("party_size"))
                 elif event.type == "room_end" and event.run_end_reason in {"extraction", "extracted"}:
                     extracted = True
                 elif is_boss_raid_completion(event):
@@ -1869,6 +1922,9 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     else:
         combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
     if run_time_ms < 30_000 or run_time_ms > 28_800_000:
+        return None
+    party_size = reconciled_party_size(declared_party_size, observed_players)
+    if party_size is None:
         return None
     return {
         "dungeon": dungeon,
@@ -3022,6 +3078,8 @@ class MeterApp:
             name_line.pack(fill="x")
             damage_type = self.label(name_line, "", 6, "bold", "muted", anchor="e")
             damage_type.pack(side="right", padx=(5, 10))
+            kills = self.label(name_line, "", 6, "bold", "orange", anchor="e")
+            kills.pack(side="right", padx=(5, 5))
             name = self.label(name_line, "", 8, foreground="text", anchor="w")
             name.pack(side="left", fill="x", expand=True)
             bar = tk.Canvas(middle, height=3, borderwidth=0, highlightthickness=0)
@@ -3032,11 +3090,13 @@ class MeterApp:
             middle.pack(side="left", fill="x", expand=True)
             row_info = {
                 "frame": row, "icon": icon, "name": name, "damage_type": damage_type,
+                "kills": kills,
                 "bar": bar, "amount": amount, "icon_holder": icon_holder,
                 "percent": 0.0, "segments": {}, "ability": None, "effect_color": None,
             }
             self.ability_rows.append(row_info)
-            for hover_widget in (row, icon_holder, icon, middle, name_line, damage_type, name, bar, amount):
+            for hover_widget in (row, icon_holder, icon, middle, name_line, damage_type,
+                                 kills, name, bar, amount):
                 hover_widget.bind("<Enter>", lambda event, info=row_info: self._show_ability_tooltip(info, event))
                 hover_widget.bind("<Leave>", self._schedule_hide_ability_tooltip)
 
@@ -4423,11 +4483,14 @@ class MeterApp:
                 self._set_leaderboard_status(error_message or "Leaderboard could not be loaded.")
             else:
                 entries = data.get("entries")
-                self.leaderboard_entries = [entry for entry in entries if isinstance(entry, dict)] \
+                self.leaderboard_entries = [entry for entry in entries
+                                             if isinstance(entry, dict)
+                                             and possible_leaderboard_entry(entry)] \
                     if isinstance(entries, list) else []
                 personal_entries = data.get("personalEntries")
                 self.leaderboard_personal_entries = [entry for entry in personal_entries
-                                                     if isinstance(entry, dict)] \
+                                                     if isinstance(entry, dict)
+                                                     and possible_leaderboard_entry(entry)] \
                     if isinstance(personal_entries, list) else []
                 player_list = data.get("playerList")
                 # Retain the roster for the session if a later response is
@@ -4805,6 +4868,9 @@ class MeterApp:
             ability = abilities[index]
             row["name"].configure(text=ability["name"])
             row["damage_type"].configure(text=ability["damage_type"])
+            kill_count = int(ability.get("kills", 0))
+            row["kills"].configure(
+                text=f"{kill_count:,} {'KILL' if kill_count == 1 else 'KILLS'}")
             row["amount"].configure(text=format_number(ability["amount"]))
             row["percent"] = ability["percent"]
             row["segments"] = ability["segments"]
@@ -4928,6 +4994,12 @@ class MeterApp:
         outer.pack(fill="both", expand=True)
         tk.Label(outer, text=ability["name"], background="#171C27", foreground="#F4F7FB",
                  font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w").pack(fill="x", padx=10, pady=(8, 5))
+        kill_count = int(ability.get("kills", 0))
+        tk.Label(
+            outer, text=f"{kill_count:,} {'kill' if kill_count == 1 else 'kills'}",
+            background="#171C27", foreground=self.colors["orange"],
+            font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 5))
         colors = {"normal": "#F4F7FB", "crit": self.colors["red"], "heavy": self.colors["orange"], "dev": self.colors["purple"]}
         titles = {"normal": "Normal", "crit": "Crit", "heavy": "Heavy", "dev": "Devastating"}
         for category in ("normal", "crit", "heavy", "dev"):
@@ -5512,13 +5584,32 @@ def run_self_test(log_path: str | None = None) -> int:
         "dungeon__Spectra_Lair__1__2026-09-17_16-03-28Z.log|2497908|123")
     assert not is_spectra_history_signature(
         "dungeon__Eastern_Reach__1__2026-09-17_16-03-28Z.log|2497908|123")
+    assert reported_party_size(1.0) == 1
+    assert reported_party_size(None) is None and reported_party_size(0) is None
+    observed_test_players: set[str] = set()
+    observe_log_players({"data": {
+        "source": {"type": "self", "id": "self"},
+        "target": {"type": "player", "id": "player-5", "display_name": "Randouken"},
+    }}, observed_test_players)
+    observe_log_players({"data": {
+        "source": {"type": "player", "id": "player-5", "display_name": "Randouken"},
+        "target": {"type": "self", "id": "self"},
+    }}, observed_test_players)
+    assert reconciled_party_size(1, observed_test_players) == 2
+    assert reconciled_party_size(None, {"self"}) is None
+    assert not possible_leaderboard_entry({
+        "dungeon": "Spectra Lair", "difficulty": "Raid", "party_size": 1})
+    assert possible_leaderboard_entry({
+        "dungeon": "Spectra Lair", "difficulty": "Raid", "party_size": 8})
     event = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
-        "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
+        "data": {"source": {"type": "self"},
+                 "target": {"type": "mob", "alias": "mob-1", "display_name": "Target"},
+                 "ability_display_name": "Bomb", "is_lethal": True,
                  "impact_type": "void", "post_target_mitigation_amount": 300, "applied_amount": 1,
                  "is_crit": True, "is_heavy_hit": True},
     })
-    assert event and event.amount == 300 and event.applied_amount == 1
+    assert event and event.amount == 300 and event.applied_amount == 1 and event.lethal
     assert damage_effect_kind(event) == "dev"
     assert damage_effect_kind(replace(event, heavy_hit=False)) == "crit"
     assert damage_effect_kind(replace(event, critical=False)) == "heavy"
@@ -5527,10 +5618,11 @@ def run_self_test(log_path: str | None = None) -> int:
     session = CombatSession()
     session.apply(live_damage_event(event, False))
     unknown = replace(event, event_id="unknown", sequence=2, ability_name="Unknown Ability", amount=209,
-                      applied_amount=209, critical=False, heavy_hit=False)
+                      applied_amount=209, critical=False, heavy_hit=False, lethal=False)
     session.apply(live_damage_event(unknown, False))
     snap = session.snapshot()
     assert snap["damage"] == 210 and snap["abilities"][0]["name"] == "Bomb"
+    assert snap["abilities"][0]["kills"] == 1
     assert snap["abilities"][0]["damage_type"] == "VOID"
     assert snap["dev_rate"] == 50 and snap["highest_dev"] == 1
     assert snap["abilities"][0]["breakdown"]["dev"]["hits"] == 1
@@ -5716,6 +5808,31 @@ def run_self_test(log_path: str | None = None) -> int:
         assert spectra_history and spectra_history["dungeon"] == "Spectra Lair"
         assert spectra_history["difficulty"] == "Raid" and spectra_history["runTimeMs"] == 42_000
         assert spectra_history["runTimeMs"] == spectra_history["combatTimeMs"]
+
+        contradicted_party_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_15-37-06Z.log"
+        contradicted_party_roots = json.loads(json.dumps(spectra_roots))
+        observed_party_events = [{
+            "event": "SHIELD_GAINED", "sequence": 100 + index,
+            "run_elapsed_ms": 30_000 + index,
+            "data": {
+                "source": {"type": "self", "id": "self"},
+                "target": {"type": "player", "id": f"player-{index}",
+                           "display_name": f"Party Member {index}"},
+            },
+        } for index in range(1, 8)]
+        contradicted_party_roots[-1:-1] = observed_party_events
+        contradicted_party_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in contradicted_party_roots),
+            encoding="utf-8")
+        contradicted_party_history = historical_run_from_log(contradicted_party_log)
+        assert contradicted_party_history and contradicted_party_history["partySize"] == 8
+
+        missing_party_log = Path(folder) / "dungeon__Lunar_Plateau_-_Abyssal__unknown.log"
+        missing_party_roots = json.loads(json.dumps(history_roots))
+        del missing_party_roots[1]["data"]["party_size"]
+        missing_party_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in missing_party_roots), encoding="utf-8")
+        assert historical_run_from_log(missing_party_log) is None
 
         abandoned_spectra_log = Path(folder) / "dungeon__Spectra_Lair__2__2026-09-17_16-20-08Z.log"
         abandoned_spectra_roots = json.loads(json.dumps(spectra_roots))

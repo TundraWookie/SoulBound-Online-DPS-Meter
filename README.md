@@ -16,7 +16,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Tracks the highest critical, heavy, and devastating hits during the current run.
 - Shows ability names, bundled ability icons, damage types, contribution bars, and totals.
 - Splits each ability bar into Normal, Crit, Heavy, and Devastating damage colors.
-- Shows per-ability hit counts, damage, percentages, and averages when you hover over an ability.
+- Shows per-ability kill counts in the meter plus hit counts, damage, percentages, and averages on hover.
 - Resolves Healing Pulse and Fortify events when the log reports them as unknown.
 - Hides unresolved `Unknown Ability` rows while retaining their amounts in the totals.
 - Excludes unresolved abilities from ability-attributed Flex records so an unidentified hit or heal is never presented as a personal best.
@@ -128,6 +128,8 @@ The ability list shows the combined amount attributed to each ability during the
 
 Ability damage bars are split by hit type: white for Normal, red for Crit, orange for Heavy, and purple for Devastating. Hover over an ability to see each category's hit count, total damage, share of that ability's damage, and average hit. Healing and shielding amounts remain visible but are identified separately instead of being counted as damage hits.
 
+Ability kills are counted only when Soulbound marks the local player's outgoing damage as lethal against a mob. Party members' kills and nonlethal overkill damage are not credited.
+
 ## Flex Records
 
 The **Flex** tab stores permanent personal records, including:
@@ -162,6 +164,7 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - Rankings and player names are visible only after joining with a registered player name.
 - Only completed extractions are eligible. Abandoned, failed, ended-early, and incomplete runs are excluded.
 - Boss raids such as Spectra Lair are recognized from a successful `bossraid` completion event even when the game omits normal extraction events. Events marked abandoned, failed, defeated, wiped, or death-related are rejected, and raid rankings use the active combat clock so pauses and the post-clear exit do not inflate the clear time.
+- Party size is checked against unique player identities observed in the completed log. Under-reported counts are corrected, missing party data is never assumed to mean Solo, and legacy impossible Spectra Solo rows are hidden.
 - Automatic history migrations preserve previously scanned non-Spectra files and throttle any required archive parsing so the live meter and timer stay responsive.
 - Completed runs are read from their recorded combat logs and added automatically after the run ends.
 - Leaderboard submissions send the run summary and a SHA-256 source-file fingerprint, not the combat-log contents.
