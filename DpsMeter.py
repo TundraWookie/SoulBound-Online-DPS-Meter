@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.14"
+VERSION = "0.9.15"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -852,6 +852,7 @@ class CombatSession:
         self.last_run_elapsed_ms: float | None = None
         self.timing_in_combat = False
         self.has_run_elapsed_timing = False
+        self.in_boss_encounter = False
         self.stages: list[dict[str, Any]] = []
         self.abilities: dict[str, list[Any]] = {}
         self.seen_event_ids: set[str] = set()
@@ -887,6 +888,7 @@ class CombatSession:
             return
 
         if event.type == "room_start":
+            self.in_boss_encounter = False
             self._start_stage(event)
             self.in_run = True
             return
@@ -894,6 +896,7 @@ class CombatSession:
         if event.type == "encounter_start":
             self.has_encounter_timing = True
             self._update_stage_subtype(event)
+            self.in_boss_encounter = "boss" in str(event.room_subtype or "").casefold()
             noncombat = self._is_noncombat(event.room_subtype)
             if noncombat:
                 self._close_encounter(event.timestamp)
@@ -920,6 +923,7 @@ class CombatSession:
                     self.combat_clock_ms = event.run_duration_ms
                 self._close_encounter(event.timestamp)
             self.timing_in_combat = False
+            self.in_boss_encounter = False
             self.last_event_at = event.timestamp
             self.is_active = False
             if is_boss_raid_completion(event):
@@ -931,12 +935,14 @@ class CombatSession:
             self._finish_stage(event)
             self._close_encounter(event.timestamp)
             self.timing_in_combat = False
+            self.in_boss_encounter = False
             self.last_event_at = event.timestamp
             self.is_active = False
             return
         if event.type == "combat_end":
             self._close_encounter(event.timestamp)
             self.timing_in_combat = False
+            self.in_boss_encounter = False
             self.last_event_at = event.timestamp
             self.is_active = False
             self.in_run = False
@@ -972,7 +978,7 @@ class CombatSession:
             self.abilities[key] = [
                 event.ability_name, 0.0, set(),
                 {"normal": [0, 0.0], "crit": [0, 0.0], "heavy": [0, 0.0], "dev": [0, 0.0]},
-                0.0, 0,
+                0.0, 0, 0.0,
             ]
         ability = self.abilities[key]
         ability[1] += event.amount
@@ -982,6 +988,8 @@ class CombatSession:
             ability[3][category][1] += event.amount
             if event.lethal and str(event.target_type or "").casefold() == "mob":
                 ability[5] += 1
+            if self.in_boss_encounter:
+                ability[6] += event.amount
             if event.impact_type:
                 ability[2].add(event.impact_type)
         else:
@@ -1015,7 +1023,7 @@ class CombatSession:
         visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
         largest = visible[0][1] if visible else 1.0
         top = []
-        for name, amount, impact_types, buckets, non_damage, kills in visible[:6]:
+        for name, amount, impact_types, buckets, non_damage, kills, boss_damage in visible[:6]:
             damage_amount = sum(float(bucket[1]) for bucket in buckets.values())
             breakdown = {}
             for category, bucket in buckets.items():
@@ -1033,6 +1041,8 @@ class CombatSession:
                 "percent": amount / largest * 100.0,
                 "damage_type": " / ".join(sorted(impact_types, key=str.casefold)).upper(),
                 "kills": int(kills),
+                "boss_damage": float(boss_damage),
+                "boss_percent": float(boss_damage) * 100.0 / damage_amount if damage_amount else 0.0,
                 "breakdown": breakdown,
                 "non_damage": float(non_damage),
                 "segments": {
@@ -5000,6 +5010,14 @@ class MeterApp:
             background="#171C27", foreground=self.colors["orange"],
             font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
         ).pack(fill="x", padx=10, pady=(0, 5))
+        boss_damage = float(ability.get("boss_damage", 0.0))
+        boss_percent = float(ability.get("boss_percent", 0.0))
+        tk.Label(
+            outer,
+            text=f"Boss encounter damage   {format_number(boss_damage)} · {boss_percent:.1f}%",
+            background="#171C27", foreground=self.colors["blue"],
+            font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 6))
         colors = {"normal": "#F4F7FB", "crit": self.colors["red"], "heavy": self.colors["orange"], "dev": self.colors["purple"]}
         titles = {"normal": "Normal", "crit": "Crit", "heavy": "Heavy", "dev": "Devastating"}
         for category in ("normal", "crit", "heavy", "dev"):
@@ -5628,6 +5646,28 @@ def run_self_test(log_path: str | None = None) -> int:
     assert snap["abilities"][0]["breakdown"]["dev"]["hits"] == 1
     assert snap["abilities"][0]["segments"]["dev"] == 100
     assert snap["in_run"]
+
+    boss_session = CombatSession()
+    boss_roots = [
+        {"timestamp_utc": "2026-09-20T17:00:00Z", "event": "ENCOUNTER_START", "sequence": 1,
+         "data": {"encounter_subtype": "miniboss", "room_index": 4}},
+        {"timestamp_utc": "2026-09-20T17:00:01Z", "event": "DAMAGE_DEALT", "sequence": 2,
+         "data": {"source": {"type": "self"}, "target": {"type": "mob"},
+                  "ability_display_name": "Boss Test", "applied_amount": 100}},
+        {"timestamp_utc": "2026-09-20T17:00:02Z", "event": "ENCOUNTER_END", "sequence": 3,
+         "data": {"encounter_subtype": "miniboss", "room_index": 4}},
+        {"timestamp_utc": "2026-09-20T17:00:03Z", "event": "DAMAGE_DEALT", "sequence": 4,
+         "data": {"source": {"type": "self"}, "target": {"type": "mob"},
+                  "ability_display_name": "Boss Test", "applied_amount": 50}},
+    ]
+    for root in boss_roots:
+        boss_event = parse_combat_event(root)
+        assert boss_event
+        boss_session.apply(boss_event)
+    boss_ability = boss_session.snapshot()["abilities"][0]
+    assert boss_ability["boss_damage"] == 100
+    assert round(boss_ability["boss_percent"], 1) == 66.7
+
     ended = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "RUN_END", "sequence": 3,
     })

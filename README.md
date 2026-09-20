@@ -16,7 +16,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Tracks the highest critical, heavy, and devastating hits during the current run.
 - Shows ability names, bundled ability icons, damage types, contribution bars, and totals.
 - Splits each ability bar into Normal, Crit, Heavy, and Devastating damage colors.
-- Shows per-ability kill counts in the meter plus hit counts, damage, percentages, and averages on hover.
+- Shows per-ability kill counts in the meter plus boss-encounter damage, hit counts, damage, percentages, and averages on hover.
 - Resolves Healing Pulse and Fortify events when the log reports them as unknown.
 - Hides unresolved `Unknown Ability` rows while retaining their amounts in the totals.
 - Excludes unresolved abilities from ability-attributed Flex records so an unidentified hit or heal is never presented as a personal best.
@@ -129,6 +129,8 @@ The ability list shows the combined amount attributed to each ability during the
 Ability damage bars are split by hit type: white for Normal, red for Crit, orange for Heavy, and purple for Devastating. Hover over an ability to see each category's hit count, total damage, share of that ability's damage, and average hit. Healing and shielding amounts remain visible but are identified separately instead of being counted as damage hits.
 
 Ability kills are counted only when Soulbound marks the local player's outgoing damage as lethal against a mob. Party members' kills and nonlethal overkill damage are not credited.
+
+Each ability popup also separates damage dealt during Soulbound encounters marked `miniboss` or `bossraid`. This is labeled **Boss encounter damage** because boss encounters can include additional enemies and the log does not give every target a definitive boss flag.
 
 ## Flex Records
 
