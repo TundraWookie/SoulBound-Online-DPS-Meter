@@ -185,11 +185,13 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - **Flex / Meter:** Switch between the live meter and permanent records.
 - **Ranks:** Browse community records and manage your leaderboard name/history scan.
 - **Compact / Normal:** Switch between the full vertical meter and compact horizontal layout.
-- **Settings button:** Change the menu color, opacity, font size, AFK fading, overkill handling, and log-cleanup preference.
+- **Settings button:** Change the menu color, opacity, font size, AFK fading, overkill handling, Soulbound mob-health display, and log-cleanup preference.
 - **Follow game window:** Keep the overlay positioned relative to Soulbound.
 - **Alt+Shift+D:** Toggle click-through mode so mouse clicks pass through the overlay.
 
 When **Fade when AFK / outside a dungeon** is enabled, the overlay gradually fades to 8% opacity after a dungeon run ends. The **Fade time** slider selects how long that transition takes, from 1 to 60 seconds. A new dungeon or encounter—or any detected player damage, healing, or shielding—quickly restores the selected normal opacity. Opening Settings also restores normal opacity so the controls remain easy to use.
+
+The **Soulbound → Mob health numbers** control reads `%LOCALAPPDATA%\worldwidewebb\settings.dat` each time Settings opens and shows whether the game's `debug_show_mob_health` flag is currently on or off. The same button toggles it in either direction. Fully close and relaunch Soulbound after changing it.
 
 ## Settings and Local Files
 

@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.16"
+VERSION = "0.9.17"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -129,6 +129,48 @@ SCRIPT_DIR = (Path(sys.executable).resolve().parent
 RECORDS_PATH = SCRIPT_DIR / "records.txt"
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", SCRIPT_DIR))
 LEADERBOARD_ERROR_LOG_PATH = SCRIPT_DIR / "leaderboard-errors.log"
+SOULBOUND_SETTINGS_PATH = LOCAL_APP_DATA / "worldwidewebb" / "settings.dat"
+MOB_HEALTH_SETTING_PATTERN = re.compile(
+    rb'("debug_show_mob_health"\s*:\s*)(true|false)', re.IGNORECASE)
+
+
+def read_soulbound_mob_health(path: Path = SOULBOUND_SETTINGS_PATH) -> bool:
+    """Read Soulbound's mob-health debug flag without rewriting its settings."""
+    raw = path.read_bytes()
+    matches = list(MOB_HEALTH_SETTING_PATTERN.finditer(raw))
+    if len(matches) != 1:
+        raise ValueError("debug_show_mob_health was not found exactly once")
+    return matches[0].group(2).lower() == b"true"
+
+
+def write_soulbound_mob_health(
+        enabled: bool, path: Path = SOULBOUND_SETTINGS_PATH) -> None:
+    """Atomically change only Soulbound's mob-health debug flag."""
+    raw = path.read_bytes()
+    matches = list(MOB_HEALTH_SETTING_PATTERN.finditer(raw))
+    if len(matches) != 1:
+        raise ValueError("debug_show_mob_health was not found exactly once")
+    match = matches[0]
+    replacement = b"true" if enabled else b"false"
+    if match.group(2).lower() == replacement:
+        return
+    updated = raw[:match.start(2)] + replacement + raw[match.end(2):]
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        temporary_path.write_bytes(updated)
+        try:
+            shutil.copystat(path, temporary_path)
+        except OSError:
+            pass
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def write_leaderboard_error_log(method: str, path: str, error: BaseException,
@@ -2994,7 +3036,9 @@ class MeterApp:
         self.root.after(180, self.refresh_leaderboard_catalog)
         if smoke_seconds is None and bool(self.settings.get("AutoUpdateEnabled")):
             self.root.after(3500, self.check_for_updates)
-        if smoke_view in {"meter", "flex", "leaderboard"}:
+        if smoke_view == "settings":
+            self.root.after(60, self.show_settings)
+        elif smoke_view in {"meter", "flex", "leaderboard"}:
             self.root.after(60, lambda: self._show_main_view(smoke_view))
             if smoke_view == "leaderboard":
                 self.root.after(120, self.refresh_leaderboard)
@@ -3696,6 +3740,23 @@ class MeterApp:
         self.label(self.settings_body,
                    "Briefly colors an ability bar and amount red for crit, orange for heavy, or purple for devastating.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        self.label(self.settings_body, "SOULBOUND", 7, "bold", "muted").pack(
+            anchor="w", padx=15, pady=(12, 5))
+        mob_health_row = self.role(tk.Frame(self.settings_body), "bg", None)
+        mob_health_row.pack(fill="x", padx=15)
+        self.mob_health_status_label = self.label(
+            mob_health_row, "Checking mob health setting…", 8,
+            foreground="text", anchor="w")
+        self.mob_health_status_label.pack(side="left", fill="x", expand=True)
+        self.mob_health_button = self.button(
+            mob_health_row, "Checking…", self.toggle_soulbound_mob_health)
+        self.mob_health_button.pack(side="right")
+        self.mob_health_note_label = self.label(
+            self.settings_body,
+            "Changes Soulbound's debug_show_mob_health setting. Fully relaunch the game after changing it.",
+            7, foreground="muted", justify="left", wraplength=290)
+        self.mob_health_note_label.pack(anchor="w", padx=34, pady=(3, 0))
+        self._refresh_mob_health_control()
         self.label(self.settings_body, "LEADERBOARD", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.leaderboard_enabled_var = tk.BooleanVar(value=bool(self.settings.get("LeaderboardEnabled")))
         leaderboard_enabled = tk.Checkbutton(
@@ -3852,6 +3913,7 @@ class MeterApp:
     def show_settings(self) -> None:
         if self.locked:
             self.toggle_lock()
+        self._refresh_mob_health_control()
         self.current_opacity = min(1.0, max(0.2, float(self.settings.get("OverlayOpacity") or 1.0)))
         self.root.attributes("-alpha", self.current_opacity)
         self.settings_view.place(x=0, y=0, relwidth=1, relheight=1)
@@ -3957,6 +4019,53 @@ class MeterApp:
             removed = self.watcher.cleanup_old_logs(self.watcher.folder, 10)
             if removed:
                 self.log_status = f"Cleared {removed} old combat logs"
+
+    def _refresh_mob_health_control(self) -> None:
+        if not hasattr(self, "mob_health_button"):
+            return
+        try:
+            enabled = read_soulbound_mob_health()
+        except FileNotFoundError:
+            self.mob_health_status_label.configure(text="Soulbound settings not found")
+            self.mob_health_button.configure(text="Unavailable", state="disabled")
+        except PermissionError:
+            self.mob_health_status_label.configure(text="Soulbound settings are locked")
+            self.mob_health_button.configure(text="Unavailable", state="disabled")
+        except (OSError, ValueError):
+            self.mob_health_status_label.configure(text="Mob health setting unavailable")
+            self.mob_health_button.configure(text="Unavailable", state="disabled")
+        else:
+            self.mob_health_status_label.configure(
+                text=f"Mob health numbers: {'ON' if enabled else 'OFF'}")
+            self.mob_health_button.configure(
+                text="Turn off" if enabled else "Turn on", state="normal")
+
+    def toggle_soulbound_mob_health(self) -> None:
+        try:
+            enabled = read_soulbound_mob_health()
+            write_soulbound_mob_health(not enabled)
+            changed = read_soulbound_mob_health()
+            if changed == enabled:
+                raise OSError("Soulbound did not retain the changed setting")
+        except FileNotFoundError:
+            detail = f"Soulbound's settings file was not found at:\n{SOULBOUND_SETTINGS_PATH}"
+        except PermissionError:
+            detail = "Soulbound's settings file is locked. Close the game and try again."
+        except ValueError:
+            detail = ("This Soulbound version does not contain exactly one "
+                      "debug_show_mob_health setting.")
+        except OSError as error:
+            detail = f"The setting could not be saved:\n{error}"
+        else:
+            self._refresh_mob_health_control()
+            messagebox.showinfo(
+                "Soulbound setting updated",
+                f"Mob health numbers are now {'ON' if changed else 'OFF'}.\n\n"
+                "Fully close and relaunch Soulbound for the change to appear.",
+                parent=self.root)
+            return
+        self._refresh_mob_health_control()
+        messagebox.showerror("Could not change mob health", detail, parent=self.root)
 
     @staticmethod
     def format_poll_interval(milliseconds: float) -> str:
@@ -5886,6 +5995,20 @@ def run_self_test(log_path: str | None = None) -> int:
         replace_program_file(update_source, update_target)
         assert update_target.read_bytes() == b"new-version"
 
+        game_settings = update_dir / "settings.dat"
+        original_settings = (
+            b'{"vsync":false,"volume":0.5,"debug_show_mob_health":false,'
+            b'"display_mode":"windowed"}')
+        enabled_settings = original_settings.replace(
+            b'"debug_show_mob_health":false', b'"debug_show_mob_health":true')
+        game_settings.write_bytes(original_settings)
+        assert not read_soulbound_mob_health(game_settings)
+        write_soulbound_mob_health(True, game_settings)
+        assert read_soulbound_mob_health(game_settings)
+        assert game_settings.read_bytes() == enabled_settings
+        write_soulbound_mob_health(False, game_settings)
+        assert game_settings.read_bytes() == original_settings
+
     protected_test_token = protect_secret("local-test-token")
     assert protected_test_token and unprotect_secret(protected_test_token) == "local-test-token"
     assert map_name_from_log_path(
@@ -6441,7 +6564,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log", help="Combat-log file or folder to use")
     parser.add_argument("--self-test", action="store_true", help="Run parser and persistence tests without opening the UI")
     parser.add_argument("--smoke-ui", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
-    parser.add_argument("--smoke-view", choices=("meter", "flex", "leaderboard"), help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--smoke-view", choices=("meter", "flex", "leaderboard", "settings"),
+        help=argparse.SUPPRESS)
     parser.add_argument("--smoke-compact", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--leaderboard-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--apply-update", metavar="TARGET", help=argparse.SUPPRESS)
