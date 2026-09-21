@@ -42,15 +42,18 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.15"
+VERSION = "0.9.16"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
 LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev"
 LEADERBOARD_AUTO_REFRESH_MS = 120_000
 LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
-LEADERBOARD_HISTORY_VERSION = 5
+LEADERBOARD_HISTORY_VERSION = 10
 LEADERBOARD_TOP_PER_DUNGEON = 5
+LEADERBOARD_NAME_CYCLE_SECONDS = 2.0
+SPECTRA_NORMAL_SOLO_BOSS_DAMAGE = 2_500_000
+SPECTRA_HARD_SOLO_BOSS_DAMAGE = 8_000_000
 LEADERBOARD_DIFFICULTY_ORDER = (
     "Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid",
 )
@@ -99,6 +102,7 @@ def leaderboard_ssl_context() -> ssl.SSLContext:
 KNOWN_DUNGEON_DIFFICULTIES = {
     "Abyssal Raid": ("Raid",),
     "Spectra Lair": ("Raid",),
+    "Spectra Hard Raid": ("Raid",),
     "Virelda Arena": ("Stable",),
     "Train Defence": ("Stable",),
     "Eastern Reach": ("Stable", "Fractured", "Collapsing", "Shattered", "Abyssal"),
@@ -113,6 +117,7 @@ KNOWN_DUNGEON_DIFFICULTIES = {
 }
 UNSUFFIXED_DUNGEON_DIFFICULTIES = {
     "spectra lair": "Raid",
+    "spectra hard raid": "Raid",
     "virelda arena": "Stable", "train defence": "Stable",
     "virelda outskirts": "Stable", "arcadia defence": "Unstable",
     "arcadia defense": "Unstable", "arcadia arena": "Unstable",
@@ -526,8 +531,9 @@ def reported_party_size(value: Any) -> int | None:
     return size if 1 <= size <= 8 else None
 
 
-def observe_log_players(root: dict[str, Any], observed: set[str]) -> None:
-    """Collect stable player identities exposed by combat source/target records."""
+def observe_log_players(root: dict[str, Any], observed: set[str],
+                        names: dict[str, str] | None = None) -> None:
+    """Collect unique player identities exposed by combat source/target records."""
     data = root.get("data") if isinstance(root.get("data"), dict) else {}
     for field in ("source", "target"):
         entity = data.get(field)
@@ -539,13 +545,19 @@ def observe_log_players(root: dict[str, Any], observed: set[str]) -> None:
             continue
         if entity_type != "player":
             continue
+        # Prefer the visible name so repeated events (or changing aliases) for
+        # the same ally count only once during this run.
+        name = first_value(entity, "display_name", "name")
+        if name is not None and str(name).strip():
+            clean_name = " ".join(str(name).strip().split())[:40]
+            key = f"name:{clean_name.casefold()}"
+            observed.add(key)
+            if names is not None:
+                names.setdefault(key, clean_name)
+            continue
         identity = first_value(entity, "id", "entity_id", "user_id", "alias")
         if identity is not None and str(identity).strip():
             observed.add(f"id:{str(identity).strip().casefold()}")
-            continue
-        name = first_value(entity, "display_name", "name")
-        if name is not None and str(name).strip():
-            observed.add(f"name:{str(name).strip().casefold()}")
 
 
 def reconciled_party_size(declared: int | None, observed: set[str]) -> int | None:
@@ -554,14 +566,6 @@ def reconciled_party_size(declared: int | None, observed: set[str]) -> int | Non
     if declared is None:
         return observed_size if observed_size > 1 else None
     return min(8, max(declared, observed_size))
-
-
-def possible_leaderboard_entry(entry: dict[str, Any]) -> bool:
-    """Hide legacy party categories that the game mode cannot produce."""
-    dungeon = str(entry.get("dungeon") or "").strip().casefold()
-    difficulty = str(entry.get("difficulty") or "").strip().casefold()
-    party_size = reported_party_size(entry.get("party_size"))
-    return not (dungeon == "spectra lair" and difficulty == "raid" and party_size == 1)
 
 
 def is_boss_raid_completion(event: "CombatEvent") -> bool:
@@ -586,6 +590,67 @@ def is_own_event(event: "CombatEvent") -> bool:
         or (event.source_id or "").lower() == "self"
         or (event.source_name or "").lower() == "self"
     )
+
+
+def is_spectra_boss_damage(event: "CombatEvent") -> bool:
+    """Return whether this is the player's effective damage to Spectra herself."""
+    return (event.type == "damage" and event.applied_amount > 0 and is_own_event(event)
+            and str(event.target_name or "").strip().casefold() == "spectra")
+
+
+def spectra_mode_evidence(event: "CombatEvent") -> str | None:
+    """Identify Normal/Hard Spectra from invariant incoming raw damage."""
+    if (event.type != "damage_taken"
+            or str(event.target_type or "").casefold() != "self"):
+        return None
+    source = str(event.source_name or "").strip().casefold()
+    impact = str(event.impact_type or "").strip().casefold()
+    raw = round(event.raw_amount, 3)
+    if source == "unknown source":
+        if (impact, raw) in {("void", 50.0), ("physical", 80.0)}:
+            return "Normal"
+        if (impact, raw) in {("void", 75.0), ("physical", 240.0)}:
+            return "Hard"
+    if source == "spectra" and impact == "void":
+        if raw == 150.0:
+            return "Normal"
+        if raw == 250.0:
+            return "Hard"
+    return None
+
+
+def spectra_run_qualification(dungeon: str, difficulty: str, party_size: int,
+                              boss_damage: float, modes: set[str]) -> str | None:
+    """Classify Spectra mode, retaining boss-HP proof as the Solo fallback."""
+    if (dungeon.strip().casefold() != "spectra lair"
+            or difficulty.strip().casefold() != "raid"):
+        return "Other"
+    if len(modes) > 1:
+        return None
+    if modes:
+        tier = next(iter(modes))
+        if party_size == 1:
+            required = (SPECTRA_HARD_SOLO_BOSS_DAMAGE if tier == "Hard"
+                        else SPECTRA_NORMAL_SOLO_BOSS_DAMAGE)
+            return tier if boss_damage >= required else None
+        return tier
+    if party_size == 1:
+        if boss_damage >= SPECTRA_HARD_SOLO_BOSS_DAMAGE:
+            return "Hard"
+        if boss_damage >= SPECTRA_NORMAL_SOLO_BOSS_DAMAGE:
+            return "Normal"
+    return None
+
+
+def leaderboard_dungeon_display_key(dungeon: str) -> tuple[int, str]:
+    """Keep the two Spectra raid rows together, with Hard below Normal."""
+    folded = dungeon.strip().casefold()
+    raid_order = {
+        "abyssal raid": 0,
+        "spectra lair": 1,
+        "spectra hard raid": 2,
+    }
+    return raid_order.get(folded, 100), folded
 
 
 def damage_effect_kind(event: "CombatEvent") -> str | None:
@@ -1818,10 +1883,15 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     extracted = False
     declared_party_size: int | None = None
     observed_players: set[str] = set()
+    observed_player_names: dict[str, str] = {}
+    spectra_modes: set[str] = set()
+    spectra_full_start = False
+    spectra_survived = True
     game_version = "unknown"
     total_damage = 0.0
     total_healing = 0.0
     total_shielding = 0.0
+    boss_damage = 0.0
     largest_hit = 0.0
     best_damage_30 = 0.0
     damage_window: deque[tuple[float, float]] = deque()
@@ -1833,7 +1903,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     last_combat_at: float | None = None
     parsed_event_names = {
         "run_start", "run_end", "room_end", "encounter_start", "encounter_end",
-        "damage", "damage_dealt", "damaged", "hit",
+        "damage", "damage_dealt", "damage_taken", "damaged", "hit",
         "heal", "healing_done", "healing_dealt", "heal_dealt", "heal_applied",
         "healing", "healed", "shield", "shield_gained",
     }
@@ -1851,7 +1921,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                     continue
                 raw_type = str(root.get("event", "")).strip().lower()
                 data = root.get("data") if isinstance(root.get("data"), dict) else {}
-                observe_log_players(root, observed_players)
+                observe_log_players(root, observed_players, observed_player_names)
                 if raw_type == "log_header":
                     game_version = str(data.get("client_version") or data.get("game_version") or "unknown")[:40]
                 elapsed_value = root.get("run_elapsed_ms")
@@ -1868,6 +1938,8 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                 if raw_type == "encounter_start":
                     subtype = str(data.get("encounter_subtype") or data.get("room_subtype") or "").lower()
                     timing_in_combat = not CombatSession._is_noncombat(subtype)
+                    if subtype == "bossraid" and data.get("snapshot") is not True:
+                        spectra_full_start = True
                 elif raw_type in {"encounter_end", "room_end", "run_end"}:
                     timing_in_combat = False
                 if raw_type not in parsed_event_names:
@@ -1876,6 +1948,12 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                 if parsed is None:
                     continue
                 event = parsed
+                mode_evidence = spectra_mode_evidence(event)
+                if mode_evidence is not None:
+                    spectra_modes.add(mode_evidence)
+                if (event.type == "damage_taken" and event.target_type == "self"
+                        and event.lethal):
+                    spectra_survived = False
                 if event.type == "combat_start" and start is None:
                     start = event
                     declared_party_size = reported_party_size(data.get("party_size"))
@@ -1896,6 +1974,8 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                 if event.type == "damage":
                     amount = event.applied_amount
                     total_damage += amount
+                    if is_spectra_boss_damage(event):
+                        boss_damage += amount
                     if not is_unknown_ability(event.ability_name):
                         largest_hit = max(largest_hit, amount)
                     damage_window.append((event.timestamp, amount))
@@ -1917,6 +1997,18 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
         return None
     display = start.dungeon_name or map_name_from_log_path(str(path))
     dungeon, difficulty = split_dungeon_difficulty(display)
+    if (dungeon.casefold() in {"spectra lair", "spectra hard raid"}
+            and is_boss_raid_completion(end) and not spectra_full_start):
+        # A snapshot-only encounter begins when the client attaches after the
+        # raid has already started. Its duration is only the observed tail of
+        # the fight, so it can never be used as a fastest full-run time.
+        return None
+    if (dungeon.casefold() in {"spectra lair", "spectra hard raid"}
+            and is_boss_raid_completion(end) and not spectra_survived):
+        # A dead client continues receiving the party encounter-end event, but
+        # that event does not say whether the party cleared or wiped. Require
+        # one surviving member's log to prove the party record.
+        return None
     run_time_ms = round(
         end.run_elapsed_ms
         if end.run_elapsed_ms is not None and end.run_elapsed_ms > 0
@@ -1933,13 +2025,23 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
         combat_time_ms = min(run_time_ms, max(1_000, combat_time_ms))
     if run_time_ms < 30_000 or run_time_ms > 28_800_000:
         return None
+    if total_damage <= 0 and total_healing <= 0 and total_shielding <= 0:
+        # Do not let empty/late-join logs own a party's fastest-time record.
+        return None
     party_size = reconciled_party_size(declared_party_size, observed_players)
     if party_size is None:
         return None
+    spectra_tier = spectra_run_qualification(
+        dungeon, difficulty, party_size, boss_damage, spectra_modes)
+    if spectra_tier is None:
+        return None
+    if spectra_tier == "Hard":
+        dungeon = "Spectra Hard Raid"
     return {
         "dungeon": dungeon,
         "difficulty": difficulty,
         "partySize": party_size,
+        "partyMembers": sorted(observed_player_names.values(), key=str.casefold),
         "gameVersion": game_version,
         "meterVersion": VERSION,
         "runTimeMs": run_time_ms,
@@ -1949,6 +2051,9 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
         "largestHit": round(largest_hit),
         "totalHealing": round(total_healing),
         "totalShielding": round(total_shielding),
+        "bossDamage": round(boss_damage),
+        "spectraFullStart": spectra_full_start,
+        "spectraSurvived": spectra_survived,
         "sourceHash": source_hasher.hexdigest(),
     }
 
@@ -1990,15 +2095,22 @@ class LeaderboardRunTracker:
         self.dungeon = "Unknown Dungeon"
         self.difficulty = "Stable"
         self.party_size = 1
+        self.observed_players: set[str] = set()
+        self.observed_player_names: dict[str, str] = {}
         self.extracted = False
         self.total_damage = 0.0
         self.total_healing = 0.0
         self.total_shielding = 0.0
+        self.boss_damage = 0.0
+        self.spectra_modes: set[str] = set()
+        self.spectra_full_start = False
+        self.spectra_survived = True
         self.largest_hit = 0.0
         self.damage_window: deque[tuple[float, float]] = deque()
         self.best_damage_30 = 0.0
         self.pending_finish: dict[str, Any] | None = None
         self.invalidated = False
+        self.exclusion_message = ""
 
     def _schedule_retry(self) -> None:
         self.retry_at = time.monotonic() + self.retry_delay
@@ -2029,13 +2141,24 @@ class LeaderboardRunTracker:
 
         raw_type = str(root.get("event", "")).strip().lower()
         data = root.get("data") if isinstance(root.get("data"), dict) else {}
+        observe_log_players(root, self.observed_players, self.observed_player_names)
         if raw_type == "log_header":
             self.game_version = str(data.get("client_version") or data.get("game_version") or "unknown")[:40]
+        elif raw_type == "encounter_start":
+            subtype = str(data.get("encounter_subtype") or data.get("room_subtype") or "").lower()
+            if subtype == "bossraid" and data.get("snapshot") is not True:
+                self.spectra_full_start = True
 
         if event is None:
             return
         if self.invalidated:
             return
+        mode_evidence = spectra_mode_evidence(event)
+        if mode_evidence is not None:
+            self.spectra_modes.add(mode_evidence)
+        if (event.type == "damage_taken" and event.target_type == "self"
+                and event.lethal):
+            self.spectra_survived = False
         if event.type == "combat_start":
             self.run_active = True
             display = event.dungeon_name or self.dungeon
@@ -2058,6 +2181,8 @@ class LeaderboardRunTracker:
             if event.type == "damage":
                 amount = event.applied_amount
                 self.total_damage += amount
+                if is_spectra_boss_damage(event):
+                    self.boss_damage += amount
                 if not is_unknown_ability(event.ability_name):
                     self.largest_hit = max(self.largest_hit, amount)
                 self.damage_window.append((event.timestamp, amount))
@@ -2074,8 +2199,30 @@ class LeaderboardRunTracker:
             return
         if event.type == "combat_end" or boss_raid_completed:
             self.run_active = False
+            self.party_size = (
+                reconciled_party_size(self.party_size, self.observed_players)
+                or self.party_size
+            )
             extracted = (boss_raid_completed or
                          (self.extracted and event.run_end_reason in {"extraction", "extracted"}))
+            spectra_tier = spectra_run_qualification(
+                self.dungeon, self.difficulty, self.party_size,
+                self.boss_damage, self.spectra_modes)
+            spectra_run = self.dungeon.casefold() in {"spectra lair", "spectra hard raid"}
+            if extracted and spectra_run and not self.spectra_full_start:
+                extracted = False
+                self.exclusion_message = (
+                    "Spectra run excluded: the full encounter start was not observed")
+            elif extracted and spectra_run and not self.spectra_survived:
+                extracted = False
+                self.exclusion_message = (
+                    "Spectra run excluded: a surviving party log is required")
+            elif extracted and spectra_tier is None:
+                extracted = False
+                self.exclusion_message = (
+                    "Spectra run excluded: mode or completion could not be verified")
+            elif spectra_tier == "Hard":
+                self.dungeon = "Spectra Hard Raid"
             run_time_ms = round(self.last_run_elapsed_ms or event.run_elapsed_ms or 0)
             run_time_ms = max(30_000, run_time_ms)
             combat_time_ms = round(float(session_snapshot.get("duration", 0.0)) * 1000.0)
@@ -2094,6 +2241,13 @@ class LeaderboardRunTracker:
                 "largestHit": round(self.largest_hit),
                 "totalHealing": round(self.total_healing),
                 "totalShielding": round(self.total_shielding),
+                "bossDamage": round(self.boss_damage),
+                "partyMembers": sorted(
+                    self.observed_player_names.values(), key=str.casefold),
+                "spectraMode": (spectra_tier
+                                if spectra_tier in {"Normal", "Hard"} else None),
+                "spectraFullStart": self.spectra_full_start,
+                "spectraSurvived": self.spectra_survived,
                 "finalSequence": self.last_sequence,
                 "finalChainHash": self.chain_hash,
             }
@@ -2216,7 +2370,8 @@ class LeaderboardRunTracker:
                 self.status_callback("Run submitted to leaderboard")
                 self.submitted_callback()
             else:
-                self.status_callback("Abandoned run excluded from leaderboard")
+                self.status_callback(
+                    self.exclusion_message or "Abandoned run excluded from leaderboard")
 
         self.client.request("POST", f"/v1/runs/{self.session_id}/finish", body,
                             complete, authenticated=True)
@@ -2261,18 +2416,9 @@ class AppSettings:
                 except (TypeError, ValueError):
                     history_version = 0
                 if history_version < LEADERBOARD_HISTORY_VERSION:
-                    # Qualification and authoritative-timing changes through
-                    # v5 only affected Spectra Raid.
-                    # Preserve every other processed signature so upgrading does
-                    # not reparse and re-upload a user's entire combat-log archive.
-                    history_files = self.data.get("LeaderboardHistoryFiles")
-                    if isinstance(history_files, list):
-                        self.data["LeaderboardHistoryFiles"] = [
-                            item for item in history_files
-                            if isinstance(item, str) and not is_spectra_history_signature(item)
-                        ]
-                    else:
-                        self.data["LeaderboardHistoryFiles"] = []
+                    # Versions 8-9 backfill observed party rosters, corrected
+                    # party sizes, and raw-hit Spectra mode classification.
+                    self.data["LeaderboardHistoryFiles"] = []
                     self.data["LeaderboardHistoryScanned"] = False
                     self.data["LeaderboardHistoryVersion"] = LEADERBOARD_HISTORY_VERSION
                 # Recorded combat logs are now the leaderboard's single source.
@@ -2777,6 +2923,10 @@ class MeterApp:
         self._leaderboard_rank_tooltip: tk.Toplevel | None = None
         self._leaderboard_rank_tooltip_hide_job: str | None = None
         self._leaderboard_rank_tooltip_row: dict[str, Any] | None = None
+        self._leaderboard_rank_name_labels: list[tuple[tk.Label, dict[str, Any]]] = []
+        self._leaderboard_party_tooltip: tk.Toplevel | None = None
+        self._leaderboard_party_tooltip_hide_job: str | None = None
+        self._leaderboard_name_cycle_phase = -1
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
         self._resize_start: tuple[int, int, int, int] | None = None
@@ -4193,7 +4343,8 @@ class MeterApp:
         dungeon, difficulty = split_dungeon_difficulty(self.current_map)
         if dungeon not in {"Waiting for dungeon", "Unknown Dungeon", "Unknown map"}:
             pairs.add((dungeon, difficulty))
-        return sorted(pairs, key=lambda item: (item[0].casefold(), item[1].casefold()))
+        return sorted(pairs, key=lambda item: (
+            leaderboard_dungeon_display_key(item[0]), item[1].casefold()))
 
     def _update_leaderboard_filter_menus(self) -> None:
         pairs = set(self._local_leaderboard_catalog())
@@ -4201,9 +4352,10 @@ class MeterApp:
         self.leaderboard_catalog = sorted(
             {self._normalized_catalog_pair(dungeon, difficulty)
              for dungeon, difficulty in pairs if dungeon and difficulty},
-            key=lambda item: (item[0].casefold(), item[1].casefold()))
+            key=lambda item: (leaderboard_dungeon_display_key(item[0]), item[1].casefold()))
         dungeons = [ALL_DUNGEONS] + sorted(
-            {dungeon for dungeon, _difficulty in self.leaderboard_catalog}, key=str.casefold)
+            {dungeon for dungeon, _difficulty in self.leaderboard_catalog},
+            key=leaderboard_dungeon_display_key)
         selected_dungeon = self.leaderboard_dungeon_var.get()
         if selected_dungeon not in dungeons:
             selected_dungeon = ALL_DUNGEONS
@@ -4285,6 +4437,50 @@ class MeterApp:
         if category == "time":
             return format_duration_ms(value)
         return f"{format_number(value)} DPS" if category == "dps" else format_number(value)
+
+    @staticmethod
+    def _leaderboard_party_names(entry: dict[str, Any]) -> list[str]:
+        """Return a complete, unique party roster or nothing when it is partial."""
+        party_size = reported_party_size(entry.get("party_size")) or 0
+        raw_members = entry.get("party_members")
+        if party_size <= 1 or not isinstance(raw_members, list):
+            return []
+        members: list[str] = []
+        seen: set[str] = set()
+        for value in raw_members:
+            name = " ".join(str(value or "").strip().split())
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                members.append(name)
+        return members if len(members) >= party_size else []
+
+    @classmethod
+    def _leaderboard_display_name(
+            cls, entry: dict[str, Any], phase: int | None = None) -> str:
+        members = cls._leaderboard_party_names(entry)
+        if not members:
+            return str(entry.get("display_name") or "Unknown")
+        if phase is None:
+            phase = int(time.monotonic() / LEADERBOARD_NAME_CYCLE_SECONDS)
+        return members[phase % len(members)]
+
+    def _cycle_leaderboard_names(self, now: float) -> None:
+        phase = int(now / LEADERBOARD_NAME_CYCLE_SECONDS)
+        if phase == self._leaderboard_name_cycle_phase:
+            return
+        self._leaderboard_name_cycle_phase = phase
+        for row in self.leaderboard_rows:
+            entry = row.get("entry")
+            if isinstance(entry, dict) and row["frame"].winfo_manager():
+                row["player"].configure(
+                    text=self._leaderboard_display_name(entry, phase))
+        for label, entry in self._leaderboard_rank_name_labels:
+            try:
+                if label.winfo_exists():
+                    label.configure(text=self._leaderboard_display_name(entry, phase))
+            except tk.TclError:
+                continue
 
     def _ensure_leaderboard_row_capacity(self, count: int) -> None:
         while len(self.leaderboard_rows) < count:
@@ -4390,7 +4586,8 @@ class MeterApp:
                 difficulty_order.get(
                     str(entry.get("difficulty") or "").casefold(), 99),
                 str(entry.get("difficulty") or "").casefold(),
-                str(entry.get("dungeon") or "Unknown").casefold(),
+                leaderboard_dungeon_display_key(
+                    str(entry.get("dungeon") or "Unknown")),
                 int(entry.get("rank", 0) or 0),
             ))
         self._ensure_leaderboard_row_capacity(max(10, len(display_entries)))
@@ -4401,7 +4598,7 @@ class MeterApp:
                 if not row["frame"].winfo_manager():
                     row["frame"].pack(fill="x", padx=7, pady=1)
                 displayed_rank = index + 1 if overview else 1
-                player = str(entry.get("display_name") or "Unknown")
+                player = self._leaderboard_display_name(entry)
                 dungeon = str(entry.get("dungeon") or "Unknown")
                 difficulty = str(entry.get("difficulty") or "—")
                 previous_difficulty = (
@@ -4494,13 +4691,11 @@ class MeterApp:
             else:
                 entries = data.get("entries")
                 self.leaderboard_entries = [entry for entry in entries
-                                             if isinstance(entry, dict)
-                                             and possible_leaderboard_entry(entry)] \
+                                             if isinstance(entry, dict)] \
                     if isinstance(entries, list) else []
                 personal_entries = data.get("personalEntries")
                 self.leaderboard_personal_entries = [entry for entry in personal_entries
-                                                     if isinstance(entry, dict)
-                                                     and possible_leaderboard_entry(entry)] \
+                                                     if isinstance(entry, dict)] \
                     if isinstance(personal_entries, list) else []
                 player_list = data.get("playerList")
                 # Retain the roster for the session if a later response is
@@ -5176,6 +5371,7 @@ class MeterApp:
             self._hide_leaderboard_rank_tooltip()
 
         tip = tk.Toplevel(self.root)
+        self._leaderboard_rank_name_labels = []
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
         outer = tk.Frame(
@@ -5221,16 +5417,26 @@ class MeterApp:
                 foreground=rank_color,
                 font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
             ).grid(row=table_row, column=0, sticky="ew", pady=1)
-            tk.Label(
-                ranking_table, text=str(candidate.get("display_name") or "Unknown"),
+            name_label = tk.Label(
+                ranking_table, text=self._leaderboard_display_name(candidate),
                 background="#171C27", foreground=rank_color,
                 font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
-            ).grid(row=table_row, column=1, sticky="ew", pady=1)
-            tk.Label(
+            )
+            name_label.grid(row=table_row, column=1, sticky="ew", pady=1)
+            self._leaderboard_rank_name_labels.append((name_label, candidate))
+            party_label = tk.Label(
                 ranking_table, text=str(candidate.get("party_size") or "—"),
                 background="#171C27", foreground=self.colors["purple"],
                 font=(self.FONT, self._scaled_font_size(8)), anchor="center",
-            ).grid(row=table_row, column=2, sticky="ew", pady=1)
+            )
+            party_label.grid(row=table_row, column=2, sticky="ew", pady=1)
+            party_label.bind(
+                "<Enter>",
+                lambda event, item=candidate, widget=party_label:
+                    self._show_leaderboard_party_tooltip(item, widget, event),
+                add="+")
+            party_label.bind(
+                "<Leave>", self._schedule_hide_leaderboard_party_tooltip, add="+")
             tk.Label(
                 ranking_table, text=self._leaderboard_score(candidate, category),
                 background="#171C27", foreground=self.colors["orange"],
@@ -5272,6 +5478,7 @@ class MeterApp:
             300, self._hide_leaderboard_rank_tooltip)
 
     def _hide_leaderboard_rank_tooltip(self) -> None:
+        self._hide_leaderboard_party_tooltip()
         if self._leaderboard_rank_tooltip_hide_job is not None:
             try:
                 self.root.after_cancel(self._leaderboard_rank_tooltip_hide_job)
@@ -5282,6 +5489,92 @@ class MeterApp:
             self._leaderboard_rank_tooltip.destroy()
         self._leaderboard_rank_tooltip = None
         self._leaderboard_rank_tooltip_row = None
+        self._leaderboard_rank_name_labels = []
+
+    def _show_leaderboard_party_tooltip(
+            self, entry: dict[str, Any], source: tk.Widget,
+            _event: tk.Event | None = None) -> None:
+        self._cancel_hide_leaderboard_party_tooltip()
+        self._cancel_hide_leaderboard_rank_tooltip()
+        self._hide_leaderboard_party_tooltip()
+        raw_members = entry.get("party_members")
+        members = []
+        if isinstance(raw_members, list):
+            seen: set[str] = set()
+            for value in raw_members:
+                name = " ".join(str(value or "").strip().split())
+                key = name.casefold()
+                if name and key not in seen:
+                    seen.add(key)
+                    members.append(name)
+        party_size = reported_party_size(entry.get("party_size")) or 0
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        outer = tk.Frame(
+            tip, background="#171C27", highlightbackground="#3A4352",
+            highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        tk.Label(
+            outer, text="PARTY MEMBERS", background="#171C27",
+            foreground=self.colors["purple"],
+            font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="w",
+        ).pack(fill="x", padx=9, pady=(7, 3))
+        if members:
+            for name in members:
+                tk.Label(
+                    outer, text=name, background="#171C27",
+                    foreground=self.colors["text"],
+                    font=(self.FONT, self._scaled_font_size(8)), anchor="w",
+                ).pack(fill="x", padx=9, pady=1)
+        else:
+            tk.Label(
+                outer, text="Names were not recorded for this run",
+                background="#171C27", foreground=self.colors["muted"],
+                font=(self.FONT, self._scaled_font_size(7)), anchor="w",
+            ).pack(fill="x", padx=9, pady=2)
+        if party_size and len(members) < party_size:
+            tk.Label(
+                outer, text=f"Observed {len(members)} of {party_size}",
+                background="#171C27", foreground=self.colors["muted"],
+                font=(self.FONT, self._scaled_font_size(6)), anchor="w",
+            ).pack(fill="x", padx=9, pady=(3, 7))
+        else:
+            tk.Frame(outer, height=6, background="#171C27").pack()
+        self._leaderboard_party_tooltip = tip
+        tip.bind("<Enter>", self._cancel_hide_leaderboard_party_tooltip, add="+")
+        tip.bind("<Enter>", self._cancel_hide_leaderboard_rank_tooltip, add="+")
+        tip.bind("<Leave>", self._schedule_hide_leaderboard_party_tooltip, add="+")
+        tip.update_idletasks()
+        x = source.winfo_rootx() + source.winfo_width() + 2
+        if x + tip.winfo_width() > self.root.winfo_screenwidth() - 8:
+            x = source.winfo_rootx() - tip.winfo_width() - 2
+        y = min(source.winfo_rooty(), self.root.winfo_screenheight() - tip.winfo_height() - 8)
+        tip.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cancel_hide_leaderboard_party_tooltip(
+            self, _event: tk.Event | None = None) -> None:
+        if self._leaderboard_party_tooltip_hide_job is not None:
+            self.root.after_cancel(self._leaderboard_party_tooltip_hide_job)
+            self._leaderboard_party_tooltip_hide_job = None
+
+    def _schedule_hide_leaderboard_party_tooltip(
+            self, _event: tk.Event | None = None) -> None:
+        if self._leaderboard_party_tooltip_hide_job is not None:
+            self.root.after_cancel(self._leaderboard_party_tooltip_hide_job)
+        self._leaderboard_party_tooltip_hide_job = self.root.after(
+            250, self._hide_leaderboard_party_tooltip)
+
+    def _hide_leaderboard_party_tooltip(self) -> None:
+        if self._leaderboard_party_tooltip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._leaderboard_party_tooltip_hide_job)
+            except tk.TclError:
+                pass
+            self._leaderboard_party_tooltip_hide_job = None
+        if self._leaderboard_party_tooltip is not None:
+            self._leaderboard_party_tooltip.destroy()
+        self._leaderboard_party_tooltip = None
 
     def _show_player_list_tooltip(self, _event: tk.Event | None = None) -> None:
         self._cancel_hide_player_list_tooltip()
@@ -5486,6 +5779,7 @@ class MeterApp:
         try:
             self.leaderboard_client.pump()
             now = time.monotonic()
+            self._cycle_leaderboard_names(now)
             if now - self.last_log_poll >= self.combat_log_poll_ms / 1000.0:
                 self.watcher.poll()
                 self.last_log_poll = now
@@ -5605,20 +5899,41 @@ def run_self_test(log_path: str | None = None) -> int:
     assert reported_party_size(1.0) == 1
     assert reported_party_size(None) is None and reported_party_size(0) is None
     observed_test_players: set[str] = set()
+    observed_test_names: dict[str, str] = {}
     observe_log_players({"data": {
         "source": {"type": "self", "id": "self"},
         "target": {"type": "player", "id": "player-5", "display_name": "Randouken"},
-    }}, observed_test_players)
+    }}, observed_test_players, observed_test_names)
     observe_log_players({"data": {
         "source": {"type": "player", "id": "player-5", "display_name": "Randouken"},
         "target": {"type": "self", "id": "self"},
-    }}, observed_test_players)
+    }}, observed_test_players, observed_test_names)
+    observe_log_players({"data": {
+        "source": {"type": "player", "id": "changed-alias", "display_name": "RANDOUKEN"},
+    }}, observed_test_players, observed_test_names)
     assert reconciled_party_size(1, observed_test_players) == 2
+    assert list(observed_test_names.values()) == ["Randouken"]
     assert reconciled_party_size(None, {"self"}) is None
-    assert not possible_leaderboard_entry({
-        "dungeon": "Spectra Lair", "difficulty": "Raid", "party_size": 1})
-    assert possible_leaderboard_entry({
-        "dungeon": "Spectra Lair", "difficulty": "Raid", "party_size": 8})
+    assert spectra_run_qualification("Spectra Lair", "Raid", 1, 2_499_999, set()) is None
+    assert spectra_run_qualification(
+        "Spectra Lair", "Raid", 1, 2_500_000, set()) == "Normal"
+    assert spectra_run_qualification(
+        "Spectra Lair", "Raid", 1, 8_000_000, set()) == "Hard"
+    assert spectra_run_qualification(
+        "Spectra Lair", "Raid", 8, 0, {"Normal"}) == "Normal"
+    assert spectra_run_qualification(
+        "Spectra Lair", "Raid", 8, 0, {"Hard"}) == "Hard"
+    assert spectra_run_qualification(
+        "Spectra Lair", "Raid", 8, 0, {"Normal", "Hard"}) is None
+    hard_marker = parse_combat_event({
+        "event": "DAMAGE_TAKEN",
+        "data": {
+            "source": {"type": "unknown", "display_name": "Unknown Source"},
+            "target": {"type": "self", "display_name": "Self"},
+            "impact_type": "physical", "raw_amount": 240, "applied_amount": 100,
+        },
+    })
+    assert hard_marker and spectra_mode_evidence(hard_marker) == "Hard"
     event = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
         "data": {"source": {"type": "self"},
@@ -5766,11 +6081,16 @@ def run_self_test(log_path: str | None = None) -> int:
     assert raid_start[2] and raid_start[2]["difficulty"] == "Raid"
     raid_start[3]({"sessionId": "raid-session"}, None)
     raid_client.calls.pop(0)[3]({"accepted": True}, None)
-    track_raid({"event": "DAMAGE_DEALT", "sequence": 2, "run_elapsed_ms": 10_000,
+    track_raid({"event": "ENCOUNTER_START", "sequence": 2, "run_elapsed_ms": 1_000,
+                "timestamp_utc": "2026-09-17T14:37:07Z",
+                "data": {"encounter_subtype": "bossraid"}})
+    track_raid({"event": "DAMAGE_DEALT", "sequence": 3, "run_elapsed_ms": 10_000,
                 "timestamp_utc": "2026-09-17T14:37:16Z",
                 "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
-                         "post_target_mitigation_amount": 500, "applied_amount": 500}})
-    track_raid({"event": "ENCOUNTER_END", "sequence": 3, "run_elapsed_ms": 523_000,
+                         "target": {"type": "mob", "display_name": "Spectra"},
+                         "post_target_mitigation_amount": 2_500_000,
+                         "applied_amount": 2_500_000}})
+    track_raid({"event": "ENCOUNTER_END", "sequence": 4, "run_elapsed_ms": 523_000,
                 "timestamp_utc": "2026-09-17T14:45:49Z",
                 "data": {"encounter_subtype": "bossraid", "duration_ms": 522_001}},
                duration=390.0)
@@ -5779,8 +6099,11 @@ def run_self_test(log_path: str | None = None) -> int:
     assert raid_finish[1].endswith("/finish") and raid_finish[2]
     assert raid_finish[2]["extracted"] is True and raid_finish[2]["runTimeMs"] == 522_001
     assert raid_finish[2]["runTimeMs"] == raid_finish[2]["combatTimeMs"]
+    assert raid_finish[2]["bossDamage"] == 2_500_000
+    assert raid_finish[2]["spectraFullStart"] is True
+    assert raid_finish[2]["spectraSurvived"] is True
     raid_finish[3]({"leaderboardEligible": True}, None)
-    track_raid({"event": "RUN_END", "sequence": 4, "run_elapsed_ms": 600_000,
+    track_raid({"event": "RUN_END", "sequence": 5, "run_elapsed_ms": 600_000,
                 "timestamp_utc": "2026-09-17T14:47:06Z", "data": {"reason": "left_dungeon"}})
     assert not raid_client.calls
 
@@ -5835,7 +6158,8 @@ def run_self_test(log_path: str | None = None) -> int:
             "event": "DAMAGE_DEALT", "sequence": second + 2,
             "run_elapsed_ms": second * 1_000,
             "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
-                     "post_target_mitigation_amount": 10, "applied_amount": 10},
+                     "target": {"type": "mob", "display_name": "Spectra"},
+                     "post_target_mitigation_amount": 62_500, "applied_amount": 62_500},
         } for second in range(2, 42))
         spectra_roots.append({
             "event": "ENCOUNTER_END", "sequence": 44, "run_elapsed_ms": 41_998,
@@ -5848,6 +6172,56 @@ def run_self_test(log_path: str | None = None) -> int:
         assert spectra_history and spectra_history["dungeon"] == "Spectra Lair"
         assert spectra_history["difficulty"] == "Raid" and spectra_history["runTimeMs"] == 42_000
         assert spectra_history["runTimeMs"] == spectra_history["combatTimeMs"]
+        assert spectra_history["bossDamage"] == 2_500_000
+        assert spectra_history["spectraFullStart"] is True
+        assert spectra_history["spectraSurvived"] is True
+
+        snapshot_spectra_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_14-40-00Z.log"
+        snapshot_spectra_roots = json.loads(json.dumps(spectra_roots))
+        snapshot_spectra_roots[2]["data"]["snapshot"] = True
+        snapshot_spectra_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in snapshot_spectra_roots),
+            encoding="utf-8")
+        assert historical_run_from_log(snapshot_spectra_log) is None
+
+        dead_spectra_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_14-41-00Z.log"
+        dead_spectra_roots = json.loads(json.dumps(spectra_roots))
+        dead_spectra_roots[-1:-1] = [{
+            "event": "DAMAGE_TAKEN", "sequence": 43, "run_elapsed_ms": 40_000,
+            "timestamp_utc": "2026-09-17T14:37:46Z",
+            "data": {"source": {"type": "mob", "display_name": "Spectra"},
+                     "target": {"type": "self", "display_name": "Self"},
+                     "raw_amount": 500, "applied_amount": 500, "is_lethal": True},
+        }]
+        dead_spectra_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in dead_spectra_roots),
+            encoding="utf-8")
+        assert historical_run_from_log(dead_spectra_log) is None
+
+        hard_spectra_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_14-50-00Z.log"
+        hard_spectra_roots = json.loads(json.dumps(spectra_roots))
+        for root in hard_spectra_roots:
+            if root.get("event") == "DAMAGE_DEALT":
+                root["data"]["post_target_mitigation_amount"] = 200_000
+                root["data"]["applied_amount"] = 200_000
+        hard_spectra_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in hard_spectra_roots),
+            encoding="utf-8")
+        hard_spectra_history = historical_run_from_log(hard_spectra_log)
+        assert hard_spectra_history
+        assert hard_spectra_history["dungeon"] == "Spectra Hard Raid"
+        assert hard_spectra_history["bossDamage"] == 8_000_000
+
+        low_damage_spectra_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_15-00-00Z.log"
+        low_damage_spectra_roots = json.loads(json.dumps(spectra_roots))
+        for root in low_damage_spectra_roots:
+            if root.get("event") == "DAMAGE_DEALT":
+                root["data"]["post_target_mitigation_amount"] = 62_499
+                root["data"]["applied_amount"] = 62_499
+        low_damage_spectra_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in low_damage_spectra_roots),
+            encoding="utf-8")
+        assert historical_run_from_log(low_damage_spectra_log) is None
 
         contradicted_party_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_15-37-06Z.log"
         contradicted_party_roots = json.loads(json.dumps(spectra_roots))
@@ -5860,6 +6234,15 @@ def run_self_test(log_path: str | None = None) -> int:
                            "display_name": f"Party Member {index}"},
             },
         } for index in range(1, 8)]
+        observed_party_events.append({
+            "event": "DAMAGE_TAKEN", "sequence": 120,
+            "run_elapsed_ms": 35_000,
+            "data": {
+                "source": {"type": "unknown", "display_name": "Unknown Source"},
+                "target": {"type": "self", "display_name": "Self"},
+                "impact_type": "void", "raw_amount": 50, "applied_amount": 40,
+            },
+        })
         contradicted_party_roots[-1:-1] = observed_party_events
         contradicted_party_log.write_text(
             "".join(json.dumps(root) + "\n" for root in contradicted_party_roots),
@@ -6025,6 +6408,24 @@ def run_self_test(log_path: str | None = None) -> int:
         assert "SSLCertVerificationError" in diagnostic
         assert f"Bundled CA available: {_certifi is not None}" in diagnostic
         assert "Authorization" not in diagnostic and "Bearer" not in diagnostic
+
+    full_party_entry = {
+        "display_name": "Uploader", "party_size": 3,
+        "party_members": ["Uploader", "Battleform", "Daytona"],
+    }
+    assert MeterApp._leaderboard_party_names(full_party_entry) == [
+        "Uploader", "Battleform", "Daytona"]
+    assert MeterApp._leaderboard_display_name(full_party_entry, 0) == "Uploader"
+    assert MeterApp._leaderboard_display_name(full_party_entry, 1) == "Battleform"
+    assert MeterApp._leaderboard_display_name(full_party_entry, 2) == "Daytona"
+    assert MeterApp._leaderboard_display_name(full_party_entry, 3) == "Uploader"
+    partial_party_entry = {
+        "display_name": "Uploader", "party_size": 3,
+        "party_members": ["Uploader", "Battleform"],
+    }
+    assert MeterApp._leaderboard_display_name(partial_party_entry, 1) == "Uploader"
+    assert MeterApp._leaderboard_display_name(
+        {"display_name": "Solo", "party_size": 1, "party_members": ["Solo"]}, 4) == "Solo"
 
     print(f"PASS Python DPS Meter {VERSION}")
     if log_path:
