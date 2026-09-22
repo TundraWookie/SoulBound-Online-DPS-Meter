@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.17"
+VERSION = "0.9.18"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -634,6 +634,13 @@ def is_own_event(event: "CombatEvent") -> bool:
     )
 
 
+def is_local_monster_kill(event: "CombatEvent") -> bool:
+    """Accept lethal dungeon hits even when Soulbound anonymizes the target."""
+    target_type = str(event.target_type or "").strip().casefold()
+    return (event.type == "damage" and event.lethal and is_own_event(event)
+            and target_type in {"mob", "unknown", ""})
+
+
 def is_spectra_boss_damage(event: "CombatEvent") -> bool:
     """Return whether this is the player's effective damage to Spectra herself."""
     return (event.type == "damage" and event.applied_amount > 0 and is_own_event(event)
@@ -1093,7 +1100,7 @@ class CombatSession:
             category = "dev" if event.critical and event.heavy_hit else "crit" if event.critical else "heavy" if event.heavy_hit else "normal"
             ability[3][category][0] += 1
             ability[3][category][1] += event.amount
-            if event.lethal and str(event.target_type or "").casefold() == "mob":
+            if is_local_monster_kill(event):
                 ability[5] += 1
             if self.in_boss_encounter:
                 ability[6] += event.amount
@@ -6066,6 +6073,11 @@ def run_self_test(log_path: str | None = None) -> int:
                  "is_crit": True, "is_heavy_hit": True},
     })
     assert event and event.amount == 300 and event.applied_amount == 1 and event.lethal
+    assert is_local_monster_kill(event)
+    assert is_local_monster_kill(replace(event, target_type="unknown"))
+    assert is_local_monster_kill(replace(event, target_type=None))
+    assert not is_local_monster_kill(replace(event, target_type="player"))
+    assert not is_local_monster_kill(replace(event, target_type="self"))
     assert damage_effect_kind(event) == "dev"
     assert damage_effect_kind(replace(event, heavy_hit=False)) == "crit"
     assert damage_effect_kind(replace(event, critical=False)) == "heavy"
