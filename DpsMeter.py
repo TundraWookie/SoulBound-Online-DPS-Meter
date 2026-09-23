@@ -42,18 +42,16 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.18"
+VERSION = "0.9.19"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
 LEADERBOARD_API_URL = "https://soulbound-leaderboard.helbreathplayer.workers.dev"
 LEADERBOARD_AUTO_REFRESH_MS = 120_000
 LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
-LEADERBOARD_HISTORY_VERSION = 10
+LEADERBOARD_HISTORY_VERSION = 11
 LEADERBOARD_TOP_PER_DUNGEON = 5
 LEADERBOARD_NAME_CYCLE_SECONDS = 2.0
-SPECTRA_NORMAL_SOLO_BOSS_DAMAGE = 2_500_000
-SPECTRA_HARD_SOLO_BOSS_DAMAGE = 8_000_000
 LEADERBOARD_DIFFICULTY_ORDER = (
     "Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid",
 )
@@ -647,6 +645,11 @@ def is_spectra_boss_damage(event: "CombatEvent") -> bool:
             and str(event.target_name or "").strip().casefold() == "spectra")
 
 
+def is_spectra_lethal_finish(event: "CombatEvent") -> bool:
+    """Return whether the local log contains Spectra's actual lethal hit."""
+    return is_spectra_boss_damage(event) and event.lethal
+
+
 def spectra_mode_evidence(event: "CombatEvent") -> str | None:
     """Identify Normal/Hard Spectra from invariant incoming raw damage."""
     if (event.type != "damage_taken"
@@ -668,27 +671,29 @@ def spectra_mode_evidence(event: "CombatEvent") -> str | None:
     return None
 
 
-def spectra_run_qualification(dungeon: str, difficulty: str, party_size: int,
-                              boss_damage: float, modes: set[str]) -> str | None:
-    """Classify Spectra mode, retaining boss-HP proof as the Solo fallback."""
+def spectra_run_qualification(dungeon: str, difficulty: str,
+                              modes: set[str]) -> str | None:
+    """Classify Spectra mode exclusively from her incoming-damage signatures."""
     if (dungeon.strip().casefold() != "spectra lair"
             or difficulty.strip().casefold() != "raid"):
         return "Other"
     if len(modes) > 1:
         return None
-    if modes:
-        tier = next(iter(modes))
-        if party_size == 1:
-            required = (SPECTRA_HARD_SOLO_BOSS_DAMAGE if tier == "Hard"
-                        else SPECTRA_NORMAL_SOLO_BOSS_DAMAGE)
-            return tier if boss_damage >= required else None
-        return tier
-    if party_size == 1:
-        if boss_damage >= SPECTRA_HARD_SOLO_BOSS_DAMAGE:
-            return "Hard"
-        if boss_damage >= SPECTRA_NORMAL_SOLO_BOSS_DAMAGE:
-            return "Normal"
-    return None
+    return next(iter(modes)) if modes else None
+
+
+def spectra_start_is_verified(live_start: bool, snapshot_start: bool,
+                              lethal_finish: bool) -> bool:
+    """Accept a live start, or a snapshot whose real completion was observed."""
+    return live_start or (snapshot_start and lethal_finish)
+
+
+def current_map_display(display_name: str, spectra_modes: set[str]) -> str:
+    """Add a verified Spectra mode to the live map label without renaming it."""
+    dungeon, _difficulty = split_dungeon_difficulty(display_name)
+    if dungeon.casefold() == "spectra lair" and len(spectra_modes) == 1:
+        return f"{display_name} · {next(iter(spectra_modes))}"
+    return display_name
 
 
 def leaderboard_dungeon_display_key(dungeon: str) -> tuple[int, str]:
@@ -1934,7 +1939,9 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     observed_players: set[str] = set()
     observed_player_names: dict[str, str] = {}
     spectra_modes: set[str] = set()
-    spectra_full_start = False
+    spectra_live_start = False
+    spectra_snapshot_start = False
+    spectra_lethal_finish = False
     spectra_survived = True
     game_version = "unknown"
     total_damage = 0.0
@@ -1987,8 +1994,11 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                 if raw_type == "encounter_start":
                     subtype = str(data.get("encounter_subtype") or data.get("room_subtype") or "").lower()
                     timing_in_combat = not CombatSession._is_noncombat(subtype)
-                    if subtype == "bossraid" and data.get("snapshot") is not True:
-                        spectra_full_start = True
+                    if subtype == "bossraid":
+                        if data.get("snapshot") is True:
+                            spectra_snapshot_start = True
+                        else:
+                            spectra_live_start = True
                 elif raw_type in {"encounter_end", "room_end", "run_end"}:
                     timing_in_combat = False
                 if raw_type not in parsed_event_names:
@@ -2025,6 +2035,8 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
                     total_damage += amount
                     if is_spectra_boss_damage(event):
                         boss_damage += amount
+                    if is_spectra_lethal_finish(event):
+                        spectra_lethal_finish = True
                     if not is_unknown_ability(event.ability_name):
                         largest_hit = max(largest_hit, amount)
                     damage_window.append((event.timestamp, amount))
@@ -2046,14 +2058,15 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
         return None
     display = start.dungeon_name or map_name_from_log_path(str(path))
     dungeon, difficulty = split_dungeon_difficulty(display)
-    if (dungeon.casefold() in {"spectra lair", "spectra hard raid"}
-            and is_boss_raid_completion(end) and not spectra_full_start):
-        # A snapshot-only encounter begins when the client attaches after the
-        # raid has already started. Its duration is only the observed tail of
-        # the fight, so it can never be used as a fastest full-run time.
+    spectra_run = dungeon.casefold() in {"spectra lair", "spectra hard raid"}
+    spectra_verified_start = spectra_start_is_verified(
+        spectra_live_start, spectra_snapshot_start, spectra_lethal_finish)
+    if spectra_run and is_boss_raid_completion(end) and not spectra_verified_start:
+        # Snapshot starts are state synchronization, not automatic proof of a
+        # late join. Accept one only when this log also observed Spectra's
+        # lethal hit; that excludes ambiguous wipe/partial encounter endings.
         return None
-    if (dungeon.casefold() in {"spectra lair", "spectra hard raid"}
-            and is_boss_raid_completion(end) and not spectra_survived):
+    if spectra_run and is_boss_raid_completion(end) and not spectra_survived:
         # A dead client continues receiving the party encounter-end event, but
         # that event does not say whether the party cleared or wiped. Require
         # one surviving member's log to prove the party record.
@@ -2080,8 +2093,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
     party_size = reconciled_party_size(declared_party_size, observed_players)
     if party_size is None:
         return None
-    spectra_tier = spectra_run_qualification(
-        dungeon, difficulty, party_size, boss_damage, spectra_modes)
+    spectra_tier = spectra_run_qualification(dungeon, difficulty, spectra_modes)
     if spectra_tier is None:
         return None
     if spectra_tier == "Hard":
@@ -2101,7 +2113,7 @@ def historical_run_from_log(path: Path, cooperative: bool = False) -> dict[str, 
         "totalHealing": round(total_healing),
         "totalShielding": round(total_shielding),
         "bossDamage": round(boss_damage),
-        "spectraFullStart": spectra_full_start,
+        "spectraFullStart": spectra_verified_start,
         "spectraSurvived": spectra_survived,
         "sourceHash": source_hasher.hexdigest(),
     }
@@ -2152,7 +2164,9 @@ class LeaderboardRunTracker:
         self.total_shielding = 0.0
         self.boss_damage = 0.0
         self.spectra_modes: set[str] = set()
-        self.spectra_full_start = False
+        self.spectra_live_start = False
+        self.spectra_snapshot_start = False
+        self.spectra_lethal_finish = False
         self.spectra_survived = True
         self.largest_hit = 0.0
         self.damage_window: deque[tuple[float, float]] = deque()
@@ -2195,8 +2209,11 @@ class LeaderboardRunTracker:
             self.game_version = str(data.get("client_version") or data.get("game_version") or "unknown")[:40]
         elif raw_type == "encounter_start":
             subtype = str(data.get("encounter_subtype") or data.get("room_subtype") or "").lower()
-            if subtype == "bossraid" and data.get("snapshot") is not True:
-                self.spectra_full_start = True
+            if subtype == "bossraid":
+                if data.get("snapshot") is True:
+                    self.spectra_snapshot_start = True
+                else:
+                    self.spectra_live_start = True
 
         if event is None:
             return
@@ -2232,6 +2249,8 @@ class LeaderboardRunTracker:
                 self.total_damage += amount
                 if is_spectra_boss_damage(event):
                     self.boss_damage += amount
+                if is_spectra_lethal_finish(event):
+                    self.spectra_lethal_finish = True
                 if not is_unknown_ability(event.ability_name):
                     self.largest_hit = max(self.largest_hit, amount)
                 self.damage_window.append((event.timestamp, amount))
@@ -2255,13 +2274,15 @@ class LeaderboardRunTracker:
             extracted = (boss_raid_completed or
                          (self.extracted and event.run_end_reason in {"extraction", "extracted"}))
             spectra_tier = spectra_run_qualification(
-                self.dungeon, self.difficulty, self.party_size,
-                self.boss_damage, self.spectra_modes)
+                self.dungeon, self.difficulty, self.spectra_modes)
             spectra_run = self.dungeon.casefold() in {"spectra lair", "spectra hard raid"}
-            if extracted and spectra_run and not self.spectra_full_start:
+            spectra_verified_start = spectra_start_is_verified(
+                self.spectra_live_start, self.spectra_snapshot_start,
+                self.spectra_lethal_finish)
+            if extracted and spectra_run and not spectra_verified_start:
                 extracted = False
                 self.exclusion_message = (
-                    "Spectra run excluded: the full encounter start was not observed")
+                    "Spectra run excluded: its start or completion could not be verified")
             elif extracted and spectra_run and not self.spectra_survived:
                 extracted = False
                 self.exclusion_message = (
@@ -2295,7 +2316,7 @@ class LeaderboardRunTracker:
                     self.observed_player_names.values(), key=str.casefold),
                 "spectraMode": (spectra_tier
                                 if spectra_tier in {"Normal", "Hard"} else None),
-                "spectraFullStart": self.spectra_full_start,
+                "spectraFullStart": spectra_verified_start,
                 "spectraSurvived": self.spectra_survived,
                 "finalSequence": self.last_sequence,
                 "finalChainHash": self.chain_hash,
@@ -2923,6 +2944,7 @@ class MeterApp:
         self.log_status = "Waiting for combat log"
         self.log_connected = False
         self.current_map = "Waiting for dungeon"
+        self.live_spectra_modes: set[str] = set()
         self.game_window: int | None = None
         self.game_pid: int | None = None
         self.last_process_poll = 0.0
@@ -3958,6 +3980,11 @@ class MeterApp:
             self.leaderboard_status_label.configure(text=message)
 
     def _on_combat_event(self, event: CombatEvent) -> None:
+        dungeon, _difficulty = split_dungeon_difficulty(self.current_map)
+        if dungeon.casefold() == "spectra lair":
+            mode_evidence = spectra_mode_evidence(event)
+            if mode_evidence is not None:
+                self.live_spectra_modes.add(mode_evidence)
         if bool(self.settings.get("DamageEffects")):
             effect = damage_effect_kind(event)
             if effect:
@@ -3992,6 +4019,7 @@ class MeterApp:
         self.damage_effects.clear()
         self.records.begin_log(path)
         self.current_map = map_name_from_log_path(path)
+        self.live_spectra_modes.clear()
         dungeon, difficulty = split_dungeon_difficulty(self.current_map)
         if hasattr(self, "leaderboard_catalog") and (dungeon, difficulty) not in self.leaderboard_catalog:
             self.leaderboard_catalog.append((dungeon, difficulty))
@@ -5246,7 +5274,8 @@ class MeterApp:
             text=f"{attempts:,} {'run' if attempts == 1 else 'runs'} · {len(dungeon_runs):,} "
                  f"{'dungeon' if len(dungeon_runs) == 1 else 'dungeons'}")
 
-        self.map_label.configure(text=self.current_map)
+        self.map_label.configure(
+            text=current_map_display(self.current_map, self.live_spectra_modes))
         folder = self.watcher.folder
         self.log_path_label.configure(text=f"Log folder: {folder}" if folder else "Log folder: auto-detect")
 
@@ -6044,17 +6073,17 @@ def run_self_test(log_path: str | None = None) -> int:
     assert reconciled_party_size(1, observed_test_players) == 2
     assert list(observed_test_names.values()) == ["Randouken"]
     assert reconciled_party_size(None, {"self"}) is None
-    assert spectra_run_qualification("Spectra Lair", "Raid", 1, 2_499_999, set()) is None
+    assert spectra_run_qualification("Spectra Lair", "Raid", set()) is None
     assert spectra_run_qualification(
-        "Spectra Lair", "Raid", 1, 2_500_000, set()) == "Normal"
+        "Spectra Lair", "Raid", {"Normal"}) == "Normal"
     assert spectra_run_qualification(
-        "Spectra Lair", "Raid", 1, 8_000_000, set()) == "Hard"
+        "Spectra Lair", "Raid", {"Hard"}) == "Hard"
     assert spectra_run_qualification(
-        "Spectra Lair", "Raid", 8, 0, {"Normal"}) == "Normal"
-    assert spectra_run_qualification(
-        "Spectra Lair", "Raid", 8, 0, {"Hard"}) == "Hard"
-    assert spectra_run_qualification(
-        "Spectra Lair", "Raid", 8, 0, {"Normal", "Hard"}) is None
+        "Spectra Lair", "Raid", {"Normal", "Hard"}) is None
+    assert spectra_run_qualification("Everdune", "Abyssal", set()) == "Other"
+    assert spectra_start_is_verified(True, False, False)
+    assert spectra_start_is_verified(False, True, True)
+    assert not spectra_start_is_verified(False, True, False)
     hard_marker = parse_combat_event({
         "event": "DAMAGE_TAKEN",
         "data": {
@@ -6064,6 +6093,10 @@ def run_self_test(log_path: str | None = None) -> int:
         },
     })
     assert hard_marker and spectra_mode_evidence(hard_marker) == "Hard"
+    assert current_map_display("Spectra Lair", {"Normal"}) == "Spectra Lair · Normal"
+    assert current_map_display("Spectra Lair", {"Hard"}) == "Spectra Lair · Hard"
+    assert current_map_display("Spectra Lair", set()) == "Spectra Lair"
+    assert current_map_display("Everdune", {"Hard"}) == "Everdune"
     event = parse_combat_event({
         "timestamp_utc": timestamp_text(utc_now()), "event": "DAMAGE_DEALT", "sequence": 1,
         "data": {"source": {"type": "self"},
@@ -6219,13 +6252,19 @@ def run_self_test(log_path: str | None = None) -> int:
     track_raid({"event": "ENCOUNTER_START", "sequence": 2, "run_elapsed_ms": 1_000,
                 "timestamp_utc": "2026-09-17T14:37:07Z",
                 "data": {"encounter_subtype": "bossraid"}})
-    track_raid({"event": "DAMAGE_DEALT", "sequence": 3, "run_elapsed_ms": 10_000,
+    track_raid({"event": "DAMAGE_TAKEN", "sequence": 3, "run_elapsed_ms": 5_000,
+                "timestamp_utc": "2026-09-17T14:37:11Z",
+                "data": {"source": {"type": "mob", "display_name": "Spectra"},
+                         "target": {"type": "self", "display_name": "Self"},
+                         "impact_type": "void", "raw_amount": 150,
+                         "applied_amount": 100}})
+    track_raid({"event": "DAMAGE_DEALT", "sequence": 4, "run_elapsed_ms": 10_000,
                 "timestamp_utc": "2026-09-17T14:37:16Z",
                 "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
                          "target": {"type": "mob", "display_name": "Spectra"},
                          "post_target_mitigation_amount": 2_500_000,
                          "applied_amount": 2_500_000}})
-    track_raid({"event": "ENCOUNTER_END", "sequence": 4, "run_elapsed_ms": 523_000,
+    track_raid({"event": "ENCOUNTER_END", "sequence": 5, "run_elapsed_ms": 523_000,
                 "timestamp_utc": "2026-09-17T14:45:49Z",
                 "data": {"encounter_subtype": "bossraid", "duration_ms": 522_001}},
                duration=390.0)
@@ -6238,7 +6277,7 @@ def run_self_test(log_path: str | None = None) -> int:
     assert raid_finish[2]["spectraFullStart"] is True
     assert raid_finish[2]["spectraSurvived"] is True
     raid_finish[3]({"leaderboardEligible": True}, None)
-    track_raid({"event": "RUN_END", "sequence": 5, "run_elapsed_ms": 600_000,
+    track_raid({"event": "RUN_END", "sequence": 6, "run_elapsed_ms": 600_000,
                 "timestamp_utc": "2026-09-17T14:47:06Z", "data": {"reason": "left_dungeon"}})
     assert not raid_client.calls
 
@@ -6288,16 +6327,22 @@ def run_self_test(log_path: str | None = None) -> int:
             {"event": "ENCOUNTER_START", "sequence": 3, "run_elapsed_ms": 1_000,
              "timestamp_utc": "2026-09-17T14:37:07Z",
              "data": {"encounter_subtype": "bossraid"}},
+            {"event": "DAMAGE_TAKEN", "sequence": 4, "run_elapsed_ms": 1_500,
+             "timestamp_utc": "2026-09-17T14:37:07.500Z",
+             "data": {"source": {"type": "mob", "display_name": "Spectra"},
+                      "target": {"type": "self", "display_name": "Self"},
+                      "impact_type": "void", "raw_amount": 150,
+                      "applied_amount": 100}},
         ]
         spectra_roots.extend({
-            "event": "DAMAGE_DEALT", "sequence": second + 2,
+            "event": "DAMAGE_DEALT", "sequence": second + 3,
             "run_elapsed_ms": second * 1_000,
             "data": {"source": {"type": "self"}, "ability_display_name": "Bomb",
                      "target": {"type": "mob", "display_name": "Spectra"},
                      "post_target_mitigation_amount": 62_500, "applied_amount": 62_500},
         } for second in range(2, 42))
         spectra_roots.append({
-            "event": "ENCOUNTER_END", "sequence": 44, "run_elapsed_ms": 41_998,
+            "event": "ENCOUNTER_END", "sequence": 45, "run_elapsed_ms": 41_998,
             "timestamp_utc": "2026-09-17T14:37:49Z",
             "data": {"encounter_subtype": "bossraid", "duration_ms": 42_000},
         })
@@ -6319,6 +6364,16 @@ def run_self_test(log_path: str | None = None) -> int:
             encoding="utf-8")
         assert historical_run_from_log(snapshot_spectra_log) is None
 
+        completed_snapshot_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_14-40-01Z.log"
+        completed_snapshot_roots = json.loads(json.dumps(snapshot_spectra_roots))
+        completed_snapshot_roots[-2]["data"]["is_lethal"] = True
+        completed_snapshot_log.write_text(
+            "".join(json.dumps(root) + "\n" for root in completed_snapshot_roots),
+            encoding="utf-8")
+        completed_snapshot_history = historical_run_from_log(completed_snapshot_log)
+        assert completed_snapshot_history
+        assert completed_snapshot_history["spectraFullStart"] is True
+
         dead_spectra_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_14-41-00Z.log"
         dead_spectra_roots = json.loads(json.dumps(spectra_roots))
         dead_spectra_roots[-1:-1] = [{
@@ -6339,6 +6394,8 @@ def run_self_test(log_path: str | None = None) -> int:
             if root.get("event") == "DAMAGE_DEALT":
                 root["data"]["post_target_mitigation_amount"] = 200_000
                 root["data"]["applied_amount"] = 200_000
+            elif root.get("event") == "DAMAGE_TAKEN":
+                root["data"]["raw_amount"] = 250
         hard_spectra_log.write_text(
             "".join(json.dumps(root) + "\n" for root in hard_spectra_roots),
             encoding="utf-8")
@@ -6356,7 +6413,9 @@ def run_self_test(log_path: str | None = None) -> int:
         low_damage_spectra_log.write_text(
             "".join(json.dumps(root) + "\n" for root in low_damage_spectra_roots),
             encoding="utf-8")
-        assert historical_run_from_log(low_damage_spectra_log) is None
+        low_damage_spectra_history = historical_run_from_log(low_damage_spectra_log)
+        assert low_damage_spectra_history
+        assert low_damage_spectra_history["dungeon"] == "Spectra Lair"
 
         contradicted_party_log = Path(folder) / "dungeon__Spectra_Lair__1__2026-09-17_15-37-06Z.log"
         contradicted_party_roots = json.loads(json.dumps(spectra_roots))
