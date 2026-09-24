@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.19"
+VERSION = "0.9.20"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -969,6 +969,9 @@ class CombatSession:
         self.has_encounter_timing = False
         self.combat_clock_ms = 0.0
         self.last_run_elapsed_ms: float | None = None
+        self.last_run_elapsed_observed_at: float | None = None
+        self.completed_run_time_ms: float | None = None
+        self.completed_as_boss_raid = False
         self.timing_in_combat = False
         self.has_run_elapsed_timing = False
         self.in_boss_encounter = False
@@ -1040,6 +1043,10 @@ class CombatSession:
                 # activity clock when the boss encounter finishes.
                 if is_boss_raid_completion(event) and event.run_duration_ms > 0:
                     self.combat_clock_ms = event.run_duration_ms
+                    self.completed_run_time_ms = event.run_duration_ms
+                    self.completed_as_boss_raid = True
+                    if self.stages:
+                        self.stages[-1]["checkpoint_ms"] = event.run_duration_ms
                 self._close_encounter(event.timestamp)
             self.timing_in_combat = False
             self.in_boss_encounter = False
@@ -1059,6 +1066,13 @@ class CombatSession:
             self.is_active = False
             return
         if event.type == "combat_end":
+            if not self.completed_as_boss_raid:
+                self.completed_run_time_ms = (
+                    event.run_elapsed_ms
+                    if event.run_elapsed_ms is not None and event.run_elapsed_ms > 0
+                    else self.last_run_elapsed_ms)
+                if self.stages and self.completed_run_time_ms is not None:
+                    self.stages[-1]["checkpoint_ms"] = self.completed_run_time_ms
             self._close_encounter(event.timestamp)
             self.timing_in_combat = False
             self.in_boss_encounter = False
@@ -1139,6 +1153,7 @@ class CombatSession:
         else:
             end = now if self.is_active else (self.last_event_at or self.started_at)
             duration = max(0.0, end - self.started_at)
+        run_duration_ms = self._current_run_time_ms()
         visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
         largest = visible[0][1] if visible else 1.0
         top = []
@@ -1175,8 +1190,9 @@ class CombatSession:
         return {
             "damage": self.total_damage, "healing": self.total_healing, "shielding": self.total_shielding,
             "dps": self._rolling(self.recent_damage, now), "hps": self._rolling(self.recent_healing, now),
-            "duration": duration, "active": self.is_active, "in_run": self.in_run, "abilities": top,
-            "stages": self._stage_snapshot(),
+            "duration": duration, "run_duration": run_duration_ms / 1000.0,
+            "active": self.is_active, "in_run": self.in_run, "abilities": top,
+            "stages": self._stage_snapshot(run_duration_ms),
             "highest_crit": self.highest_critical_hit, "highest_heavy": self.highest_heavy_hit,
             "highest_dev": self.highest_devastating_hit,
             "crit_rate": self.critical_hit_count * 100.0 / hits if self.damage_hit_count else 0.0,
@@ -1192,7 +1208,17 @@ class CombatSession:
         if self.timing_in_combat and self.last_run_elapsed_ms is not None:
             delta = max(0.0, elapsed - self.last_run_elapsed_ms)
             self.combat_clock_ms += min(delta, self.PAUSE_GAP_MS)
-        self.last_run_elapsed_ms = elapsed if self.last_run_elapsed_ms is None else max(self.last_run_elapsed_ms, elapsed)
+        if self.last_run_elapsed_ms is None or elapsed >= self.last_run_elapsed_ms:
+            self.last_run_elapsed_ms = elapsed
+            self.last_run_elapsed_observed_at = time.monotonic()
+
+    def _current_run_time_ms(self) -> float:
+        if self.completed_run_time_ms is not None:
+            return max(0.0, self.completed_run_time_ms)
+        elapsed = max(0.0, self.last_run_elapsed_ms or 0.0)
+        if self.in_run and self.last_run_elapsed_observed_at is not None:
+            elapsed += max(0.0, time.monotonic() - self.last_run_elapsed_observed_at) * 1000.0
+        return elapsed
 
     @classmethod
     def _is_noncombat(cls, subtype: str | None) -> bool:
@@ -1226,9 +1252,12 @@ class CombatSession:
     def _finish_stage(self, event: CombatEvent) -> None:
         stage = self._stage_for(event)
         if stage is not None and stage["checkpoint_ms"] is None:
-            stage["checkpoint_ms"] = self.combat_clock_ms
+            stage["checkpoint_ms"] = (
+                event.run_elapsed_ms
+                if event.run_elapsed_ms is not None
+                else self._current_run_time_ms())
 
-    def _stage_snapshot(self) -> list[dict[str, Any]]:
+    def _stage_snapshot(self, run_duration_ms: float) -> list[dict[str, Any]]:
         result = []
         for position, stage in enumerate(self.stages, start=1):
             checkpoint = stage["checkpoint_ms"]
@@ -1236,7 +1265,7 @@ class CombatSession:
                 "number": position,
                 "name": stage["name"],
                 "subtype": stage["subtype"] or "combat",
-                "time_ms": self.combat_clock_ms if checkpoint is None else checkpoint,
+                "time_ms": run_duration_ms if checkpoint is None else checkpoint,
                 "current": checkpoint is None and self.in_run,
                 "complete": checkpoint is not None,
             })
@@ -3241,7 +3270,7 @@ class MeterApp:
         self.encounter.pack(fill="x", pady=(0, 9))
         self.timer = self.role(tk.Frame(self.encounter), "bg", None)
         self.timer.pack(side="left")
-        self.label(self.timer, "COMBAT TIME", 7, "bold", "muted").pack(anchor="w")
+        self.label(self.timer, "RUN TIME", 7, "bold", "muted").pack(anchor="w")
         self.duration_label = self.label(self.timer, "00:00", 19, "normal", "text")
         self.duration_label.pack(anchor="w")
         self.state_label = self.label(self.encounter, "IDLE", 8, "bold", "accent", padx=8, pady=5)
@@ -5188,7 +5217,7 @@ class MeterApp:
     def refresh(self) -> None:
         snapshot = self.session.snapshot()
         self._update_overlay_opacity(bool(snapshot["in_run"]))
-        self.duration_label.configure(text=format_combat_clock(snapshot["duration"] * 1000.0))
+        self.duration_label.configure(text=format_combat_clock(snapshot["run_duration"] * 1000.0))
         self.state_label.configure(text="ACTIVE" if snapshot["active"] else "IDLE")
         self.damage_value.configure(text=format_number(snapshot["damage"]))
         self.healing_value.configure(text=format_number(snapshot["healing"]))
@@ -6487,8 +6516,8 @@ def run_self_test(log_path: str | None = None) -> int:
     rewrite_snapshot = rewrite_session.snapshot()
     assert rewrite_snapshot["damage"] == 123 and rewrite_session.damage_hit_count == 1 and rewrite_snapshot["in_run"]
 
-    # Room checkpoints use cumulative combat-only time. A ten-second silent
-    # gap contributes at most three seconds, and relic rooms add no time.
+    # Combat duration remains pause-aware for statistics, while the displayed
+    # run clock and room checkpoints use the full leaderboard clock.
     stage_session = CombatSession()
     stage_roots = [
         {"timestamp_utc": "2026-08-30T22:00:00Z", "event": "RUN_START", "run_elapsed_ms": 0, "sequence": 20},
@@ -6512,6 +6541,8 @@ def run_self_test(log_path: str | None = None) -> int:
          "data": {"room_index": 1, "room_subtype": "relic"}},
         {"timestamp_utc": "2026-08-30T22:01:16Z", "event": "ROOM_END", "run_elapsed_ms": 76000, "sequence": 30,
          "data": {"room_index": 1, "room_subtype": "relic"}},
+        {"timestamp_utc": "2026-08-30T22:01:16Z", "event": "RUN_END", "run_elapsed_ms": 76000, "sequence": 31,
+         "data": {"reason": "extracted", "duration_ms": 76000}},
     ]
     for stage_root in stage_roots:
         stage_event = parse_combat_event(stage_root)
@@ -6519,9 +6550,10 @@ def run_self_test(log_path: str | None = None) -> int:
         stage_session.apply(stage_event)
     stage_snapshot = stage_session.snapshot()
     assert stage_snapshot["duration"] == 4.0
+    assert stage_snapshot["run_duration"] == 76.0
     assert len(stage_snapshot["stages"]) == 2
-    assert stage_snapshot["stages"][0]["time_ms"] == 4000
-    assert stage_snapshot["stages"][1]["time_ms"] == 4000
+    assert stage_snapshot["stages"][0]["time_ms"] == 13_000
+    assert stage_snapshot["stages"][1]["time_ms"] == 76_000
     assert stage_snapshot["stages"][1]["subtype"] == "relic"
 
     resolver = CombatAbilityResolver()

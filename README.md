@@ -118,9 +118,9 @@ For example, if 2 of your 10 damage hits are heavy, the displayed Heavy Chance i
 
 ### Combat Time
 
-When the combat log provides encounter start and end events, the timer counts active combat time. It pauses between encounters, including upgrade periods, and resumes when the next encounter begins.
+The meter's **Run Time** clock uses Soulbound's full run clock—the same value submitted for fastest-time rankings. Relic selection, room transitions, and other pauses therefore remain visible in the displayed time. Combat-only duration is still tracked internally for performance statistics.
 
-The room timeline below the ability list uses the log's run clock to display combat-only checkpoints. Long pauses, relic selection, treasure rooms, shops, and other non-combat sections do not inflate these checkpoint times.
+The room timeline below the ability list uses the same full run clock, so its final checkpoint matches the leaderboard time.
 
 ### Top Abilities
 
