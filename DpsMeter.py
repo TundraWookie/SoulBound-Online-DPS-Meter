@@ -34,7 +34,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 try:
     import certifi as _certifi
@@ -42,7 +42,7 @@ except ImportError:
     _certifi = None
 
 
-VERSION = "0.9.20"
+VERSION = "0.9.21"
 GITHUB_RELEASE_API_URL = "https://api.github.com/repos/TundraWookie/SoulBound-Online-DPS-Meter/releases/latest"
 UPDATE_USER_AGENT = f"Soulbound-DPS-Meter/{VERSION}"
 UPDATE_MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
@@ -52,6 +52,8 @@ LEADERBOARD_CATALOG_CACHE_SECONDS = 6 * 60 * 60
 LEADERBOARD_HISTORY_VERSION = 11
 LEADERBOARD_TOP_PER_DUNGEON = 5
 LEADERBOARD_NAME_CYCLE_SECONDS = 2.0
+PARTY_RECAP_FIRST_REFRESH_SECONDS = 5.0
+PARTY_RECAP_SECOND_REFRESH_SECONDS = 10.0
 LEADERBOARD_DIFFICULTY_ORDER = (
     "Stable", "Unstable", "Fractured", "Collapsing", "Shattered", "Abyssal", "Raid",
 )
@@ -1156,8 +1158,9 @@ class CombatSession:
         run_duration_ms = self._current_run_time_ms()
         visible = sorted((row for row in self.abilities.values() if not is_unknown_ability(row[0])), key=lambda row: row[1], reverse=True)
         largest = visible[0][1] if visible else 1.0
-        top = []
-        for name, amount, impact_types, buckets, non_damage, kills, boss_damage in visible[:6]:
+        total_kills = sum(max(0, int(row[5])) for row in visible)
+        all_abilities = []
+        for name, amount, impact_types, buckets, non_damage, kills, boss_damage in visible[:12]:
             damage_amount = sum(float(bucket[1]) for bucket in buckets.values())
             breakdown = {}
             for category, bucket in buckets.items():
@@ -1169,9 +1172,10 @@ class CombatSession:
                     "percent": category_damage * 100.0 / damage_amount if damage_amount else 0.0,
                     "average": category_damage / category_hits if category_hits else 0.0,
                 }
-            top.append({
+            all_abilities.append({
                 "name": name,
                 "amount": amount,
+                "damage_amount": damage_amount,
                 "percent": amount / largest * 100.0,
                 "damage_type": " / ".join(sorted(impact_types, key=str.casefold)).upper(),
                 "kills": int(kills),
@@ -1189,9 +1193,11 @@ class CombatSession:
         hits = self.damage_hit_count or 1
         return {
             "damage": self.total_damage, "healing": self.total_healing, "shielding": self.total_shielding,
+            "total_kills": total_kills,
             "dps": self._rolling(self.recent_damage, now), "hps": self._rolling(self.recent_healing, now),
             "duration": duration, "run_duration": run_duration_ms / 1000.0,
-            "active": self.is_active, "in_run": self.in_run, "abilities": top,
+            "active": self.is_active, "in_run": self.in_run,
+            "abilities": all_abilities[:6], "all_abilities": all_abilities,
             "stages": self._stage_snapshot(run_duration_ms),
             "highest_crit": self.highest_critical_hit, "highest_heavy": self.highest_heavy_hit,
             "highest_dev": self.highest_devastating_hit,
@@ -1611,17 +1617,32 @@ class FlexRecordStore:
                 bucket["FastestMs"] = duration_ms
                 bucket["FastestAt"] = entry.get("StartedAt")
 
-    def import_log_history(self, folder: Path | str | None) -> int:
-        """Import every existing log once; the persisted run ID makes rescans idempotent."""
+    def pending_log_history_paths(self, folder: Path | str | None) -> list[Path]:
+        """Return only new logs and logs whose earlier scan never reached an end."""
         if folder is None:
-            return 0
+            return []
         root_folder = Path(folder)
-        imported_before = len(self.data["DungeonRunLedger"])
+        finalized_files = {
+            str(entry.get("SourceFile") or "").casefold()
+            for entry in self.data["DungeonRunLedger"].values()
+            if isinstance(entry, dict)
+            and str(entry.get("Status") or "").casefold() != "started"
+            and str(entry.get("SourceFile") or "").strip()
+        }
         try:
-            paths = sorted((p for p in root_folder.iterdir()
-                            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS), key=lambda p: p.name.casefold())
+            return sorted(
+                (path for path in root_folder.iterdir()
+                 if path.is_file()
+                 and path.suffix.lower() in SUPPORTED_EXTENSIONS
+                 and path.name.casefold() not in finalized_files),
+                key=lambda path: path.name.casefold())
         except OSError:
-            return 0
+            return []
+
+    @staticmethod
+    def parse_log_history_paths(paths: Iterable[Path]) -> list[dict[str, Any]]:
+        """Read history files without mutating UI-visible record state."""
+        parsed: list[dict[str, Any]] = []
         for path in paths:
             start: CombatEvent | None = None
             end: CombatEvent | None = None
@@ -1657,7 +1678,7 @@ class FlexRecordStore:
             if start is None:
                 continue
             display = start.dungeon_name or map_name_from_log_path(str(path))
-            run_id = self._run_id(start.timestamp, display)
+            run_id = FlexRecordStore._run_id(start.timestamp, display)
             status = "started"
             if end is not None:
                 status = "extracted" if (
@@ -1665,11 +1686,32 @@ class FlexRecordStore:
                                               or is_boss_raid_completion(end))) else (
                     "abandoned" if end.run_end_reason == "abandoned" else "ended")
             duration_ms = max(0.0, (end.timestamp - start.timestamp) * 1000.0) if end else 0.0
-            self._upsert_run(run_id, display, start.timestamp, status, str(path), duration_ms,
-                             status == "extracted")
+            parsed.append({
+                "run_id": run_id, "display": display, "started_at": start.timestamp,
+                "status": status, "path": str(path), "duration_ms": duration_ms,
+                "qualifies_fastest": status == "extracted",
+            })
+        return parsed
+
+    def apply_log_history(self, parsed: Iterable[dict[str, Any]]) -> int:
+        imported_before = len(self.data["DungeonRunLedger"])
+        changed = False
+        for entry in parsed:
+            self._upsert_run(
+                str(entry["run_id"]), str(entry["display"]), float(entry["started_at"]),
+                str(entry["status"]), str(entry["path"]), float(entry["duration_ms"]),
+                bool(entry["qualifies_fastest"]))
+            changed = True
+        if not changed:
+            return 0
         self._rebuild_fastest_times()
         self.save(force=True)
         return max(0, len(self.data["DungeonRunLedger"]) - imported_before)
+
+    def import_log_history(self, folder: Path | str | None) -> int:
+        """Import new or unfinished logs synchronously when explicitly requested."""
+        paths = self.pending_log_history_paths(folder)
+        return self.apply_log_history(self.parse_log_history_paths(paths))
 
     def _log_key(self) -> str:
         return self.active_log or "legacy-or-manual-source"
@@ -2492,6 +2534,7 @@ class AppSettings:
         "LeaderboardCategory": "time", "LeaderboardDungeon": ALL_DUNGEONS,
         "LeaderboardDifficulty": ALL_DIFFICULTIES,
         "LeaderboardPartySize": "All", "LeaderboardSource": "imported",
+        "PartyRecapEnabled": True,
         "LeaderboardHistoryScanned": False, "LeaderboardHistoryFiles": [],
         "LeaderboardHistoryVersion": LEADERBOARD_HISTORY_VERSION,
     }
@@ -2627,11 +2670,18 @@ class CombatLogWatcher:
 
     @classmethod
     def find_newest(cls, folder: Path) -> Path | None:
-        verified = [path for path in cls.files(folder) if cls.verified(path)]
         try:
-            return max(verified, key=lambda path: (path.stat().st_mtime_ns, path.stat().st_ctime_ns, path.name.lower()), default=None)
+            candidates = sorted(
+                cls.files(folder),
+                key=lambda path: (
+                    cls.log_start_key(path), path.stat().st_mtime_ns,
+                    path.stat().st_ctime_ns, path.name.lower()),
+                reverse=True)
         except OSError:
             return None
+        # Usually the first file is valid. Checking newest-first avoids opening
+        # every historical log on each 250 ms polling cycle.
+        return next((path for path in candidates if cls.verified(path)), None)
 
     @classmethod
     def log_start_key(cls, path: Path) -> int:
@@ -2965,6 +3015,32 @@ class MeterApp:
         self.leaderboard_history_scanning = False
         self.leaderboard_history_rescan_pending = False
         self.leaderboard_completion_scan_job: str | None = None
+        self.record_history_scanning = False
+        self.record_history_results: queue.Queue[
+            tuple[list[dict[str, Any]] | None, str | None]] = queue.Queue()
+        self.party_live_inflight = False
+        self.party_live_next_refresh_at = 0.0
+        self.party_live_refreshes_remaining = 0
+        self.party_live_submitted = False
+        self.party_live_submit_attempts = 0
+        self.party_live_active = False
+        self.party_live_end_pending = False
+        self.party_live_run_id = ""
+        self.party_live_dungeon = "Unknown Dungeon"
+        self.party_live_difficulty = "Stable"
+        self.party_live_party_size = 1
+        self.party_live_started_at_ms = 0
+        self.party_live_room_name = ""
+        self.party_live_room_index = -1
+        self.party_live_outcome = "Waiting"
+        self.party_sort_key = "totalDamage"
+        self.party_sort_descending = True
+        self.party_live_observed_players: set[str] = set()
+        self.party_live_observed_names: dict[str, str] = {}
+        self.party_live_members: list[dict[str, Any]] = []
+        self.party_live_matched = 0
+        self.party_live_expected = 1
+        self.party_live_status = "Waiting for a party dungeon"
         self.update_check_running = False
         self.update_download_running = False
         configured = log_override or self.settings.get("CombatLogFolder") or self.settings.get("CombatLogPath")
@@ -3026,6 +3102,8 @@ class MeterApp:
         self._leaderboard_rank_name_labels: list[tuple[tk.Label, dict[str, Any]]] = []
         self._leaderboard_party_tooltip: tk.Toplevel | None = None
         self._leaderboard_party_tooltip_hide_job: str | None = None
+        self._party_member_tooltip: tk.Toplevel | None = None
+        self._party_member_tooltip_hide_job: str | None = None
         self._leaderboard_name_cycle_phase = -1
         self._updating_theme = False
         self._drag_start: tuple[int, int, int, int] | None = None
@@ -3068,6 +3146,7 @@ class MeterApp:
         self._build_meter_view()
         self._build_flex_view()
         self._build_leaderboard_view()
+        self._build_party_view()
         self._build_settings_view()
         self._build_credit_and_grip()
         self._load_icons()
@@ -3076,11 +3155,10 @@ class MeterApp:
 
         self.watcher = CombatLogWatcher(
             configured, bool(self.settings.get("CleanupOldCombatLogs")), self._on_combat_event,
-            self._on_active_log, self._on_log_status, None,
+            self._on_active_log, self._on_log_status, self._on_raw_combat_event,
         )
         if self.watcher.folder is None:
             self.watcher.folder = self.watcher.default_folder()
-        self.records.import_log_history(self.watcher.folder)
         if self.watcher.folder:
             self.settings.set("CombatLogFolder", str(self.watcher.folder))
         self.win = WindowsApi(self.root)
@@ -3089,6 +3167,7 @@ class MeterApp:
         self.root.after(80, self.win.ensure_taskbar_button)
         self.find_and_follow(force=True)
         self.root.after(20, self.tick)
+        self.root.after(350, self._start_record_history_import)
         if self.leaderboard_client.token and bool(self.settings.get("LeaderboardEnabled")):
             self.root.after(1000, self.scan_leaderboard_history)
         self.root.after(180, self.refresh_leaderboard_catalog)
@@ -3096,7 +3175,7 @@ class MeterApp:
             self.root.after(3500, self.check_for_updates)
         if smoke_view == "settings":
             self.root.after(60, self.show_settings)
-        elif smoke_view in {"meter", "flex", "leaderboard"}:
+        elif smoke_view in {"meter", "flex", "leaderboard", "party"}:
             self.root.after(60, lambda: self._show_main_view(smoke_view))
             if smoke_view == "leaderboard":
                 self.root.after(120, self.refresh_leaderboard)
@@ -3205,6 +3284,8 @@ class MeterApp:
         self.view_button.pack(side="left", padx=(0, 4))
         self.leaderboard_button = self.button(controls, "Ranks", self.toggle_leaderboard_view, width=5)
         self.leaderboard_button.pack(side="left", padx=(0, 4))
+        self.party_button = self.button(controls, "Party", self.toggle_party_view, width=4)
+        self.party_button.pack(side="left", padx=(0, 4))
         self.button(controls, "⚙", self.show_settings, width=2).pack(side="left", padx=(0, 4))
         self.compact_button = self.button(controls, "Compact", self.toggle_compact_mode, width=7)
         self.compact_button.pack(side="left", padx=(0, 4))
@@ -3661,6 +3742,95 @@ class MeterApp:
             6, foreground="dim", anchor="w")
         self.leaderboard_note.pack(fill="x", pady=(5, 16))
 
+    def _build_party_view(self) -> None:
+        self.party_view = self.role(tk.Frame(self.view_host), "bg", None)
+        top = self.role(tk.Frame(self.party_view), "bg", None)
+        top.pack(fill="x", pady=(12, 8))
+        self.label(top, "PARTY RECAP", 10, "bold", "text").pack(side="left", anchor="w")
+        self.button(top, "Copy", self.copy_party_recap, width=6).pack(side="right")
+        self.party_status_label = self.label(
+            self.party_view, self.party_live_status, 7, foreground="muted", anchor="w")
+        self.party_status_label.pack(fill="x")
+        self.party_run_label = self.label(
+            self.party_view, "No party run recorded", 7, "bold", "purple", anchor="w")
+        self.party_run_label.pack(fill="x", pady=(2, 7))
+
+        table = self.panel(self.party_view)
+        table.pack(fill="both", expand=True)
+        heading = self.role(tk.Frame(table), "panel", None)
+        heading.pack(fill="x", padx=8, pady=(7, 3))
+        self.label(heading, "#", 7, "bold", "muted", width=2, anchor="e").pack(side="left")
+        self.label(heading, "PLAYER", 7, "bold", "muted", width=10, anchor="w").pack(
+            side="left", fill="x", expand=True)
+        self.party_sort_headings: dict[str, tuple[tk.Label, str]] = {}
+
+        def sortable_heading(text: str, key: str, width: int) -> None:
+            label = self.label(heading, text, 7, "bold", "muted", width=width, anchor="e")
+            label.pack(side="right")
+            label.configure(cursor="hand2")
+            label.bind("<Button-1>", lambda _event, field=key: self.set_party_sort(field), add="+")
+            self.party_sort_headings[key] = (label, text)
+
+        sortable_heading("DPS", "dps", 7)
+        sortable_heading("SHIELD", "totalShielding", 7)
+        sortable_heading("HEAL", "totalHealing", 7)
+        sortable_heading("KILLS", "totalKills", 5)
+        sortable_heading("DAMAGE", "totalDamage", 11)
+        self.party_rows_host = self.role(tk.Frame(table), "panel", None)
+        self.party_rows_host.pack(fill="both", expand=True)
+        self.party_rows: list[dict[str, Any]] = []
+        for _index in range(8):
+            row = self.role(tk.Frame(self.party_rows_host, highlightthickness=1), "panel", None)
+            rank = self.label(row, "", 8, "bold", "muted", width=2, anchor="e")
+            rank.pack(side="left", padx=(4, 2), pady=7)
+            name = self.label(row, "", 8, "bold", "text", width=10, anchor="w")
+            name.pack(side="left", fill="x", expand=True, padx=(2, 1), pady=7)
+            dps = self.label(row, "", 8, "bold", "orange", width=7, anchor="e")
+            dps.pack(side="right", padx=(2, 8))
+            shielding = self.label(row, "", 8, "bold", "blue", width=7, anchor="e")
+            shielding.pack(side="right", padx=2)
+            healing = self.label(row, "", 8, "bold", "green", width=7, anchor="e")
+            healing.pack(side="right", padx=2)
+            kills = self.label(row, "", 8, "bold", "purple", width=5, anchor="e")
+            kills.pack(side="right", padx=2)
+            damage = self.label(row, "", 8, "bold", "text", width=11, anchor="e")
+            damage.pack(side="right", padx=2)
+            info: dict[str, Any] = {
+                "frame": row, "rank": rank, "name": name, "damage": damage, "kills": kills,
+                "healing": healing, "shielding": shielding, "dps": dps,
+                "member": None,
+            }
+            self.party_rows.append(info)
+            for widget in (row, rank, name, damage, kills, healing, shielding, dps):
+                widget.bind(
+                    "<Enter>", lambda event, item=info: self._show_party_member_tooltip(item, event),
+                    add="+")
+                widget.bind("<Leave>", self._schedule_hide_party_member_tooltip, add="+")
+        self.party_totals_row = self.role(tk.Frame(table, highlightthickness=1), "button", None)
+        self.label(self.party_totals_row, "", 8, width=2, anchor="e").pack(side="left", padx=(4, 2), pady=7)
+        self.label(self.party_totals_row, "TOTAL", 8, "bold", "text", width=10, anchor="w").pack(
+            side="left", fill="x", expand=True, padx=(2, 1))
+        self.party_total_dps = self.label(
+            self.party_totals_row, "—", 8, "bold", "orange", width=7, anchor="e")
+        self.party_total_dps.pack(side="right", padx=(2, 8))
+        self.party_total_shielding = self.label(
+            self.party_totals_row, "0", 8, "bold", "blue", width=7, anchor="e")
+        self.party_total_shielding.pack(side="right", padx=2)
+        self.party_total_healing = self.label(
+            self.party_totals_row, "0", 8, "bold", "green", width=7, anchor="e")
+        self.party_total_healing.pack(side="right", padx=2)
+        self.party_total_kills = self.label(
+            self.party_totals_row, "0", 8, "bold", "purple", width=5, anchor="e")
+        self.party_total_kills.pack(side="right", padx=2)
+        self.party_total_damage = self.label(
+            self.party_totals_row, "0 100%", 8, "bold", "text", width=11, anchor="e")
+        self.party_total_damage.pack(side="right", padx=2)
+        self.party_note = self.label(
+            self.party_view,
+            "Created automatically when the run ends. Only players running this DPS meter can contribute damage totals.",
+            6, foreground="dim", justify="left", anchor="w", wraplength=390)
+        self.party_note.pack(fill="x", pady=(6, 18))
+
     def _build_settings_view(self) -> None:
         self.settings_view = self.role(tk.Frame(self.outer, highlightthickness=1), "bg", None)
         header = self.role(tk.Frame(self.settings_view), "bg", None)
@@ -3828,6 +3998,21 @@ class MeterApp:
         self.label(self.settings_body,
                    "Requires a player name in the Ranks tab. Only completed extractions are eligible; abandoned runs are excluded.",
                    7, foreground="muted", justify="left", wraplength=290).pack(anchor="w", padx=34, pady=(3, 0))
+        self.party_live_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("PartyRecapEnabled")))
+        party_live_enabled = tk.Checkbutton(
+            self.settings_body, text="Create an automatic party recap when a run ends",
+            variable=self.party_live_enabled_var, command=self.party_live_enabled_changed,
+            font=(self.FONT, self._scaled_font_size(8)), borderwidth=0,
+            highlightthickness=0, anchor="w", justify="left")
+        self._register_font(party_live_enabled, 8)
+        self.role(party_live_enabled, "bg", "text")
+        party_live_enabled.pack(anchor="w", padx=15, pady=(9, 0))
+        self.label(
+            self.settings_body,
+            "Sends one summarized result when a party run ends, including clears, deaths, failures, and runs you leave. Raw combat logs are never uploaded.",
+            7, foreground="muted", justify="left", wraplength=290).pack(
+                anchor="w", padx=34, pady=(3, 0))
         self.label(self.settings_body, "UPDATES", 7, "bold", "muted").pack(anchor="w", padx=15, pady=(12, 5))
         self.auto_update_var = tk.BooleanVar(value=bool(self.settings.get("AutoUpdateEnabled")))
         auto_update = tk.Checkbutton(
@@ -4025,6 +4210,191 @@ class MeterApp:
         if event.type == "combat_end" or is_boss_raid_completion(event):
             self._schedule_completed_log_import()
 
+    def _on_raw_combat_event(
+            self, root: dict[str, Any], _raw: bytes,
+            event: CombatEvent | None) -> None:
+        raw_type = str(root.get("event") or "").strip().lower()
+        data = root.get("data") if isinstance(root.get("data"), dict) else {}
+        observe_log_players(
+            root, self.party_live_observed_players, self.party_live_observed_names)
+        if raw_type == "run_start" and event is not None:
+            display = event.dungeon_name or self.current_map
+            self.party_live_dungeon, self.party_live_difficulty = split_dungeon_difficulty(display)
+            self.party_live_party_size = reported_party_size(data.get("party_size")) or 1
+            self.party_live_started_at_ms = max(0, round(event.timestamp * 1000.0))
+            owner = str(self.settings.get("LeaderboardPlayerId") or "local")
+            signature = f"{self.party_live_started_at_ms}|{display.casefold()}|{owner}"
+            self.party_live_run_id = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:32]
+            self.party_live_room_name = str(data.get("room_name") or "")[:120]
+            self.party_live_outcome = "In Progress"
+            try:
+                self.party_live_room_index = int(float(data.get("room_index", -1)))
+            except (TypeError, ValueError):
+                self.party_live_room_index = -1
+            self.party_live_active = self.party_live_party_size > 1
+            self.party_live_end_pending = False
+            self.party_live_submitted = False
+            self.party_live_submit_attempts = 0
+            self.party_live_refreshes_remaining = 0
+            self.party_live_next_refresh_at = 0.0
+            self.party_live_members = []
+            self.party_live_matched = 0
+            self.party_live_expected = self.party_live_party_size
+            self.party_live_status = (
+                "Party recap will be created when this run ends"
+                if self.party_live_active else "Solo run · no party recap needed")
+        elif raw_type in {"room_start", "encounter_start"}:
+            self.party_live_room_name = str(
+                data.get("room_name") or self.party_live_room_name)[:120]
+            try:
+                self.party_live_room_index = int(float(
+                    data.get("room_index", self.party_live_room_index)))
+            except (TypeError, ValueError):
+                pass
+        if self.party_live_run_id:
+            # Some Soulbound logs incorrectly declare a solo party size. Ally
+            # identities observed anywhere in the run are a stronger signal.
+            reconciled = reconciled_party_size(
+                self.party_live_party_size, self.party_live_observed_players)
+            if reconciled is not None and reconciled > self.party_live_party_size:
+                self.party_live_party_size = reconciled
+                self.party_live_expected = reconciled
+                self.party_live_active = reconciled > 1
+                self.party_live_status = (
+                    "Party recap will be created when this run ends")
+        boss_raid_ended = bool(
+            event is not None and event.type == "encounter_end"
+            and event.room_subtype == "bossraid")
+        extracted_room_ended = bool(
+            event is not None and event.type == "room_end"
+            and event.run_end_reason in {"extraction", "extracted"})
+        party_run_ended = raw_type == "run_end" or boss_raid_ended or extracted_room_ended
+        if party_run_ended and self.party_live_run_id:
+            reason = str(
+                (event.run_end_reason if event is not None else None)
+                or data.get("reason") or data.get("end_reason") or "").strip().casefold()
+            boss_completed = event is not None and is_boss_raid_completion(event)
+            if extracted_room_ended or boss_completed or reason in {"extraction", "extracted"}:
+                self.party_live_outcome = "Cleared"
+            elif reason in {"died", "death", "wipe", "wiped", "defeat", "defeated"}:
+                self.party_live_outcome = "Died"
+            elif reason in {"failed", "failure"}:
+                self.party_live_outcome = "Failed"
+            elif reason in {"abandoned", "left_dungeon", "client_exit", "session_changed"}:
+                self.party_live_outcome = "Left"
+            else:
+                self.party_live_outcome = "Ended"
+            if self.party_live_active and not self.party_live_submitted:
+                self.party_live_end_pending = True
+            self.party_live_active = False
+            self.party_live_status = "Preparing party recap…"
+
+    def _party_live_body(self) -> dict[str, Any]:
+        snapshot = self.session.snapshot()
+        total_damage = max(0.0, float(snapshot.get("damage") or 0.0))
+        combat_seconds = max(1.0, float(snapshot.get("duration") or 0.0))
+        abilities = []
+        for ability in snapshot.get("all_abilities", [])[:12]:
+            damage_amount = max(0.0, float(
+                ability.get("damage_amount", ability.get("amount", 0.0)) or 0.0))
+            if damage_amount <= 0:
+                continue
+            abilities.append({
+                "name": str(ability.get("name") or "Unknown")[:80],
+                "amount": damage_amount,
+                "kills": max(0, int(ability.get("kills") or 0)),
+                "damageType": str(ability.get("damage_type") or "")[:120],
+            })
+        return {
+            "runId": self.party_live_run_id or "inactive-run",
+            "dungeon": self.party_live_dungeon,
+            "difficulty": self.party_live_difficulty,
+            "partySize": self.party_live_party_size,
+            "runStartedAt": self.party_live_started_at_ms,
+            "runElapsedMs": max(0, min(28_800_000, round(
+                float(snapshot.get("run_duration") or 0.0) * 1000.0))),
+            "roomName": self.party_live_room_name,
+            "roomIndex": self.party_live_room_index,
+            "outcome": self.party_live_outcome,
+            "totalDamage": total_damage,
+            "dps": total_damage / combat_seconds,
+            "totalKills": max(0, int(snapshot.get("total_kills") or 0)),
+            "totalHealing": max(0.0, float(snapshot.get("healing") or 0.0)),
+            "totalShielding": max(0.0, float(snapshot.get("shielding") or 0.0)),
+            "observedPlayers": sorted(
+                self.party_live_observed_names.values(), key=str.casefold)[:8],
+            "abilities": abilities,
+        }
+
+    def _tick_party_live(self, now: float) -> None:
+        enabled = bool(self.settings.get("PartyRecapEnabled"))
+        token_ready = bool(self.leaderboard_client.token)
+        should_submit = (
+            self.party_live_end_pending and enabled and token_ready
+            and self.party_live_submit_attempts < 3
+            and now >= self.party_live_next_refresh_at)
+        should_refresh = (
+            self.party_live_submitted and self.party_live_refreshes_remaining > 0
+            and enabled and token_ready and now >= self.party_live_next_refresh_at)
+        if self.party_live_active and not token_ready:
+            self.party_live_status = "Join Ranks once to enable automatic party recaps"
+        elif self.party_live_active and not enabled:
+            self.party_live_status = "Party recaps are turned off in Settings"
+        elif self.party_live_end_pending and not token_ready:
+            self.party_live_status = "Join Ranks to create this party recap"
+        elif self.party_live_end_pending and not enabled:
+            self.party_live_status = "Party recap was not shared because it is turned off"
+        if self.party_live_inflight or not (should_submit or should_refresh):
+            return
+        self.party_live_inflight = True
+        submitting = should_submit
+        if submitting:
+            self.party_live_submit_attempts += 1
+        path = "/v1/party/recap"
+        method = "POST"
+        body: dict[str, Any] | None = self._party_live_body()
+        if should_refresh:
+            method = "GET"
+            body = None
+            path += "?" + urllib.parse.urlencode({"runId": self.party_live_run_id})
+
+        def complete(data: dict[str, Any] | None, error_message: str | None) -> None:
+            self.party_live_inflight = False
+            if error_message:
+                if submitting and self.party_live_submit_attempts < 3:
+                    self.party_live_next_refresh_at = time.monotonic() + 30.0
+                    self.party_live_status = "Party recap upload will retry shortly"
+                else:
+                    self.party_live_end_pending = False
+                    self.party_live_refreshes_remaining = 0
+                    self.party_live_status = f"Party recap unavailable · {error_message}"
+                return
+            if submitting:
+                self.party_live_end_pending = False
+                self.party_live_submitted = True
+                self.party_live_refreshes_remaining = 2
+                self.party_live_next_refresh_at = (
+                    time.monotonic() + PARTY_RECAP_FIRST_REFRESH_SECONDS)
+            else:
+                self.party_live_refreshes_remaining = max(
+                    0, self.party_live_refreshes_remaining - 1)
+                self.party_live_next_refresh_at = (
+                    time.monotonic() + PARTY_RECAP_SECOND_REFRESH_SECONDS)
+            members = data.get("members") if isinstance(data, dict) else None
+            self.party_live_members = [member for member in (members or [])
+                                       if isinstance(member, dict)]
+            try:
+                self.party_live_matched = int(data.get("matched", len(self.party_live_members)))
+                self.party_live_expected = int(data.get("expected", self.party_live_party_size))
+            except (TypeError, ValueError, AttributeError):
+                self.party_live_matched = len(self.party_live_members)
+                self.party_live_expected = self.party_live_party_size
+            self.party_live_status = (
+                f"Party recap · {self.party_live_matched}/{self.party_live_expected} meter users matched")
+
+        self.leaderboard_client.request(
+            method, path, body, complete, authenticated=True)
+
     def _schedule_completed_log_import(self) -> None:
         if (not self.leaderboard_client.token
                 or not bool(self.settings.get("LeaderboardEnabled"))):
@@ -4043,12 +4413,60 @@ class MeterApp:
         self.leaderboard_completion_scan_job = None
         self.scan_leaderboard_history()
 
+    def _start_record_history_import(self) -> None:
+        if self.record_history_scanning or self.watcher.folder is None:
+            return
+        paths = self.records.pending_log_history_paths(self.watcher.folder)
+        active_path = self.watcher.active_path
+        if active_path is not None:
+            active_key = str(active_path).casefold()
+            paths = [path for path in paths if str(path).casefold() != active_key]
+        if not paths:
+            return
+        self.record_history_scanning = True
+
+        def worker() -> None:
+            try:
+                parsed = FlexRecordStore.parse_log_history_paths(paths)
+            except Exception as error:
+                self.record_history_results.put((None, type(error).__name__))
+                return
+            self.record_history_results.put((parsed, None))
+
+        threading.Thread(
+            target=worker, name="SoulboundLocalHistory", daemon=True).start()
+
+    def _pump_record_history_import(self) -> None:
+        try:
+            parsed, error_name = self.record_history_results.get_nowait()
+        except queue.Empty:
+            return
+        self.record_history_scanning = False
+        if error_name is not None or parsed is None:
+            return
+        self.records.apply_log_history(parsed)
+
     def _on_active_log(self, path: str) -> None:
         self.session.reset()
         self.damage_effects.clear()
         self.records.begin_log(path)
         self.current_map = map_name_from_log_path(path)
         self.live_spectra_modes.clear()
+        self.party_live_active = False
+        self.party_live_end_pending = False
+        self.party_live_submitted = False
+        self.party_live_submit_attempts = 0
+        self.party_live_refreshes_remaining = 0
+        self.party_live_next_refresh_at = 0.0
+        self.party_live_run_id = ""
+        self.party_live_party_size = 1
+        self.party_live_room_name = ""
+        self.party_live_room_index = -1
+        self.party_live_outcome = "Waiting"
+        self.party_live_observed_players.clear()
+        self.party_live_observed_names.clear()
+        self.party_live_members = []
+        self.party_live_status = "Waiting for a party dungeon"
         dungeon, difficulty = split_dungeon_difficulty(self.current_map)
         if hasattr(self, "leaderboard_catalog") and (dungeon, difficulty) not in self.leaderboard_catalog:
             self.leaderboard_catalog.append((dungeon, difficulty))
@@ -4288,6 +4706,17 @@ class MeterApp:
             "Leaderboard submissions enabled" if enabled else "Leaderboard submissions disabled")
         if enabled and self.leaderboard_client.token:
             self.root.after(100, self.scan_leaderboard_history)
+
+    def party_live_enabled_changed(self) -> None:
+        enabled = bool(self.party_live_enabled_var.get())
+        self.settings.set("PartyRecapEnabled", enabled)
+        if enabled:
+            if self.party_live_submitted:
+                self.party_live_refreshes_remaining = max(
+                    1, self.party_live_refreshes_remaining)
+                self.party_live_next_refresh_at = 0.0
+        else:
+            self.party_live_status = "Party recaps are turned off in Settings"
 
     def _update_leaderboard_identity(self) -> None:
         if not hasattr(self, "leaderboard_name_entry"):
@@ -4958,10 +5387,19 @@ class MeterApp:
             self.refresh_leaderboard_catalog()
             self.refresh_leaderboard()
 
+    def toggle_party_view(self) -> None:
+        target = "meter" if self.current_view == "party" else "party"
+        self._show_main_view(target)
+        if target == "party" and self.party_live_submitted:
+            self.party_live_refreshes_remaining = max(
+                1, self.party_live_refreshes_remaining)
+            self.party_live_next_refresh_at = 0.0
+
     def _show_main_view(self, view: str) -> None:
         self._hide_player_list_tooltip()
         self._hide_leaderboard_rank_tooltip()
-        for widget in (self.meter_view, self.flex_view, self.leaderboard_view):
+        self._hide_party_member_tooltip()
+        for widget in (self.meter_view, self.flex_view, self.leaderboard_view, self.party_view):
             widget.pack_forget()
         self.current_view = view
         if view == "meter":
@@ -4969,6 +5407,8 @@ class MeterApp:
                                  pady=(4, 6) if self.compact_mode else (10, 21))
         elif view == "flex":
             self.flex_view.pack(fill="both", expand=True)
+        elif view == "party":
+            self.party_view.pack(fill="both", expand=True)
         else:
             self.leaderboard_view.pack(fill="both", expand=True)
         self._schedule_leaderboard_auto_refresh()
@@ -4982,6 +5422,8 @@ class MeterApp:
                                    width=3 if self.compact_mode else 4)
         self.leaderboard_button.configure(text="DPS" if self.current_view == "leaderboard" else "Ranks",
                                           width=4 if self.compact_mode else 5)
+        self.party_button.configure(text="DPS" if self.current_view == "party" else "Party",
+                                    width=3 if self.compact_mode else 4)
 
     @staticmethod
     def _set_packed(widget: tk.Widget, visible: bool, **pack_options: Any) -> None:
@@ -5305,6 +5747,7 @@ class MeterApp:
 
         self.map_label.configure(
             text=current_map_display(self.current_map, self.live_spectra_modes))
+        self._render_party_view()
         folder = self.watcher.folder
         self.log_path_label.configure(text=f"Log folder: {folder}" if folder else "Log folder: auto-detect")
 
@@ -5750,6 +6193,229 @@ class MeterApp:
             self._leaderboard_party_tooltip.destroy()
         self._leaderboard_party_tooltip = None
 
+    @staticmethod
+    def _party_member_kills(member: dict[str, Any]) -> int:
+        abilities = member.get("abilities")
+        ability_kills = sum(
+            max(0, int(ability.get("kills") or 0))
+            for ability in (abilities if isinstance(abilities, list) else [])
+            if isinstance(ability, dict))
+        try:
+            return max(0, int(member.get("totalKills", ability_kills) or 0))
+        except (TypeError, ValueError):
+            return ability_kills
+
+    def _party_metric(self, member: dict[str, Any], key: str) -> float:
+        if key == "totalKills":
+            return float(self._party_member_kills(member))
+        try:
+            return max(0.0, float(member.get(key) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def set_party_sort(self, key: str) -> None:
+        if key == self.party_sort_key:
+            self.party_sort_descending = not self.party_sort_descending
+        else:
+            self.party_sort_key = key
+            self.party_sort_descending = True
+        self._render_party_view()
+
+    def _party_run_summary(self, members: list[dict[str, Any]]) -> str:
+        owner = str(self.settings.get("LeaderboardDisplayName") or "").casefold()
+        local_member = next(
+            (member for member in members
+             if str(member.get("displayName") or "").casefold() == owner),
+            members[0] if members else None)
+        outcome = str((local_member or {}).get("outcome") or self.party_live_outcome)
+        duration = format_duration_ms((local_member or {}).get("runElapsedMs"))
+        return (f"{self.party_live_dungeon} · {self.party_live_difficulty} · "
+                f"{outcome} · {duration}")
+
+    def copy_party_recap(self) -> None:
+        members = list(self.party_live_members)
+        if not members:
+            return
+        members.sort(key=lambda member: str(member.get("displayName") or "").casefold())
+        members.sort(key=lambda member: self._party_metric(member, "totalDamage"), reverse=True)
+        total_damage = sum(self._party_metric(member, "totalDamage") for member in members)
+        lines = [f"Party Recap — {self._party_run_summary(members)}"]
+        for index, member in enumerate(members, 1):
+            damage = self._party_metric(member, "totalDamage")
+            share = damage * 100.0 / total_damage if total_damage else 0.0
+            lines.append(
+                f"{index}. {member.get('displayName') or 'Unknown'} — "
+                f"{format_number(damage)} damage ({share:.1f}%), "
+                f"{self._party_member_kills(member):,} kills, "
+                f"{format_number(self._party_metric(member, 'totalHealing'))} healing, "
+                f"{format_number(self._party_metric(member, 'totalShielding'))} shielding, "
+                f"{format_number(self._party_metric(member, 'dps'))} DPS")
+        lines.append(
+            f"Captured totals — {format_number(total_damage)} damage, "
+            f"{sum(self._party_member_kills(member) for member in members):,} kills, "
+            f"{format_number(sum(self._party_metric(member, 'totalHealing') for member in members))} healing, "
+            f"{format_number(sum(self._party_metric(member, 'totalShielding') for member in members))} shielding")
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self.party_live_status = "Party recap copied to clipboard"
+        self.party_status_label.configure(text=self.party_live_status)
+
+    def _render_party_view(self) -> None:
+        if not hasattr(self, "party_rows"):
+            return
+        self.party_status_label.configure(text=self.party_live_status)
+        members = list(self.party_live_members)
+        members.sort(key=lambda member: str(member.get("displayName") or "").casefold())
+        members.sort(
+            key=lambda member: self._party_metric(member, self.party_sort_key),
+            reverse=self.party_sort_descending)
+        self.party_run_label.configure(
+            text=self._party_run_summary(members) if members else "No party run recorded")
+        for key, (label, text) in self.party_sort_headings.items():
+            active = key == self.party_sort_key
+            arrow = " ▼" if self.party_sort_descending else " ▲"
+            label.configure(
+                text=text + (arrow if active else ""),
+                foreground=self.colors["neon"] if active else self.colors["muted"])
+        total_damage = sum(self._party_metric(member, "totalDamage") for member in members)
+        total_healing = sum(self._party_metric(member, "totalHealing") for member in members)
+        total_shielding = sum(self._party_metric(member, "totalShielding") for member in members)
+        total_kills = sum(self._party_member_kills(member) for member in members)
+        if members:
+            if not self.party_totals_row.winfo_manager():
+                self.party_totals_row.pack(fill="x", padx=5, pady=(4, 2))
+            self.party_total_damage.configure(text=f"{format_number(total_damage)} 100%")
+            self.party_total_kills.configure(text=f"{total_kills:,}")
+            self.party_total_healing.configure(text=format_number(total_healing))
+            self.party_total_shielding.configure(text=format_number(total_shielding))
+        else:
+            self.party_totals_row.pack_forget()
+        owner = str(self.settings.get("LeaderboardDisplayName") or "").casefold()
+        for index, row in enumerate(self.party_rows):
+            if index >= len(members):
+                if row.get("member") is not None:
+                    self._hide_party_member_tooltip()
+                row["frame"].pack_forget()
+                row["member"] = None
+                continue
+            member = members[index]
+            if not row["frame"].winfo_manager():
+                row["frame"].pack(fill="x", padx=5, pady=2)
+            name = str(member.get("displayName") or "Unknown")
+            row["name"].configure(
+                text=name,
+                foreground=self.colors["neon"] if owner and name.casefold() == owner
+                else self.colors["text"])
+            row["rank"].configure(text=str(index + 1))
+            damage = self._party_metric(member, "totalDamage")
+            share = damage * 100.0 / total_damage if total_damage else 0.0
+            row["damage"].configure(text=f"{format_number(damage)} {share:.0f}%")
+            row["kills"].configure(text=f"{self._party_member_kills(member):,}")
+            row["healing"].configure(
+                text=format_number(float(member.get("totalHealing") or 0)))
+            row["shielding"].configure(
+                text=format_number(float(member.get("totalShielding") or 0)))
+            row["dps"].configure(text=format_number(float(member.get("dps") or 0)))
+            row["member"] = member
+
+    def _show_party_member_tooltip(
+            self, row: dict[str, Any], _event: tk.Event | None = None) -> None:
+        member = row.get("member")
+        if not isinstance(member, dict):
+            return
+        if self._party_member_tooltip_hide_job is not None:
+            self.root.after_cancel(self._party_member_tooltip_hide_job)
+            self._party_member_tooltip_hide_job = None
+        self._hide_party_member_tooltip()
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        outer = tk.Frame(
+            tip, background="#171C27", highlightbackground="#3A4352",
+            highlightthickness=1)
+        outer.pack(fill="both", expand=True)
+        tk.Label(
+            outer, text=str(member.get("displayName") or "Unknown"),
+            background="#171C27", foreground="#F4F7FB",
+            font=(self.FONT, self._scaled_font_size(9), "bold"), anchor="w",
+        ).pack(fill="x", padx=10, pady=(8, 2))
+        summary = (
+            f"Damage {format_number(float(member.get('totalDamage') or 0))}  ·  "
+            f"DPS {format_number(float(member.get('dps') or 0))}\n"
+            f"Healing {format_number(float(member.get('totalHealing') or 0))}  ·  "
+            f"Shielding {format_number(float(member.get('totalShielding') or 0))}")
+        tk.Label(
+            outer, text=summary, background="#171C27", foreground=self.colors["muted"],
+            font=(self.FONT, self._scaled_font_size(7)), anchor="w", justify="left",
+        ).pack(fill="x", padx=10, pady=(0, 7))
+        abilities = member.get("abilities")
+        if isinstance(abilities, list) and abilities:
+            tk.Label(
+                outer, text="ABILITY BREAKDOWN", background="#171C27",
+                foreground=self.colors["purple"],
+                font=(self.FONT, self._scaled_font_size(7), "bold"), anchor="w",
+            ).pack(fill="x", padx=10, pady=(0, 3))
+            for ability in abilities[:12]:
+                if not isinstance(ability, dict):
+                    continue
+                line = tk.Frame(outer, background="#171C27")
+                line.pack(fill="x", padx=10, pady=1)
+                tk.Label(
+                    line, text=str(ability.get("name") or "Unknown"), width=20,
+                    background="#171C27", foreground="#F4F7FB",
+                    font=(self.FONT, self._scaled_font_size(8)), anchor="w",
+                ).pack(side="left")
+                kills = int(ability.get("kills") or 0)
+                ability_damage = float(ability.get(
+                    "damageAmount", ability.get(
+                        "damage_amount", ability.get("amount", 0))) or 0)
+                detail = f"{kills:,} K  ·  {format_number(ability_damage)}"
+                tk.Label(
+                    line, text=detail, background="#171C27", foreground=self.colors["orange"],
+                    font=(self.FONT, self._scaled_font_size(8), "bold"), anchor="e",
+                ).pack(side="right")
+        else:
+            tk.Label(
+                outer, text="Waiting for ability data…", background="#171C27",
+                foreground=self.colors["muted"],
+                font=(self.FONT, self._scaled_font_size(7)), anchor="w",
+            ).pack(fill="x", padx=10, pady=(0, 4))
+        tk.Frame(outer, height=7, background="#171C27").pack()
+        self._party_member_tooltip = tip
+        tip.bind("<Enter>", self._cancel_hide_party_member_tooltip, add="+")
+        tip.bind("<Leave>", self._schedule_hide_party_member_tooltip, add="+")
+        tip.update_idletasks()
+        source: tk.Widget = row["frame"]
+        x = source.winfo_rootx() + source.winfo_width() + 2
+        if x + tip.winfo_width() > self.root.winfo_screenwidth() - 8:
+            x = source.winfo_rootx() - tip.winfo_width() - 2
+        y = min(source.winfo_rooty(), self.root.winfo_screenheight() - tip.winfo_height() - 8)
+        tip.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _cancel_hide_party_member_tooltip(
+            self, _event: tk.Event | None = None) -> None:
+        if self._party_member_tooltip_hide_job is not None:
+            self.root.after_cancel(self._party_member_tooltip_hide_job)
+            self._party_member_tooltip_hide_job = None
+
+    def _schedule_hide_party_member_tooltip(
+            self, _event: tk.Event | None = None) -> None:
+        if self._party_member_tooltip_hide_job is not None:
+            self.root.after_cancel(self._party_member_tooltip_hide_job)
+        self._party_member_tooltip_hide_job = self.root.after(
+            250, self._hide_party_member_tooltip)
+
+    def _hide_party_member_tooltip(self) -> None:
+        if self._party_member_tooltip_hide_job is not None:
+            try:
+                self.root.after_cancel(self._party_member_tooltip_hide_job)
+            except tk.TclError:
+                pass
+            self._party_member_tooltip_hide_job = None
+        if self._party_member_tooltip is not None:
+            self._party_member_tooltip.destroy()
+        self._party_member_tooltip = None
+
     def _show_player_list_tooltip(self, _event: tk.Event | None = None) -> None:
         self._cancel_hide_player_list_tooltip()
         summary = self.leaderboard_player_list
@@ -5952,6 +6618,7 @@ class MeterApp:
             return
         try:
             self.leaderboard_client.pump()
+            self._pump_record_history_import()
             now = time.monotonic()
             self._cycle_leaderboard_names(now)
             if now - self.last_log_poll >= self.combat_log_poll_ms / 1000.0:
@@ -5961,6 +6628,7 @@ class MeterApp:
                 saved_folder = str(self.settings.get("CombatLogFolder") or "")
                 if detected_folder and detected_folder.casefold() != saved_folder.casefold():
                     self.settings.set("CombatLogFolder", detected_folder)
+            self._tick_party_live(now)
             if now - self.last_process_poll >= 0.75:
                 self.find_and_follow()
                 self.last_process_poll = now
@@ -5992,6 +6660,7 @@ class MeterApp:
         self._hide_dungeon_tooltip()
         self._hide_player_list_tooltip()
         self._hide_leaderboard_rank_tooltip()
+        self._hide_party_member_tooltip()
         if self._brand_animation_job is not None:
             try:
                 self.root.after_cancel(self._brand_animation_job)
@@ -6152,6 +6821,7 @@ def run_self_test(log_path: str | None = None) -> int:
     session.apply(live_damage_event(unknown, False))
     snap = session.snapshot()
     assert snap["damage"] == 210 and snap["abilities"][0]["name"] == "Bomb"
+    assert snap["all_abilities"][0]["damage_amount"] == 1
     assert snap["abilities"][0]["kills"] == 1
     assert snap["abilities"][0]["damage_type"] == "VOID"
     assert snap["dev_rate"] == 50 and snap["highest_dev"] == 1
@@ -6336,6 +7006,10 @@ def run_self_test(log_path: str | None = None) -> int:
         assert imported_history["difficulty"] == "Abyssal" and imported_history["totalDamage"] == 125
         assert imported_history["largestHit"] == 0
         assert imported_history["runTimeMs"] == 43_000 and len(imported_history["sourceHash"]) == 64
+        history_store = FlexRecordStore(Path(folder) / "history.state")
+        assert history_store.pending_log_history_paths(folder) == [history_log]
+        assert history_store.import_log_history(folder) == 1
+        assert history_store.pending_log_history_paths(folder) == []
 
         abandoned_log = Path(folder) / "dungeon__Lunar_Plateau_-_Abyssal__2__2026-09-16_16-00-00Z.log"
         abandoned_roots = json.loads(json.dumps(history_roots))
@@ -6668,7 +7342,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test", action="store_true", help="Run parser and persistence tests without opening the UI")
     parser.add_argument("--smoke-ui", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--smoke-view", choices=("meter", "flex", "leaderboard", "settings"),
+        "--smoke-view", choices=("meter", "flex", "leaderboard", "party", "settings"),
         help=argparse.SUPPRESS)
     parser.add_argument("--smoke-compact", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--leaderboard-smoke", action="store_true", help=argparse.SUPPRESS)

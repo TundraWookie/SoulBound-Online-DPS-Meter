@@ -25,6 +25,7 @@ Created by **TundraWooK** with permission from Soulbound creator Tom Landon and 
 - Imports existing combat logs once and keeps a permanent duplicate-prevention ledger in `records.txt`.
 - Shows a room timeline below the ability list with readable combat-only checkpoint times in both normal and compact layouts.
 - Includes a community **Ranks** tab for fastest completed runs, damage, DPS, healing, shielding, and other categories.
+- Includes an automatic **Party** recap that combines end-of-run totals from party members running the meter and shows each player's damage abilities on hover.
 - Shows one leading score per dungeon and difficulty with your personal best beside it; hover a dungeon name for that category's color-coded top five.
 - Excludes abandoned, failed, incomplete, and edited live runs from leaderboard rankings.
 - Checks GitHub Releases on startup and asks before downloading and installing a newer version.
@@ -181,10 +182,19 @@ Open **Ranks**, choose a permanent display name, and select **Join** to submit q
 - Dungeon catalog results are cached for six hours, and each unchanged combat log is processed only once to keep community Cloudflare usage within the free allowance.
 - The leaderboard groups difficulty sections hardest to easiest: Raid, Abyssal, Shattered, Collapsing, Fractured, Unstable, then Stable. The difficulty filter remains ordered easiest to hardest.
 
+## Party Recap
+
+When a run ends, the **Party** tab automatically matches registered meter users who completed the same dungeon run. No room code or invitation is required. Matching uses dungeon, party size, synchronized run timing, completion time, and room progress; ally names exposed by the combat log provide additional confirmation when available.
+
+The recap shows the run result and time, ranks matched players by the selected sortable column, and lists damage share, kills, effective healing, applied shielding, and DPS. A totals row summarizes all matched meters, and **Copy** creates a Discord-friendly text recap. Hover a player's name to see their damage-by-ability breakdown and kill counts. Percentages and totals cover matched meter users only; players who are not running the meter cannot provide combat totals.
+
+Party recaps are enabled by default after joining the leaderboard with a nickname and can be disabled in Settings. The meter sends one summarized result when a party run ends—including clears, deaths, failures, and runs you leave—then briefly checks for teammates who finish a few seconds later. Raw combat-log contents are not uploaded, and recap values are informational rather than leaderboard verification data.
+
 ## Controls
 
 - **Flex / Meter:** Switch between the live meter and permanent records.
 - **Ranks:** Browse community records and manage your leaderboard name/history scan.
+- **Party:** View automatically matched party members' completed-run damage and ability breakdowns.
 - **Compact / Normal:** Switch between the full vertical meter and compact horizontal layout.
 - **Settings button:** Change the menu color, opacity, font size, AFK fading, overkill handling, Soulbound mob-health display, and log-cleanup preference.
 - **Follow game window:** Keep the overlay positioned relative to Soulbound.
@@ -225,6 +235,7 @@ The optional cleanup setting:
 - It contacts the community leaderboard service to retrieve member-only rankings. Viewing names or scores and submitting runs requires joining with a display name; submissions can be disabled in Settings.
 - Every registered member can hover over **Player list** to see the registered display-name roster and which names currently have at least one qualifying score. This summary does not include authentication tokens or combat-log contents.
 - Leaderboard submissions contain run statistics, timing metadata, and cryptographic log fingerprints—not the combat-log contents.
+- Party recaps send temporary run-matching metadata and one end-of-run damage summary; they do not send raw combat logs or continuously update the leaderboard database.
 - It does not inject code into Soulbound.
 - It does not read or modify Soulbound's memory.
 - It only reads the selected combat-log folder and writes its own settings and records files.
